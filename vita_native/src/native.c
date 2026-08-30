@@ -261,6 +261,7 @@ extern uint32_t azahar_chain_irq[2];
 extern volatile uint32_t azahar_prog_irq, azahar_gic_va, azahar_irq_last, azahar_irq_stray, azahar_seal_flag;
 extern void azahar_vec_irq(void);
 extern uint8_t azahar_stray_stack_top[], azahar_irq_stack_top[];
+extern volatile uint32_t azahar_stray_retry;
 // taiHEN's module utility, imported but not declared by any header vitasdk installs.
 extern int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset,
                              uintptr_t *addr);
@@ -364,6 +365,7 @@ static void core2_install(void) {
     azahar_chain_dabt[0] = sv_sp_abt;
     azahar_chain_dabt[1] = azahar_sony[4];
     azahar_guest_active = 0;
+    azahar_stray_retry = 0;
     for (unsigned i = 0; i < 8; i++) {
         azahar_stray[i] = 0;
     }
@@ -551,9 +553,9 @@ static void report_stray(void) {
     }
     static const char *const names[] = {"?", "svc", "undefined", "prefetch abort", "data abort"};
     emit("  STRAY exception(s) on core 2 with no guest active: %u, first %s lr %08x spsr %08x "
-         "dfsr %08x dfar %08x ifsr %08x ifar %08x (chained to Sony's handler)\n",
+         "dfsr %08x dfar %08x ifsr %08x ifar %08x (%u retried store(s))\n",
          azahar_stray[0], azahar_stray[1] < 5 ? names[azahar_stray[1]] : "?", azahar_stray[2], azahar_stray[3],
-         azahar_stray[4], azahar_stray[5], azahar_stray[6], azahar_stray[7]);
+         azahar_stray[4], azahar_stray[5], azahar_stray[6], azahar_stray[7], azahar_stray_retry);
 }
 
 static int core2_command(uint32_t cmd, unsigned steps) {

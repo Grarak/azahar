@@ -116,6 +116,24 @@ azahar_vec_\name:
     ldr     sp, [sp]
     cmp     sp, #0
     beq     7f
+    .if \reason == 4
+    @ Sealed data aborts are retried a few times before parking. Kept as a generic guard:
+    @ re-executing the aborted store costs nothing, and a recoverable one-off (spurious
+    @ abort, transient walk hiccup) then survives instead of wedging the core. The counter
+    @ is cumulative per install and shown in the stray report; past the cap the stub parks
+    @ as before. (The 2026-08-30 wedges this was written for turned out to be a dropped
+    @ relocation - see azahar_irq_stack_top below - not a transient fault.)
+    ldr     sp, =azahar_stray_stack_top
+    push    {r0-r1}
+    ldr     r0, =azahar_stray_retry
+    ldr     r1, [r0]
+    add     r1, r1, #1
+    str     r1, [r0]
+    cmp     r1, #16
+    pop     {r0-r1}
+    bgt     6f
+    subs    pc, lr, #8              @ back to the aborted store, mode and cpsr restored
+    .endif
 6:  b       6b                      @ sealed: nothing of Sony's is mapped to chain to; the
                                     @ record above is the report, the syscall side times out
 7:  ldr     sp, =azahar_chain_\name
@@ -311,6 +329,8 @@ azahar_seal_flag:  .word 0
 azahar_irq_last:   .word 0
     .global azahar_irq_stray
 azahar_irq_stray:  .word 0
+    .global azahar_stray_retry
+azahar_stray_retry: .word 0
     .bss
     .align 3
 azahar_stray_stack: .space 64
