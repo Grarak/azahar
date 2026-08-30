@@ -339,5 +339,14 @@ azahar_stray_stack_top:
 azahar_irq_stack:  .space 64
     .global azahar_irq_stack_top
 azahar_irq_stack_top:
+    .space 8                        @ keeps azahar_irq_stack_top strictly inside the segment:
+                                    @ a symbol at the exact end (one-past-the-end address)
+                                    @ gets its relocations silently DROPPED by
+                                    @ vita-elf-create - it cannot attribute the address to
+                                    @ a segment - so every reference to it stayed at the
+                                    @ link-time address after load (2026-08-30: the stray
+                                    @ pushes aborted on the unmapped link VA, the seal
+                                    @ ranges stretched toward it, and a C dereference of it
+                                    @ crashed the resident thread outright)
 
     .section .note.GNU-stack,"",%progbits
