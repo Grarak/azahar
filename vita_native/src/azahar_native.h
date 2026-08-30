@@ -88,6 +88,26 @@ typedef struct AzaharEditRequest {
     AzaharRange range;     // user_va is ignored for UNMAP; perm is ignored for UNMAP
 } AzaharEditRequest;
 
+// Cortex-A9 performance counters, accumulated over guest slices. The plugin reprograms core 2's
+// PMU at every azaharRun: the cycle counter and the six event counters are reset just before the
+// guest is entered and read back at the exit, so the totals cover guest execution (plus the few
+// hundred cycles of the entry/exit path) and nothing else that ever ran on the core. azaharPmuRead
+// copies the totals out and zeroes them. Call it from the thread that calls azaharRun: the totals
+// are not synchronized against a run in flight.
+// events[] order (Cortex-A9 event numbers):
+//   0  0x68 instructions passing the rename stage (the A9 has no retired-instruction event)
+//   1  0x60 cycles stalled on an instruction-cache miss
+//   2  0x61 cycles stalled on a data-cache miss
+//   3  0x03 L1 data cache refills
+//   4  0x01 L1 instruction cache refills
+//   5  0x10 mispredicted branches
+typedef struct AzaharPmuStats {
+    uint64_t cycles;
+    uint64_t events[6];
+    uint32_t runs;    // azaharRun slices the totals cover
+    uint32_t pad;
+} AzaharPmuStats;
+
 // Error codes (negative), beyond the kernel's own.
 #define AZAHAR_ERR_STATE (-1000)      // call out of order (map before take, run before map...)
 #define AZAHAR_ERR_ARG (-1001)        // bad request (alignment, count, perm)
@@ -108,6 +128,7 @@ int azaharMap(const AzaharMapRequest *req);
 int azaharRun(AzaharRunRequest *req);
 int azaharRelease(void);
 int azaharEdit(const AzaharEditRequest *req);
+int azaharPmuRead(AzaharPmuStats *out);
 
 #ifdef __cplusplus
 }

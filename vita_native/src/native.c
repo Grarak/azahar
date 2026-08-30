@@ -215,6 +215,14 @@ static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at ma
 enum { CMD_NONE, CMD_INSTALL, CMD_RUN, CMD_UNINSTALL };
 static volatile uint32_t azahar_cmd, azahar_cmd_done, azahar_cmd_status;
 static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_park, azahar_park_cycles;
+
+// PMU totals over guest slices; see AzaharPmuStats in vanative.h. Written by core 2 between
+// slices, read and zeroed by azaharPmuRead on the syscall core. The emulator calls azaharRun and
+// azaharPmuRead from one thread, so the two never overlap and the 64-bit sums need no lock.
+static volatile uint64_t azahar_pmu_cycles;
+static volatile uint64_t azahar_pmu_ev[6];
+static volatile uint32_t azahar_pmu_runs;
+static const uint32_t azahar_pmu_events[6] = {0x68u, 0x60u, 0x61u, 0x03u, 0x01u, 0x10u};
 static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr1, azahar_core2_sp;
 
 // Saved on core 2 at install, restored at uninstall.
@@ -437,6 +445,34 @@ static void core2_uninstall(void) {
 }
 
 // One trip into the guest. Interrupts are masked at the GIC for its duration — the core is
+// Program core 2's PMU for a slice: the six A9 event counters get the events AzaharPmuStats
+// documents, overflow interrupts stay off (nothing may interrupt the detached core but the
+// preemption timer), and PMCR.E|P|C starts everything from zero. Resetting PMCCNTR is fine
+// here, unlike in the surveys: the core is ours, and Sony's kernel never reads its counters
+// again (azaharRelease parks it for good).
+static void pmu_slice_start(void) {
+    for (uint32_t i = 0; i < 6; i++) {
+        asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));                  // PMSELR
+        asm volatile("mcr p15, 0, %0, c9, c13, 1" ::"r"(azahar_pmu_events[i]));  // PMXEVTYPER
+    }
+    asm volatile("mcr p15, 0, %0, c9, c14, 2" ::"r"(0xFFFFFFFFu));  // PMINTENCLR
+    asm volatile("mcr p15, 0, %0, c9, c12, 1" ::"r"(0x8000003Fu));  // PMCNTENSET: cycle + 0-5
+    asm volatile("mcr p15, 0, %0, c9, c12, 0" ::"r"(0x7u));         // PMCR E|P|C
+    asm volatile("isb" ::: "memory");
+}
+
+static void pmu_slice_end(void) {
+    uint32_t v;
+    asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v));  // PMCCNTR
+    azahar_pmu_cycles += v;
+    for (uint32_t i = 0; i < 6; i++) {
+        asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));   // PMSELR
+        asm volatile("mrc p15, 0, %0, c9, c13, 2" : "=r"(v));  // PMXEVCNTR
+        azahar_pmu_ev[i] += v;
+    }
+    azahar_pmu_runs++;
+}
+
 // owned, not shared, while guest code runs — and put back afterwards.
 static void core2_run(void) {
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
@@ -472,8 +508,10 @@ static void core2_run(void) {
         asm volatile("dsb \n isb" ::: "memory");
     }
     azahar_progress = 3;
+    pmu_slice_start();
     const uint32_t reason = (uint32_t)azahar_enter(&azahar_ctx, azahar_host);
     azahar_progress = 42;
+    pmu_slice_end();
     if (pmr) {
         azahar_run_timer_left = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
         *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
@@ -1509,6 +1547,27 @@ int azaharEdit(const AzaharEditRequest *user_req) {
 out:
     emit("  -> %d\n", ret);
     log_close();
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+int azaharPmuRead(AzaharPmuStats *user_out) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    AzaharPmuStats out;
+    out.cycles = azahar_pmu_cycles;
+    for (unsigned i = 0; i < 6; i++) {
+        out.events[i] = azahar_pmu_ev[i];
+    }
+    out.runs = azahar_pmu_runs;
+    out.pad = 0;
+    azahar_pmu_cycles = 0;
+    for (unsigned i = 0; i < 6; i++) {
+        azahar_pmu_ev[i] = 0;
+    }
+    azahar_pmu_runs = 0;
+    // No log_open: this is called every second and has nothing to say.
+    const int ret = ksceKernelCopyToUser(user_out, &out, sizeof(out)) < 0 ? AZAHAR_ERR_ARG : 0;
     EXIT_SYSCALL(state);
     return ret;
 }
