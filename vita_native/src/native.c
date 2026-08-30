@@ -223,6 +223,91 @@ static volatile uint64_t azahar_pmu_cycles;
 static volatile uint64_t azahar_pmu_ev[6];
 static volatile uint32_t azahar_pmu_runs;
 static const uint32_t azahar_pmu_events[6] = {0x68u, 0x60u, 0x61u, 0x03u, 0x01u, 0x10u};
+
+// Host-core sampling (azaharPmuReadAll): one kernel thread pinned to each schedulable core
+// programs that core's PMU with the same six events and folds 10 ms deltas into per-core
+// totals. The PMU is banked per core and counts whatever the scheduler runs there, so this is
+// a per-core profile, not a per-thread one. Deltas are unsigned 32-bit subtractions, so a
+// counter wrapping between samples is harmless; the readout races the samplers by design
+// (statistics, not bookkeeping).
+static volatile uint64_t azahar_pmu_host_cycles[4];
+static volatile uint64_t azahar_pmu_host_ev[4][6];
+static volatile uint32_t azahar_pmu_host_samples[4];
+static volatile uint32_t azahar_pmu_host_stop;
+static SceUID azahar_pmu_host_thread[4] = {-1, -1, -1, -1};
+static uint32_t azahar_pmu_host_core_arg[4] = {0, 1, 2, 3};
+
+static uint32_t pmu_read_event(uint32_t i) {
+    uint32_t v;
+    asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));  // PMSELR
+    asm volatile("isb");
+    asm volatile("mrc p15, 0, %0, c9, c13, 2" : "=r"(v)); // PMXEVCNTR
+    return v;
+}
+
+static int pmu_host_entry(SceSize args, void *argp) {
+    (void)args;
+    const uint32_t core = *(const uint32_t *)argp;
+    PmuSave save;
+    pmu_begin(&save); // PMCR.E on, cycle counter on, previous state saved; PMCR.C stays clear
+    for (uint32_t i = 0; i < 6; i++) {
+        asm volatile("mcr p15, 0, %0, c9, c12, 5" ::"r"(i));                  // PMSELR
+        asm volatile("mcr p15, 0, %0, c9, c13, 1" ::"r"(azahar_pmu_events[i]));  // PMXEVTYPER
+    }
+    asm volatile("mcr p15, 0, %0, c9, c12, 1" ::"r"(0x3Fu));  // PMCNTENSET: events 0-5
+    asm volatile("isb" ::: "memory");
+    uint32_t prev[7];
+    prev[6] = rd_pmccntr();
+    for (uint32_t i = 0; i < 6; i++) {
+        prev[i] = pmu_read_event(i);
+    }
+    while (!azahar_pmu_host_stop) {
+        ksceKernelDelayThread(10000);
+        uint32_t cur = rd_pmccntr();
+        azahar_pmu_host_cycles[core] += (uint32_t)(cur - prev[6]);
+        prev[6] = cur;
+        for (uint32_t i = 0; i < 6; i++) {
+            cur = pmu_read_event(i);
+            azahar_pmu_host_ev[core][i] += (uint32_t)(cur - prev[i]);
+            prev[i] = cur;
+        }
+        azahar_pmu_host_samples[core]++;
+    }
+    asm volatile("mcr p15, 0, %0, c9, c12, 2" ::"r"(0x3Fu));  // PMCNTENCLR: events 0-5
+    pmu_end(&save);
+    return 0;
+}
+
+static void pmu_host_start(void) {
+    static const uint32_t cores[3] = {0, 1, 3};
+    static const char *const names[3] = {"vanpmu_c0", "vanpmu_c1", "vanpmu_c3"};
+    if (azahar_pmu_host_thread[0] >= 0) {
+        return;
+    }
+    azahar_pmu_host_stop = 0;
+    for (unsigned i = 0; i < 3; i++) {
+        const uint32_t c = cores[i];
+        const SceUID t = ksceKernelCreateThread(names[i], pmu_host_entry, 0x10000100, 0x1000, 0,
+                                                CPU_AFFINITY(c), NULL);
+        if (t < 0) {
+            continue;
+        }
+        azahar_pmu_host_thread[c] = t;
+        ksceKernelStartThread(t, sizeof(azahar_pmu_host_core_arg[c]), &azahar_pmu_host_core_arg[c]);
+    }
+}
+
+static void pmu_host_stop_all(void) {
+    azahar_pmu_host_stop = 1;
+    for (unsigned c = 0; c < 4; c++) {
+        if (azahar_pmu_host_thread[c] >= 0) {
+            SceUInt timeout = 1000000;
+            ksceKernelWaitThreadEnd(azahar_pmu_host_thread[c], NULL, &timeout);
+            ksceKernelDeleteThread(azahar_pmu_host_thread[c]);
+            azahar_pmu_host_thread[c] = -1;
+        }
+    }
+}
 static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr1, azahar_core2_sp;
 
 // Saved on core 2 at install, restored at uninstall.
@@ -758,6 +843,7 @@ static int azahar_on_proc_gone(SceUID pid) {
     }
     log_open();
     emit("== client process gone (state %d)\n", azahar_state);
+    pmu_host_stop_all();
     if (azahar_state == ST_MAPPED) {
         const int r = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);
         emit("  uninstall -> %d\n", r);
@@ -1551,6 +1637,42 @@ out:
     return ret;
 }
 
+int azaharPmuReadAll(AzaharPmuAll *user_out) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    pmu_host_start();
+    AzaharPmuAll out;
+    for (unsigned c = 0; c < 4; c++) {
+        if (c == AZAHAR_TARGET_CORE) {
+            out.core[c].cycles = azahar_pmu_cycles;
+            for (unsigned i = 0; i < 6; i++) {
+                out.core[c].events[i] = azahar_pmu_ev[i];
+            }
+            out.core[c].runs = azahar_pmu_runs;
+            azahar_pmu_cycles = 0;
+            for (unsigned i = 0; i < 6; i++) {
+                azahar_pmu_ev[i] = 0;
+            }
+            azahar_pmu_runs = 0;
+        } else {
+            out.core[c].cycles = azahar_pmu_host_cycles[c];
+            for (unsigned i = 0; i < 6; i++) {
+                out.core[c].events[i] = azahar_pmu_host_ev[c][i];
+            }
+            out.core[c].runs = azahar_pmu_host_samples[c];
+            azahar_pmu_host_cycles[c] = 0;
+            for (unsigned i = 0; i < 6; i++) {
+                azahar_pmu_host_ev[c][i] = 0;
+            }
+            azahar_pmu_host_samples[c] = 0;
+        }
+        out.core[c].pad = 0;
+    }
+    const int ret = ksceKernelCopyToUser(user_out, &out, sizeof(out)) < 0 ? AZAHAR_ERR_ARG : 0;
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
 int azaharPmuRead(AzaharPmuStats *user_out) {
     uint32_t state;
     ENTER_SYSCALL(state);
@@ -1578,6 +1700,8 @@ int azaharRelease(void) {
     log_open();
     emit("== azaharRelease\n");
     int ret = 0;
+
+    pmu_host_stop_all();
 
     if (azahar_state == ST_MAPPED) {
         ret = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);

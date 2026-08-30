@@ -108,6 +108,14 @@ typedef struct AzaharPmuStats {
     uint32_t pad;
 } AzaharPmuStats;
 
+// All four cores' counters. core[2] is the guest slice totals described above; the other
+// cores are whole-core samples, taken every 10 ms by a small kernel thread pinned to each,
+// counting everything scheduled there. The first azaharPmuReadAll starts the samplers; every
+// read drains the totals.
+typedef struct AzaharPmuAll {
+    AzaharPmuStats core[4];
+} AzaharPmuAll;
+
 // Error codes (negative), beyond the kernel's own.
 #define AZAHAR_ERR_STATE (-1000)      // call out of order (map before take, run before map...)
 #define AZAHAR_ERR_ARG (-1001)        // bad request (alignment, count, perm)
@@ -129,6 +137,7 @@ int azaharRun(AzaharRunRequest *req);
 int azaharRelease(void);
 int azaharEdit(const AzaharEditRequest *req);
 int azaharPmuRead(AzaharPmuStats *out);
+int azaharPmuReadAll(AzaharPmuAll *out);
 
 #ifdef __cplusplus
 }
