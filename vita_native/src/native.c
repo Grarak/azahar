@@ -947,7 +947,7 @@ static int build_table(const AzaharMapRequest *req) {
     // heartbeat frozen and every command timing out. The spot list survives only as the
     // fallback when the lookup fails.
     struct KeepRange { uint32_t addr, len; };
-    struct KeepRange keep[32];
+    struct KeepRange keep[40];
     unsigned nkeep = 0;
     {
         // Segment bases from taiHEN (already imported; the module manager's own
@@ -979,6 +979,8 @@ static int build_table(const AzaharMapRequest *req) {
                 uintptr_t base = 0;
                 if (module_get_offset(0x10005, tinfo.modid, (int)seg, 0, &base) >= 0) {
                     bases[seg] = (uint32_t)base;
+                } else {
+                    emit("  seal: segment %u base lookup failed\n", seg);
                 }
             }
             // A symbol belongs to whichever segment starts at or below it, nearest. The two
@@ -989,6 +991,7 @@ static int build_table(const AzaharMapRequest *req) {
             // commercial-title run).
             const unsigned n_text = sizeof(text_syms) / sizeof(text_syms[0]);
             const unsigned n_data = sizeof(data_syms) / sizeof(data_syms[0]);
+            int bucket[32];
             uint32_t ends[2] = {bases[0], bases[1]};
             for (unsigned i = 0; i < n_text + n_data; i++) {
                 const uint32_t sym = i < n_text ? text_syms[i] : data_syms[i - n_text];
@@ -999,19 +1002,43 @@ static int build_table(const AzaharMapRequest *req) {
                         best = (int)seg;
                     }
                 }
+                bucket[i] = best;
                 if (best >= 0 && sym > ends[best]) {
                     ends[best] = sym;
                 }
             }
+            // A range longer than any plausible module segment means the bucketing went
+            // wrong: when one segment's base lookup fails, its symbols fall into the other
+            // segment's bucket and stretch that range across the gap between the two -
+            // hundreds of unmapped megabytes' worth on 2026-08-30 (third commercial-title
+            // run: text near 0x01c-, data near 0x810-, one skip line per megabyte between).
+            // Such a range is discarded and its symbols are kept one megabyte at a time,
+            // like the spot-list fallback.
             for (unsigned seg = 0; seg < 2; seg++) {
                 if (bases[seg] == 0) {
                     continue;
                 }
+                const uint32_t len = (ends[seg] - bases[seg]) + 0x1000u;
+                if (len > 0x01000000u) {
+                    emit("  seal: segment %u range %08x..%08x implausible, keeping its "
+                         "symbols one by one\n", seg, bases[seg], bases[seg] + len);
+                    bases[seg] = 0; /* rejected: its symbols fall through to spots below */
+                    continue;
+                }
                 keep[nkeep].addr = bases[seg];
-                keep[nkeep].len = (ends[seg] - bases[seg]) + 0x1000u;
-                emit("  seal: segment %u %08x..%08x\n", seg, bases[seg],
-                     bases[seg] + keep[nkeep].len);
+                keep[nkeep].len = len;
+                emit("  seal: segment %u %08x..%08x\n", seg, bases[seg], bases[seg] + len);
                 nkeep++;
+            }
+            for (unsigned i = 0; i < n_text + n_data; i++) {
+                if (bucket[i] >= 0 && bases[bucket[i]] != 0) {
+                    continue; /* covered by a kept segment range */
+                }
+                if (nkeep < 36) {
+                    keep[nkeep].addr = i < n_text ? text_syms[i] : data_syms[i - n_text];
+                    keep[nkeep].len = 4;
+                    nkeep++;
+                }
             }
         }
     }
@@ -1057,8 +1084,17 @@ static int build_table(const AzaharMapRequest *req) {
         if (keep[i].addr == 0 || keep[i].len == 0) {
             continue;
         }
+        const uint32_t first = keep[i].addr >> 20;
         const uint32_t last = (keep[i].addr + keep[i].len - 1u) >> 20;
-        for (uint32_t idx = keep[i].addr >> 20; idx <= last; idx++) {
+        if (last - first >= 64u) {
+            // No legitimate keep range spans 64 megabytes; this also catches wrap-around
+            // (last < first underflows huge). Refusing here is the backstop that keeps a
+            // miscomputed range from sweeping the whole table one log line at a time.
+            emit("  seal: range %08x+%x implausible, refused\n", keep[i].addr, keep[i].len);
+            continue;
+        }
+        unsigned skipped = 0;
+        for (uint32_t idx = first; idx <= last; idx++) {
             if (azahar_l1[idx] & 3u) {
                 continue;
             }
@@ -1067,7 +1103,7 @@ static int build_table(const AzaharMapRequest *req) {
                 // A megabyte the kernel's own table does not map cannot be one anything on
                 // this core needs - the kernel could not touch it either. Ranges may
                 // legitimately brush such megabytes; skip them rather than fail the install.
-                emit("  seal: l1[%03x] invalid in the kernel's table, skipped\n", idx);
+                skipped++;
                 continue;
             }
             azahar_l1[idx] = e;
@@ -1075,6 +1111,10 @@ static int build_table(const AzaharMapRequest *req) {
             if (kl < (int)sizeof(kept_list) - 8) {
                 kl += snprintf(kept_list + kl, sizeof(kept_list) - kl, " %03x", idx);
             }
+        }
+        if (skipped != 0) {
+            emit("  seal: %u unmapped megabyte(s) inside %08x+%x skipped\n", skipped,
+                 keep[i].addr, keep[i].len);
         }
     }
     emit("  L1 sealed: %u kernel megabyte(s) kept (%s ), the rest invalid; kernel ttbr0 table at "
