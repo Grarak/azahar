@@ -220,6 +220,8 @@ static volatile uint32_t azahar_core2_vbar, azahar_core2_cpsr, azahar_core2_ttbr
 // Saved on core 2 at install, restored at uninstall.
 static volatile uint32_t sv_ttbcr, sv_ttbr0, sv_ctxid, sv_vbar, sv_sp_und, sv_sp_abt, sv_tpidruro;
 static volatile uint32_t sv_tpidrurw, sv_cpacr, sv_fpexc;
+static uint32_t sv_fpscr;
+static uint64_t sv_vfp_bank[32];
 
 static inline uint32_t rd_tpidrurw(void) {
     uint32_t v;
@@ -236,6 +238,23 @@ static inline uint32_t rd_fpexc_here(void) {
 }
 static inline void wr_fpexc(uint32_t v) {
     asm volatile(".fpu neon \n vmsr fpexc, %0 \n isb" ::"r"(v) : "memory");
+}
+static inline uint32_t rd_fpscr_here(void) {
+    uint32_t v;
+    asm volatile(".fpu neon \n vmrs %0, fpscr" : "=r"(v));
+    return v;
+}
+static inline void wr_fpscr(uint32_t v) {
+    asm volatile(".fpu neon \n vmsr fpscr, %0" ::"r"(v));
+}
+static void vfp_bank_save(uint64_t *p) {
+    asm volatile(".fpu neon \n vstmia %0!, {d0-d15} \n vstmia %0, {d16-d31}"
+                 : "+r"(p)
+                 :
+                 : "memory");
+}
+static void vfp_bank_load(const uint64_t *p) {
+    asm volatile(".fpu neon \n vldmia %0!, {d0-d15} \n vldmia %0, {d16-d31}" : "+r"(p));
 }
 static volatile uint32_t azahar_ttbcr_seen;
 
@@ -332,6 +351,12 @@ static void core2_install(void) {
     wr_cpacr(sv_cpacr | (0xFu << 20));
     sv_fpexc = rd_fpexc_here();
     wr_fpexc(sv_fpexc | (1u << 30));
+    // The whole register bank and FPSCR belong to whichever Sony thread lazily owned the VFP
+    // on this core, and the guest is about to clobber both. Hand back at uninstall exactly
+    // what was here: a guest FPSCR with exception bits left live panicked Sony's first VFP
+    // operation after release ("VFP/NEON exception occurred in kernel thread", 2026-08-30).
+    sv_fpscr = rd_fpscr_here();
+    vfp_bank_save(sv_vfp_bank);
     sv_sp_und = azahar_get_banked_sp(MODE_UND);
     sv_sp_abt = azahar_get_banked_sp(MODE_ABT);
     sv_sp_svc = azahar_get_banked_sp(MODE_SVC);
@@ -390,6 +415,10 @@ static void core2_uninstall(void) {
     azahar_set_banked_sp(MODE_IRQ, sv_sp_irq);
     wr_tpidruro(sv_tpidruro);
     wr_tpidrurw(sv_tpidrurw);
+    // Bank and FPSCR back before FPEXC/CPACR close the door (and before the PMR reopens
+    // interrupts: Sony's IRQ path must never see the guest's VFP state).
+    vfp_bank_load(sv_vfp_bank);
+    wr_fpscr(sv_fpscr);
     wr_fpexc(sv_fpexc);
     wr_cpacr(sv_cpacr);
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
