@@ -212,6 +212,7 @@ static SceUID azahar_thread = -1;
 static SceUID azahar_client_pid = -1;      // the process azaharTakeCore ran for
 static SceUID azahar_proc_handler = -1;    // registered once, on the first take
 static uint32_t azahar_saved_mask;         // the active CPU mask before the detach
+static int azahar_detached;                // whether this session actually took core 2 out
 static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at map time
 
 // Resident thread <-> syscall side. Everything volatile, no kernel calls on the core-2 side.
@@ -835,6 +836,22 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
     return 0;
 }
 
+// Experiment switch (ux0:data/azahar/no_detach): leave core 2 in the scheduler's active mask
+// and see what Sony does with a core that is occupied but still nominally available. The
+// prediction is that nothing lands on it while the guest is installed - core2_install drops
+// ICCPMR to AZAHAR_PMR_MASK, which masks the rescheduling SGIs, and the private timer is
+// reprogrammed with its interrupt off - so the scheduler can assign a thread to core 2 but has
+// no way to make it run there. A thread stuck that way holding a kernel lock is how this ends
+// badly. Delete the file to go back to detaching.
+static int azahar_no_detach_requested(void) {
+    const SceUID fd = ksceIoOpen(OUT_DIR "/no_detach", SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    ksceIoClose(fd);
+    return 1;
+}
+
 // Ends the resident thread and gives core 2 back to the scheduler, in the only order measured
 // to work: the thread is stopped and waited for first, so the scheduler receives an idle core
 // rather than an occupied one (restoring the mask under a live occupant froze the console,
@@ -853,7 +870,12 @@ static int azahar_stop_resident(void) {
              (uint32_t)ended, AZAHAR_TARGET_CORE);
         return AZAHAR_ERR_CORE;
     }
+    if (!azahar_detached) {
+        emit("  thread ended; the mask was never changed (no-detach run)\n");
+        return 0;
+    }
     const int r = p_ChangeActiveCpuMask((int)azahar_saved_mask);
+    azahar_detached = 0;
     emit("  thread ended; ChangeActiveCpuMask(%08x) -> 0x%08x\n", azahar_saved_mask, (uint32_t)r);
     return 0;
 }
@@ -956,21 +978,33 @@ int azaharTakeCore(void) {
         mask = 0xFu;
         emit("  mask unreadable; assuming %08x\n", mask);
     }
-    const uint32_t detached = mask & ~(1u << AZAHAR_TARGET_CORE);
     const uint32_t beat = azahar_heartbeat;
-    emit("  ChangeActiveCpuMask(%08x) -> 0x%08x  (mask was %08x)\n", detached,
-         (uint32_t)p_ChangeActiveCpuMask((int)detached), mask);
+    azahar_detached = 0;
+    if (azahar_no_detach_requested()) {
+        emit("  NO-DETACH: core %u stays in the scheduler's mask (%08x)\n", AZAHAR_TARGET_CORE, mask);
+    } else {
+        const uint32_t detached = mask & ~(1u << AZAHAR_TARGET_CORE);
+        emit("  ChangeActiveCpuMask(%08x) -> 0x%08x  (mask was %08x)\n", detached,
+             (uint32_t)p_ChangeActiveCpuMask((int)detached), mask);
+        azahar_detached = 1;
+    }
+    // The same gate either way: 250 ms later the resident thread must still be ticking. A
+    // detach that stopped it means the core went away under us; a no-detach run that stops it
+    // means the scheduler took the core back.
     ksceKernelDelayThread(250000);
     if (azahar_heartbeat == beat) {
-        emit("  resident thread STOPPED across the detach; restoring the mask\n");
-        p_ChangeActiveCpuMask((int)mask);
+        emit("  resident thread STOPPED (detached=%d); restoring the mask\n", azahar_detached);
+        if (azahar_detached) {
+            p_ChangeActiveCpuMask((int)mask);
+            azahar_detached = 0;
+        }
         azahar_stop = 1;
         free_blocks();
         ret = AZAHAR_ERR_CORE;
         goto out;
     }
-    emit("  heartbeat %u -> %u across the detach: core %u is ours\n", beat, azahar_heartbeat,
-         AZAHAR_TARGET_CORE);
+    emit("  heartbeat %u -> %u: core %u is ours (detached=%d)\n", beat, azahar_heartbeat,
+         AZAHAR_TARGET_CORE, azahar_detached);
     azahar_saved_mask = mask;
     azahar_client_pid = ksceKernelGetProcessId();
     if (azahar_proc_handler < 0) {
