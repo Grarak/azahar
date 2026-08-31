@@ -22,10 +22,13 @@
 //   azaharRun        enter the guest in user mode with a register file, leave it on the first
 //                 exception (svc, undefined, prefetch or data abort), return the register file
 //                 and the reason (entry.S; new)
-//   azaharRelease    put Sony's registers back on core 2 and park the thread in WFI. The mask is
-//                 never restored: a restore after a held detach leaves the core unschedulable and
-//                 freezes the app at exit, while a detached core with a parked thread lets the
-//                 app exit normally (both measured 2026-08-29)
+//   azaharRelease    put Sony's registers back on core 2, end the resident thread, and hand the
+//                 core back to the scheduler. The order is what makes the hand-back safe:
+//                 restoring the mask while the thread still occupied the core left the core
+//                 unschedulable and froze the app at exit (measured 2026-08-29), so the thread
+//                 is stopped and waited for first - the order azahar_on_proc_gone has always used
+//                 for a dead client. A release that cannot end the thread leaves the core
+//                 detached and refuses to be taken again.
 //
 // Everything the resident thread does after the detach avoids kernel calls: the scheduler is no
 // longer managing it, and a blocking call there is a way to never come back. It talks to the
@@ -832,6 +835,29 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
     return 0;
 }
 
+// Ends the resident thread and gives core 2 back to the scheduler, in the only order measured
+// to work: the thread is stopped and waited for first, so the scheduler receives an idle core
+// rather than an occupied one (restoring the mask under a live occupant froze the console,
+// 2026-08-29). Returns 0 when the core was handed back, AZAHAR_ERR_CORE when the thread would not
+// end - in which case the core stays detached, because a wedged console is worse than a lost
+// core. Callers must have uninstalled first if the state was ST_MAPPED.
+static int azahar_stop_resident(void) {
+    azahar_park = 0;
+    azahar_stop = 1;
+    SceUInt timeout = 1000000;
+    const int ended = ksceKernelWaitThreadEnd(azahar_thread, NULL, &timeout);
+    ksceKernelDeleteThread(azahar_thread);
+    azahar_thread = -1;
+    if (ended < 0) {
+        emit("  resident thread did not end (0x%08x); core %u stays detached\n",
+             (uint32_t)ended, AZAHAR_TARGET_CORE);
+        return AZAHAR_ERR_CORE;
+    }
+    const int r = p_ChangeActiveCpuMask((int)azahar_saved_mask);
+    emit("  thread ended; ChangeActiveCpuMask(%08x) -> 0x%08x\n", azahar_saved_mask, (uint32_t)r);
+    return 0;
+}
+
 // The client process is gone: put the core back. This is the teardown order the syscall path
 // cannot use — restoring the mask during the app's own exit froze it (measured 2026-08-29),
 // because the resident thread still owned the core when the scheduler got it back. Here the
@@ -848,22 +874,7 @@ static int azahar_on_proc_gone(SceUID pid) {
         const int r = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);
         emit("  uninstall -> %d\n", r);
     }
-    azahar_park = 0;
-    azahar_stop = 1;
-    SceUInt timeout = 1000000;
-    const int ended = ksceKernelWaitThreadEnd(azahar_thread, NULL, &timeout);
-    ksceKernelDeleteThread(azahar_thread);
-    azahar_thread = -1;
-    if (ended < 0) {
-        // The thread did not come out of its loop; handing the scheduler a core with a live
-        // occupant is the measured freeze, so better a lost core than a wedged console.
-        emit("  resident thread did not end (0x%08x); core %u stays detached\n",
-             (uint32_t)ended, AZAHAR_TARGET_CORE);
-    } else {
-        const int r = p_ChangeActiveCpuMask((int)azahar_saved_mask);
-        emit("  thread ended; ChangeActiveCpuMask(%08x) -> 0x%08x\n", azahar_saved_mask,
-             (uint32_t)r);
-    }
+    (void)azahar_stop_resident();
     free_blocks();
     azahar_state = ST_NONE;
     azahar_client_pid = -1;
@@ -1710,19 +1721,18 @@ int azaharRelease(void) {
         ret = AZAHAR_ERR_STATE;
         goto out;
     }
-    // Park in WFI on the detached core. The mask is never restored (see the file comment).
-    azahar_park = 1;
-    ksceKernelDelayThread(100000);
-    const uint32_t b0 = azahar_heartbeat, c0 = azahar_park_cycles;
-    ksceKernelDelayThread(500000);
-    const uint32_t wakes = azahar_heartbeat - b0, cycles = azahar_park_cycles - c0;
     emit("  %u run(s) since the map\n", azahar_run_count);
-    emit("  parked: %u wake(s), %u awake cycle(s) in 0.5 s -> %s\n", wakes, cycles,
-         cycles > 50000000u ? "SPINNING (WFI is returning at once)"
-                            : "sleeping between interrupts; overlays still show 100% because the "
-                              "kernel's idle thread never runs here");
+    // Give the core back rather than parking a thread on it forever. A release happens every
+    // time the emulator returns to its game list, not only at exit, so leaving the core taken
+    // meant the next title found azahar_state != ST_NONE and ran without native execution for the
+    // rest of the session. Ending the resident thread before restoring the mask is what makes
+    // the hand-back safe (azahar_stop_resident).
+    const int stopped = azahar_stop_resident();
     free_blocks();
-    azahar_state = ST_RELEASED;
+    // Only a core actually handed back may be taken again: after a failed hand-back the mask
+    // still excludes core 2, and azaharTakeCore would create a thread there that never runs.
+    azahar_state = stopped == 0 ? ST_NONE : ST_RELEASED;
+    azahar_client_pid = -1;
 
 out:
     emit("  -> %d\n", ret);
