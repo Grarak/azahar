@@ -211,6 +211,13 @@ static uint32_t azahar_l2_slot[AZAHAR_L2_COUNT]; // which L1 index each L2 serve
 static SceUID azahar_thread = -1;
 static SceUID azahar_client_pid = -1;      // the process azaharTakeCore ran for
 static SceUID azahar_proc_handler = -1;    // registered once, on the first take
+// EXPERIMENT (2026-08-31): core 2 is left in the scheduler's active mask. core2_install drops
+// ICCPMR to AZAHAR_PMR_MASK, which masks the rescheduling SGIs, and the private timer is
+// reprogrammed with its interrupt off, so the scheduler can assign a thread to core 2 but has
+// no way to make it run there - the run answers what Sony does with a thread parked on a core
+// that never answers. Set back to 0 to restore the detach; both branches still compile.
+#define AZAHAR_NO_DETACH 1
+
 static uint32_t azahar_saved_mask;         // the active CPU mask before the detach
 static int azahar_detached;                // whether this session actually took core 2 out
 static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at map time
@@ -836,22 +843,6 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
     return 0;
 }
 
-// Experiment switch (ux0:data/azahar/no_detach): leave core 2 in the scheduler's active mask
-// and see what Sony does with a core that is occupied but still nominally available. The
-// prediction is that nothing lands on it while the guest is installed - core2_install drops
-// ICCPMR to AZAHAR_PMR_MASK, which masks the rescheduling SGIs, and the private timer is
-// reprogrammed with its interrupt off - so the scheduler can assign a thread to core 2 but has
-// no way to make it run there. A thread stuck that way holding a kernel lock is how this ends
-// badly. Delete the file to go back to detaching.
-static int azahar_no_detach_requested(void) {
-    const SceUID fd = ksceIoOpen(OUT_DIR "/no_detach", SCE_O_RDONLY, 0);
-    if (fd < 0) {
-        return 0;
-    }
-    ksceIoClose(fd);
-    return 1;
-}
-
 // Ends the resident thread and gives core 2 back to the scheduler, in the only order measured
 // to work: the thread is stopped and waited for first, so the scheduler receives an idle core
 // rather than an occupied one (restoring the mask under a live occupant froze the console,
@@ -980,7 +971,7 @@ int azaharTakeCore(void) {
     }
     const uint32_t beat = azahar_heartbeat;
     azahar_detached = 0;
-    if (azahar_no_detach_requested()) {
+    if (AZAHAR_NO_DETACH) {
         emit("  NO-DETACH: core %u stays in the scheduler's mask (%08x)\n", AZAHAR_TARGET_CORE, mask);
     } else {
         const uint32_t detached = mask & ~(1u << AZAHAR_TARGET_CORE);
