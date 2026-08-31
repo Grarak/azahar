@@ -211,15 +211,7 @@ static uint32_t azahar_l2_slot[AZAHAR_L2_COUNT]; // which L1 index each L2 serve
 static SceUID azahar_thread = -1;
 static SceUID azahar_client_pid = -1;      // the process azaharTakeCore ran for
 static SceUID azahar_proc_handler = -1;    // registered once, on the first take
-// EXPERIMENT (2026-08-31): core 2 is left in the scheduler's active mask. core2_install drops
-// ICCPMR to AZAHAR_PMR_MASK, which masks the rescheduling SGIs, and the private timer is
-// reprogrammed with its interrupt off, so the scheduler can assign a thread to core 2 but has
-// no way to make it run there - the run answers what Sony does with a thread parked on a core
-// that never answers. Set back to 0 to restore the detach; both branches still compile.
-#define AZAHAR_NO_DETACH 1
-
 static uint32_t azahar_saved_mask;         // the active CPU mask before the detach
-static int azahar_detached;                // whether this session actually took core 2 out
 static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at map time
 
 // Resident thread <-> syscall side. Everything volatile, no kernel calls on the core-2 side.
@@ -392,7 +384,6 @@ extern int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset
 #define MODE_IRQ 0x12u
 static volatile uint32_t sv_sp_irq, sv_isenabler_timer;
 static volatile uint32_t azahar_timer_sample;   // idle loop: the free-running counter
-static volatile uint32_t azahar_sample;         // hold the idle loop awake, sampling that counter
 static uint32_t azahar_timer_hz;                // measured at map
 static volatile uint32_t azahar_run_quantum_ticks, azahar_run_timer_left;
 static volatile uint32_t azahar_tlb_dirty;      // an edit happened since the guest last ran
@@ -692,16 +683,6 @@ static int core2_entry(SceSize args, void *argp) {
         }
         const uint32_t cmd = azahar_cmd;
         if (cmd == CMD_NONE || azahar_cmd_done) {
-            // Nothing to do. Sleep on the event register rather than spinning: the guest runs
-            // for a few microseconds per command and the core spent the other ~96% of the
-            // second burning clocks against the shared L2 for nothing. WFE is the primitive
-            // that works here - an SGI cannot wake this core, because core2_install masks the
-            // rescheduling interrupts at ICCPMR, while SEV reaches it whatever the GIC is
-            // doing. The event register is sticky, so a SEV that lands between the check above
-            // and the WFE returns from it immediately instead of being lost.
-            if (!azahar_sample) {
-                asm volatile("wfe" ::: "memory");
-            }
             continue;
         }
         switch (cmd) {
@@ -737,8 +718,6 @@ static int core2_command(uint32_t cmd, unsigned steps) {
     azahar_cmd_status = 0xFFFFFFFFu;
     asm volatile("dsb" ::: "memory");
     azahar_cmd = cmd;
-    // The command is published; wake the core that is waiting on it.
-    asm volatile("dsb \n sev" ::: "memory");
     // A guest exit is microseconds away most of the time — an svc round trip measured ~1.5 us
     // — and the emulator waits here on every one of them, so the wait spins first and only
     // sleeps once it is clear the guest is running for real. Sleeping in 1 ms steps after that
@@ -865,9 +844,6 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
 static int azahar_stop_resident(void) {
     azahar_park = 0;
     azahar_stop = 1;
-    // Without this the thread sleeps through its own stop request and the wait below times
-    // out, which costs the core for the rest of the session.
-    asm volatile("dsb \n sev" ::: "memory");
     SceUInt timeout = 1000000;
     const int ended = ksceKernelWaitThreadEnd(azahar_thread, NULL, &timeout);
     ksceKernelDeleteThread(azahar_thread);
@@ -877,12 +853,7 @@ static int azahar_stop_resident(void) {
              (uint32_t)ended, AZAHAR_TARGET_CORE);
         return AZAHAR_ERR_CORE;
     }
-    if (!azahar_detached) {
-        emit("  thread ended; the mask was never changed (no-detach run)\n");
-        return 0;
-    }
     const int r = p_ChangeActiveCpuMask((int)azahar_saved_mask);
-    azahar_detached = 0;
     emit("  thread ended; ChangeActiveCpuMask(%08x) -> 0x%08x\n", azahar_saved_mask, (uint32_t)r);
     return 0;
 }
@@ -956,7 +927,7 @@ int azaharTakeCore(void) {
     }
 
     // Occupy first, detach second: a thread pinned to an already-detached core never runs.
-    azahar_heartbeat = azahar_stop = azahar_park = azahar_cmd = azahar_cmd_done = azahar_sample = 0;
+    azahar_heartbeat = azahar_stop = azahar_park = azahar_cmd = azahar_cmd_done = 0;
     azahar_thread = ksceKernelCreateThread("vanative_core2", core2_entry, 0x10000100, 0x4000, 0,
                                         CPU_AFFINITY(AZAHAR_TARGET_CORE), NULL);
     if (azahar_thread < 0 || ksceKernelStartThread(azahar_thread, 0, NULL) < 0) {
@@ -985,35 +956,21 @@ int azaharTakeCore(void) {
         mask = 0xFu;
         emit("  mask unreadable; assuming %08x\n", mask);
     }
+    const uint32_t detached = mask & ~(1u << AZAHAR_TARGET_CORE);
     const uint32_t beat = azahar_heartbeat;
-    // The heartbeat counts wake-ups now, not spins, so the gate has to knock first.
-    asm volatile("dsb \n sev" ::: "memory");
-    azahar_detached = 0;
-    if (AZAHAR_NO_DETACH) {
-        emit("  NO-DETACH: core %u stays in the scheduler's mask (%08x)\n", AZAHAR_TARGET_CORE, mask);
-    } else {
-        const uint32_t detached = mask & ~(1u << AZAHAR_TARGET_CORE);
-        emit("  ChangeActiveCpuMask(%08x) -> 0x%08x  (mask was %08x)\n", detached,
-             (uint32_t)p_ChangeActiveCpuMask((int)detached), mask);
-        azahar_detached = 1;
-    }
-    // The same gate either way: 250 ms later the resident thread must still be ticking. A
-    // detach that stopped it means the core went away under us; a no-detach run that stops it
-    // means the scheduler took the core back.
+    emit("  ChangeActiveCpuMask(%08x) -> 0x%08x  (mask was %08x)\n", detached,
+         (uint32_t)p_ChangeActiveCpuMask((int)detached), mask);
     ksceKernelDelayThread(250000);
     if (azahar_heartbeat == beat) {
-        emit("  resident thread STOPPED (detached=%d); restoring the mask\n", azahar_detached);
-        if (azahar_detached) {
-            p_ChangeActiveCpuMask((int)mask);
-            azahar_detached = 0;
-        }
+        emit("  resident thread STOPPED across the detach; restoring the mask\n");
+        p_ChangeActiveCpuMask((int)mask);
         azahar_stop = 1;
         free_blocks();
         ret = AZAHAR_ERR_CORE;
         goto out;
     }
-    emit("  heartbeat %u -> %u: core %u is ours (detached=%d)\n", beat, azahar_heartbeat,
-         AZAHAR_TARGET_CORE, azahar_detached);
+    emit("  heartbeat %u -> %u across the detach: core %u is ours\n", beat, azahar_heartbeat,
+         AZAHAR_TARGET_CORE);
     azahar_saved_mask = mask;
     azahar_client_pid = ksceKernelGetProcessId();
     if (azahar_proc_handler < 0) {
@@ -1486,16 +1443,9 @@ int azaharMap(const AzaharMapRequest *user_req) {
     // against the A9 ratio; this is the number the quantum is converted with.
     azahar_timer_hz = 0;
     if (gic_va) {
-        // The counter is the core's own banked private timer, so only core 2 can read it, and
-        // it now sleeps between commands. Hold it awake for the measurement; the settle delay
-        // is so the first sample is one this loop took, not the stale one it slept on.
-        azahar_sample = 1;
-        asm volatile("dsb \n sev" ::: "memory");
-        ksceKernelDelayThread(1000);
         const uint32_t s0 = azahar_timer_sample, t0 = ksceKernelGetSystemTimeLow();
         ksceKernelDelayThread(AZAHAR_TIMER_MEASURE_US);
         const uint32_t s1 = azahar_timer_sample, t1 = ksceKernelGetSystemTimeLow();
-        azahar_sample = 0;
         const uint32_t ticks = s0 - s1, us = t1 - t0; // counts down
         if (us) {
             azahar_timer_hz = (uint32_t)(((uint64_t)ticks * 1000000ull) / us);
