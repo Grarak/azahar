@@ -80,9 +80,6 @@
 #ifndef GICD_ICENABLER0
 #define GICD_ICENABLER0 0x1180u
 #endif
-#ifndef GICD_ITARGETSR
-#define GICD_ITARGETSR 0x1800u    // one byte per interrupt ID; SPIs (32 and up) are not banked
-#endif
 #define AZAHAR_TIMER_MEASURE_US 300000u
 
 // 1: the table holds only what core 2 needs — guest windows, the vector page, this module's
@@ -425,69 +422,11 @@ static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid) {
                  : "memory");
 }
 
-// SPIs routed to core 2 and to nowhere else. Once core2_install drops ICCPMR they can never
-// be delivered, and whatever device owns them waits forever - the 2026-08-31 routing scan
-// counted four on this console (ids 38, 70, 73, 178). Point them at another core for exactly
-// as long as the guest is installed, and put them back byte for byte afterwards.
-//
-// Interrupts that merely *include* core 2 in their target list need nothing done: the
-// distributor signals those to every targeted interface and the first to acknowledge takes
-// it, so a core sitting behind a priority mask simply never answers and another one does.
-// That is why only the exclusive row matters, and it is worth the write to the shared
-// distributor that this is - it affects the whole system, so it is undone on the way out.
-static uint8_t azahar_spi_saved[256];
-static unsigned azahar_spi_moved;
-
-static void azahar_retarget_spis(void) {
-    azahar_spi_moved = 0;
-    if (!gic_va || !gic_has_dist) {
-        return;
-    }
-    volatile uint8_t *const targets = (volatile uint8_t *)(uintptr_t)(gic_va + GICD_ITARGETSR);
-    const uint8_t ours = (uint8_t)(1u << AZAHAR_TARGET_CORE);
-    uint8_t dest = 0;
-    for (unsigned c = 0; c < 4; c++) {
-        if (c != AZAHAR_TARGET_CORE) {
-            dest = (uint8_t)(1u << c);
-            break;
-        }
-    }
-    for (unsigned id = 32; id < 256; id++) {
-        azahar_spi_saved[id] = 0;
-        if ((targets[id] & 0xFu) == ours) {
-            azahar_spi_saved[id] = ours;
-            targets[id] = dest;
-            azahar_spi_moved++;
-        }
-    }
-    asm volatile("dsb \n isb" ::: "memory");
-}
-
-/// Idempotent: whichever of uninstall or the teardown path runs first puts them back.
-static void azahar_restore_spis(void) {
-    if (azahar_spi_moved == 0 || !gic_va || !gic_has_dist) {
-        azahar_spi_moved = 0;
-        return;
-    }
-    volatile uint8_t *const targets = (volatile uint8_t *)(uintptr_t)(gic_va + GICD_ITARGETSR);
-    for (unsigned id = 32; id < 256; id++) {
-        if (azahar_spi_saved[id] != 0) {
-            targets[id] = azahar_spi_saved[id];
-            azahar_spi_saved[id] = 0;
-        }
-    }
-    asm volatile("dsb \n isb" ::: "memory");
-    azahar_spi_moved = 0;
-}
-
 static void core2_install(void) {
     // Own the core from here on: nothing of Sony's is delivered to it while our table is in.
     // The 2026-08-29 run that left interrupts open between install and the first run took a
     // prefetch abort within 0.1 s — Sony's IRQ path running under a copy of its L1 that had
     // already gone stale.
-    // Before the mask goes up, not after: an SPI that only this core can take must already be
-    // pointing somewhere else by the time it stops answering.
-    azahar_retarget_spis();
     volatile uint32_t *const pmr = gic_va ? (volatile uint32_t *)(gic_va + GICC_PMR) : NULL;
     if (pmr) {
         sv_pmr = *pmr & 0xFFu;
@@ -590,8 +529,6 @@ static void core2_uninstall(void) {
         *pmr = sv_pmr;
         asm volatile("dsb \n isb" ::: "memory");
     }
-    // After the mask comes down, so nothing is routed back to a core that still cannot answer.
-    azahar_restore_spis();
     azahar_cmd_status = 0;
 }
 
@@ -907,9 +844,6 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
 static int azahar_stop_resident(void) {
     azahar_park = 0;
     azahar_stop = 1;
-    // Backstop for a teardown that never got to uninstall: leaving the distributor rewritten
-    // would outlive this process and cost the system those interrupts for good.
-    azahar_restore_spis();
     SceUInt timeout = 1000000;
     const int ended = ksceKernelWaitThreadEnd(azahar_thread, NULL, &timeout);
     ksceKernelDeleteThread(azahar_thread);
@@ -1503,8 +1437,6 @@ int azaharMap(const AzaharMapRequest *user_req) {
          AZAHAR_TARGET_CORE, sv_ttbcr, azahar_ttbcr_seen, sv_vbar, azahar_vec_va, sv_sp_und, sv_sp_abt,
          sv_sp_svc, sv_sp_irq, sv_pmr, AZAHAR_PMR_MASK, sv_isenabler_timer ? "enabled" : "disabled",
          sv_cpacr, sv_fpexc);
-    emit("  %u SPI(s) that could only land on core %u pointed elsewhere for the session\n",
-         azahar_spi_moved, AZAHAR_TARGET_CORE);
 
     // The private timer's clock, from the idle loop's samples of the free-running counter
     // against the system clock. PLAN.md §14.2 carries a device-tree claim of a fixed 144 MHz
