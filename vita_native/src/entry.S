@@ -52,6 +52,16 @@ azahar_enter:
     vldmia  r2, {d16-d31}
     ldr     r3, [r0, #0x4c]
     vmsr    fpscr, r3
+    @ Drop any exclusive reservation before the guest resumes. Whether an exception return
+    @ clears the local monitor is IMPLEMENTATION DEFINED on ARMv7-A, so it cannot be assumed:
+    @ guest thread A can take its exit between an ldrex and its strex, and if the reservation
+    @ survives into thread B then B's strex to the same word succeeds when the architecture
+    @ says it must fail. That is a 3DS LightLock handed to two owners at once, and it is how
+    @ eight of thirteen guest threads ended up parked on address arbiters nobody would signal
+    @ (2026-09-01). One instruction per entry, and it also makes ClearExclusiveState's
+    @ no-op honest. A spurious strex failure is architecturally permitted and every lock loop
+    @ retries, so clearing on every entry costs nothing but the instruction.
+    clrex
     cpsid   if                      @ nothing may interrupt the banked-register dance
     cps     #0x13                   @ Supervisor
     str     sp, [r1, #0x08]         @ Sony's SP_svc, put back on exit
