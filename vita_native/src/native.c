@@ -80,6 +80,9 @@
 #ifndef GICD_ICENABLER0
 #define GICD_ICENABLER0 0x1180u
 #endif
+#ifndef GICD_ISPENDR0
+#define GICD_ISPENDR0 0x1200u     // banked: this core's pending IDs 0-31
+#endif
 #define AZAHAR_TIMER_MEASURE_US 300000u
 
 // 1: the table holds only what core 2 needs — guest windows, the vector page, this module's
@@ -388,6 +391,12 @@ static uint32_t azahar_timer_hz;                // measured at map
 static volatile uint32_t azahar_run_quantum_ticks, azahar_run_timer_left;
 static volatile uint32_t azahar_tlb_dirty;      // an edit happened since the guest last ran
 static uint32_t azahar_run_count;
+// Core-2 side: our table/vectors/PMR are in (set at the end of core2_install, cleared first
+// thing in core2_uninstall), so the resident loop knows when the SGI poll applies.
+static volatile uint32_t azahar_installed;
+// SGI service windows (core2_sgi_window): how many opened, the last pending mask that opened
+// one, and how many timed out with a bit still pending. Read on the syscall core at release.
+static volatile uint32_t azahar_sgi_windows, azahar_sgi_last_pend, azahar_sgi_stuck;
 // 1: every azaharRun logs its entry and exit (the trigger app's test); 0: only faults, preemptions
 // and errors (the emulator). The test app asks for it through azaharMap's count sign — see azaharMap.
 static int azahar_verbose;
@@ -499,10 +508,12 @@ static void core2_install(void) {
 
     // Our vectors, executable only because our table says so.
     asm volatile("mcr p15, 0, %0, c12, c0, 0 \n isb" ::"r"(azahar_vec_va) : "memory");
+    azahar_installed = 1;
     azahar_cmd_status = 0;
 }
 
 static void core2_uninstall(void) {
+    azahar_installed = 0;
     asm volatile("mcr p15, 0, %0, c12, c0, 0 \n isb" ::"r"(sv_vbar) : "memory");
     core2_switch(sv_ttbcr, sv_ttbr0, sv_ctxid);
     azahar_set_banked_sp(MODE_UND, sv_sp_und);
@@ -530,6 +541,44 @@ static void core2_uninstall(void) {
         asm volatile("dsb \n isb" ::: "memory");
     }
     azahar_cmd_status = 0;
+}
+
+// The kernel's cross-core calls — Threadmgr on SGI 2/7, Processmgr on SGI 6 (FINDINGS,
+// 2026-08-17) — broadcast to every core, and the sender spins until each core's handler has
+// run. With ICCPMR at AZAHAR_PMR_MASK a taken core never takes them, so the sender spins forever
+// holding whatever lock it holds, and the whole console freezes. Hardware showed this the
+// first time a system process spawned mid-title (2026-09-01): module loading does an all-core
+// icache rendezvous, and the burst of module starts ended in a full-device freeze. Steady-state
+// gameplay never triggers it — the 2026-08-29 count saw no foreign SGI at all — which is why
+// every earlier hold survived.
+//
+// The answer is to service the SGI rather than emulate its protocol: put Sony's world back for
+// a moment (core2_uninstall restores the PMR last, so the pending SGI vectors straight into
+// Sony's own handler, which does the flush and acks the barrier), then take the core again.
+// The scheduler still dispatches nothing here — the active-mask bit stays clear, and STAGE_HOLD
+// ran 180 s that way with interrupts open — so the resident thread resumes the instant the
+// handler returns. The TLBIALL/ICIALLU each way is the price of the round trip; a window opens
+// only when an SGI actually pends. Latency to the answer is bounded by one guest slice
+// (16 ms cap, sub-millisecond in practice with the SVC exit rate).
+static void core2_sgi_window(void) {
+    core2_uninstall();
+    // The interrupt delivers within a few cycles of the PMR write above. Stay open while
+    // pending bits keep appearing — a process start loads many modules back to back — bounded
+    // in case a bit sticks (a pending-but-disabled SGI would otherwise pin the loop).
+    uint32_t spins = 0;
+    while (spins < 100000u) {
+        const uint32_t pend = *(volatile uint32_t *)(gic_va + GICD_ISPENDR0) &
+                              *(volatile uint32_t *)(gic_va + GICD_ISENABLER0) & 0x7FFFu;
+        if (!pend) {
+            break;
+        }
+        spins++;
+    }
+    if (spins >= 100000u) {
+        azahar_sgi_stuck++;
+    }
+    core2_install();
+    azahar_sgi_windows++;
 }
 
 // One trip into the guest. Interrupts are masked at the GIC for its duration — the core is
@@ -680,6 +729,17 @@ static int core2_entry(SceSize args, void *argp) {
         }
         if (azahar_gic_va) {
             azahar_timer_sample = *(volatile uint32_t *)(azahar_gic_va + PTIMER_COUNTER);
+        }
+        // An SGI pending against this core while our world is installed is a cross-core call
+        // the kernel is spinning on (core2_sgi_window). Checked between commands only — during
+        // a slice the guest owns the core and the pend bit simply waits for the next exit.
+        if (azahar_installed && gic_va) {
+            const uint32_t pend = *(volatile uint32_t *)(gic_va + GICD_ISPENDR0) &
+                                  *(volatile uint32_t *)(gic_va + GICD_ISENABLER0) & 0x7FFFu;
+            if (pend) {
+                azahar_sgi_last_pend = pend;
+                core2_sgi_window();
+            }
         }
         const uint32_t cmd = azahar_cmd;
         if (cmd == CMD_NONE || azahar_cmd_done) {
@@ -1722,6 +1782,8 @@ int azaharRelease(void) {
         goto out;
     }
     emit("  %u run(s) since the map\n", azahar_run_count);
+    emit("  sgi windows %u  last pend %04x  stuck %u\n", azahar_sgi_windows, azahar_sgi_last_pend,
+         azahar_sgi_stuck);
     // Give the core back rather than parking a thread on it forever. A release happens every
     // time the emulator returns to its game list, not only at exit, so leaving the core taken
     // meant the next title found azahar_state != ST_NONE and ran without native execution for the
