@@ -723,7 +723,9 @@ static int core2_entry(SceSize args, void *argp) {
                 pmu_begin(&pmu);
                 pmu_on = 1;
             }
-            asm volatile("wfi" ::: "memory");
+            // WFE, not WFI: a taken core sees no interrupt for seconds at a time, and the
+            // next azaharTakeCore has to be able to wake this. SEV from any core does.
+            asm volatile("wfe" ::: "memory");
             azahar_park_cycles = rd_pmccntr();
             continue;
         }
@@ -934,9 +936,13 @@ static int azahar_on_proc_gone(SceUID pid) {
         const int r = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);
         emit("  uninstall -> %d\n", r);
     }
-    (void)azahar_stop_resident();
+    // Same as azaharRelease: the core stays detached and the thread parked. Restoring the
+    // scheduler mask is what froze the console (2026-08-29 under a live occupant, 2026-09-04
+    // after the thread had ended), so the mask is never restored; the next client reuses
+    // the core.
+    azahar_park = 1;
     free_blocks();
-    azahar_state = ST_NONE;
+    azahar_state = ST_RELEASED;
     azahar_client_pid = -1;
     log_release();
     return 0;
@@ -969,7 +975,7 @@ int azaharTakeCore(void) {
     emit("== azaharTakeCore\n");
     int ret = 0;
 
-    if (azahar_state != ST_NONE) {
+    if (azahar_state != ST_NONE && azahar_state != ST_RELEASED) {
         ret = AZAHAR_ERR_STATE;
         goto out;
     }
@@ -978,6 +984,38 @@ int azaharTakeCore(void) {
         goto out;
     }
     azahar_gic();
+
+    if (azahar_state == ST_RELEASED) {
+        // A previous title released the core without handing it back (azaharRelease): the
+        // scheduler still excludes it, and the resident thread is idling on it. Prove the
+        // thread is alive and take it over as it stands.
+        if (azahar_thread < 0) {
+            ret = AZAHAR_ERR_STATE;
+            goto out;
+        }
+        const uint32_t beat = azahar_heartbeat;
+        azahar_park = 0;
+        asm volatile("dsb \n sev" ::: "memory");
+        unsigned w;
+        for (w = 0; w < 20 && azahar_heartbeat == beat; w++) {
+            ksceKernelDelayThread(10000);
+        }
+        if (azahar_heartbeat == beat) {
+            emit("  resident thread is not running on the released core\n");
+            ret = AZAHAR_ERR_CORE;
+            goto out;
+        }
+        if ((ret = alloc_block("azahar_l1", AZAHAR_L1_ENTRIES * 4, 0x4000, &azahar_l1_uid, &azahar_l1, &azahar_l1_pa)) ||
+            (ret = alloc_block("azahar_l2", AZAHAR_L2_COUNT * 0x400, 0x1000, &azahar_l2_uid, &azahar_l2, &azahar_l2_pa)) ||
+            (ret = alloc_block("azahar_vec", 0x100000, 0x100000, &azahar_vec_uid, &azahar_vec, &azahar_vec_pa))) {
+            free_blocks();
+            goto out;
+        }
+        azahar_cmd = azahar_cmd_done = 0;
+        emit("  reusing the detached core: heartbeat %u -> %u\n", beat, azahar_heartbeat);
+        azahar_state = ST_TAKEN;
+        goto out;
+    }
 
     if ((ret = alloc_block("azahar_l1", AZAHAR_L1_ENTRIES * 4, 0x4000, &azahar_l1_uid, &azahar_l1, &azahar_l1_pa)) ||
         (ret = alloc_block("azahar_l2", AZAHAR_L2_COUNT * 0x400, 0x1000, &azahar_l2_uid, &azahar_l2, &azahar_l2_pa)) ||
@@ -1784,16 +1822,18 @@ int azaharRelease(void) {
     emit("  %u run(s) since the map\n", azahar_run_count);
     emit("  sgi windows %u  last pend %04x  stuck %u\n", azahar_sgi_windows, azahar_sgi_last_pend,
          azahar_sgi_stuck);
-    // Give the core back rather than parking a thread on it forever. A release happens every
-    // time the emulator returns to its game list, not only at exit, so leaving the core taken
-    // meant the next title found azahar_state != ST_NONE and ran without native execution for the
-    // rest of the session. Ending the resident thread before restoring the mask is what makes
-    // the hand-back safe (azahar_stop_resident).
-    const int stopped = azahar_stop_resident();
+    // The core stays detached, with Sony's world restored on it (core2_uninstall put back
+    // every register install touched) and the resident thread idling between commands with
+    // interrupts open - the state STAGE_HOLD ran 180 s in. The guest's tables go now; the
+    // next azaharTakeCore builds fresh ones and reuses the thread, so the second title of a
+    // session gets native execution without the core changing hands. Handing the core back
+    // from a live process - ending the thread, then restoring the scheduler mask - froze the
+    // whole console right after the release (measured 2026-09-04), so that hand-back is now
+    // done only once the client process is gone (azahar_on_proc_gone), the order that restored
+    // cleanly on 2026-08-26.
+    azahar_park = 1;
     free_blocks();
-    // Only a core actually handed back may be taken again: after a failed hand-back the mask
-    // still excludes core 2, and azaharTakeCore would create a thread there that never runs.
-    azahar_state = stopped == 0 ? ST_NONE : ST_RELEASED;
+    azahar_state = ST_RELEASED;
     azahar_client_pid = -1;
 
 out:
