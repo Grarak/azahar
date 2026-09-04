@@ -213,6 +213,7 @@ static uint32_t azahar_l2_slot[AZAHAR_L2_COUNT]; // which L1 index each L2 serve
 
 static SceUID azahar_thread = -1;
 static SceUID azahar_client_pid = -1;      // the process azaharTakeCore ran for
+static int azahar_detached;                // whether this session took core 2 out of the mask
 static SceUID azahar_proc_handler = -1;    // registered once, on the first take
 static uint32_t azahar_saved_mask;         // the active CPU mask before the detach
 static uint32_t azahar_sony[8]; // Sony's handler per vector slot, decoded at map time
@@ -903,9 +904,36 @@ static int azahar_user_page(uint32_t uva, uint32_t *pa, int *how, uint32_t *par_
 // 2026-08-29). Returns 0 when the core was handed back, AZAHAR_ERR_CORE when the thread would not
 // end - in which case the core stays detached, because a wedged console is worse than a lost
 // core. Callers must have uninstalled first if the state was ST_MAPPED.
+// Experiment switch (ux0:data/azahar/no_detach): leave core 2 in the scheduler's active mask
+// and hold it by masking interrupts alone. Nothing can land on the core while the guest is
+// installed - core2_install drops ICCPMR to AZAHAR_PMR_MASK, which masks the rescheduling SGIs,
+// and the private timer's interrupt is off - so the scheduler may assign a thread to core 2
+// but has no way to make it run there. A system thread pinned to core 2 while it holds a
+// kernel lock is how this ends badly, and the cross-core calls that would have frozen the
+// console this way now get answered (core2_sgi_window), which is what makes the experiment
+// worth rerunning: it was built on 2026-08-31 and reverted the same day inside a batch whose
+// stated failure was the WFE idle, so it never got a verdict of its own.
+//
+// What it buys, if it holds: nothing to restore at release. The mask is never changed, so the
+// one-way reattach (FINDINGS, "The reattach is one-way") cannot happen, the resident thread
+// ends like any other thread, and core 2 goes straight back to the scheduler - available to
+// the shell and to every other app, which the park-and-never-restore teardown cannot offer.
+// Delete the file to go back to detaching.
+static int azahar_no_detach_requested(void) {
+    const SceUID fd = ksceIoOpen(OUT_DIR "/no_detach", SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    ksceIoClose(fd);
+    return 1;
+}
+
+// End the resident thread and, if this session took the core out of the mask, put the mask
+// back. Only a no-detach session may do the second half: see azaharRelease.
 static int azahar_stop_resident(void) {
     azahar_park = 0;
     azahar_stop = 1;
+    asm volatile("dsb \n sev" ::: "memory");
     SceUInt timeout = 1000000;
     const int ended = ksceKernelWaitThreadEnd(azahar_thread, NULL, &timeout);
     ksceKernelDeleteThread(azahar_thread);
@@ -915,16 +943,17 @@ static int azahar_stop_resident(void) {
              (uint32_t)ended, AZAHAR_TARGET_CORE);
         return AZAHAR_ERR_CORE;
     }
+    if (!azahar_detached) {
+        emit("  thread ended; the mask was never changed (no-detach run)\n");
+        return 0;
+    }
     const int r = p_ChangeActiveCpuMask((int)azahar_saved_mask);
     emit("  thread ended; ChangeActiveCpuMask(%08x) -> 0x%08x\n", azahar_saved_mask, (uint32_t)r);
+    azahar_detached = 0;
     return 0;
 }
 
-// The client process is gone: put the core back. This is the teardown order the syscall path
-// cannot use — restoring the mask during the app's own exit froze it (measured 2026-08-29),
-// because the resident thread still owned the core when the scheduler got it back. Here the
-// process is already dead, so the thread is ended first, waited for, and only then is the mask
-// restored: the scheduler receives an idle core, not an occupied one.
+// The client process is gone: same teardown as azaharRelease, which the two paths share below.
 static int azahar_on_proc_gone(SceUID pid) {
     if (pid != azahar_client_pid || azahar_state == ST_NONE) {
         return 0;
@@ -936,13 +965,18 @@ static int azahar_on_proc_gone(SceUID pid) {
         const int r = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);
         emit("  uninstall -> %d\n", r);
     }
-    // Same as azaharRelease: the core stays detached and the thread parked. Restoring the
-    // scheduler mask is what froze the console (2026-08-29 under a live occupant, 2026-09-04
-    // after the thread had ended), so the mask is never restored; the next client reuses
-    // the core.
-    azahar_park = 1;
-    free_blocks();
-    azahar_state = ST_RELEASED;
+    if (!azahar_detached) {
+        // Nothing was taken from the scheduler, so nothing has to be given back: the resident
+        // thread ends like any other thread and core 2 is a normal core again the moment it
+        // does. This is the whole point of a no-detach session.
+        const int ended = azahar_stop_resident();
+        free_blocks();
+        azahar_state = ended == 0 ? ST_NONE : ST_RELEASED;
+    } else {
+        azahar_park = 1;
+        free_blocks();
+        azahar_state = ST_RELEASED;
+    }
     azahar_client_pid = -1;
     log_release();
     return 0;
@@ -1054,21 +1088,32 @@ int azaharTakeCore(void) {
         mask = 0xFu;
         emit("  mask unreadable; assuming %08x\n", mask);
     }
-    const uint32_t detached = mask & ~(1u << AZAHAR_TARGET_CORE);
     const uint32_t beat = azahar_heartbeat;
-    emit("  ChangeActiveCpuMask(%08x) -> 0x%08x  (mask was %08x)\n", detached,
-         (uint32_t)p_ChangeActiveCpuMask((int)detached), mask);
+    azahar_detached = 0;
+    if (azahar_no_detach_requested()) {
+        emit("  NO-DETACH: core %u stays in the scheduler's mask (%08x)\n", AZAHAR_TARGET_CORE, mask);
+    } else {
+        const uint32_t detached = mask & ~(1u << AZAHAR_TARGET_CORE);
+        emit("  ChangeActiveCpuMask(%08x) -> 0x%08x  (mask was %08x)\n", detached,
+             (uint32_t)p_ChangeActiveCpuMask((int)detached), mask);
+        azahar_detached = 1;
+    }
+    // The same gate either way: 250 ms later the resident thread must still be ticking. A
+    // detach that stopped it means the core went away under us; a no-detach run that stops it
+    // means the scheduler took the core back.
     ksceKernelDelayThread(250000);
     if (azahar_heartbeat == beat) {
-        emit("  resident thread STOPPED across the detach; restoring the mask\n");
-        p_ChangeActiveCpuMask((int)mask);
+        emit("  resident thread STOPPED (detached=%d); restoring the mask\n", azahar_detached);
+        if (azahar_detached) {
+            p_ChangeActiveCpuMask((int)mask);
+            azahar_detached = 0;
+        }
         azahar_stop = 1;
         free_blocks();
         ret = AZAHAR_ERR_CORE;
         goto out;
     }
-    emit("  heartbeat %u -> %u across the detach: core %u is ours\n", beat, azahar_heartbeat,
-         AZAHAR_TARGET_CORE);
+    emit("  heartbeat %u -> %u: core %u is ours\n", beat, azahar_heartbeat, AZAHAR_TARGET_CORE);
     azahar_saved_mask = mask;
     azahar_client_pid = ksceKernelGetProcessId();
     if (azahar_proc_handler < 0) {
@@ -1822,18 +1867,30 @@ int azaharRelease(void) {
     emit("  %u run(s) since the map\n", azahar_run_count);
     emit("  sgi windows %u  last pend %04x  stuck %u\n", azahar_sgi_windows, azahar_sgi_last_pend,
          azahar_sgi_stuck);
-    // The core stays detached, with Sony's world restored on it (core2_uninstall put back
-    // every register install touched) and the resident thread idling between commands with
-    // interrupts open - the state STAGE_HOLD ran 180 s in. The guest's tables go now; the
-    // next azaharTakeCore builds fresh ones and reuses the thread, so the second title of a
-    // session gets native execution without the core changing hands. Handing the core back
-    // from a live process - ending the thread, then restoring the scheduler mask - froze the
-    // whole console right after the release (measured 2026-09-04), so that hand-back is now
-    // done only once the client process is gone (azahar_on_proc_gone), the order that restored
-    // cleanly on 2026-08-26.
-    azahar_park = 1;
-    free_blocks();
-    azahar_state = ST_RELEASED;
+    // Sony's world is back on core 2 either way (core2_uninstall put back every register
+    // install touched). What happens to the core depends on whether this session took it:
+    //
+    // Detached: it stays detached, with the resident thread parked - the state STAGE_HOLD ran
+    // 180 s in. The mask is never restored. Handing the core back froze the whole console
+    // under a live occupant (2026-08-29) and again after a clean thread end (2026-09-04),
+    // because a core detached with a thread resident on it is never dispatched to again
+    // (FINDINGS, "The reattach is one-way"). The guest's tables go now; the next azaharTakeCore
+    // wakes the parked thread and reuses the core, so a second title still runs natively.
+    //
+    // No-detach: nothing was taken, so nothing is given back. The thread ends and core 2 is
+    // an ordinary core again.
+    if (!azahar_detached) {
+        // Nothing was taken from the scheduler, so nothing has to be given back: the resident
+        // thread ends like any other thread and core 2 is a normal core again the moment it
+        // does. This is the whole point of a no-detach session.
+        const int ended = azahar_stop_resident();
+        free_blocks();
+        azahar_state = ended == 0 ? ST_NONE : ST_RELEASED;
+    } else {
+        azahar_park = 1;
+        free_blocks();
+        azahar_state = ST_RELEASED;
+    }
     azahar_client_pid = -1;
 
 out:
