@@ -1710,6 +1710,7 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     ENTER_SYSCALL(state);
     log_open();
     int ret = 0;
+    int quiet = 0; /* SYNC_CODE comes once a frame on some titles: logged only when it fails */
 
     if (azahar_state != ST_MAPPED) {
         ret = AZAHAR_ERR_STATE;
@@ -1721,10 +1722,12 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     }
     const AzaharRange *rg = &azahar_edit_req.range;
     const uint32_t op = azahar_edit_req.op;
-    emit("== azaharEdit %s guest %08x user %08x size %08x\n",
-         op == AZAHAR_EDIT_MAP ? "MAP" : op == AZAHAR_EDIT_UNMAP ? "UNMAP" : op == AZAHAR_EDIT_PROTECT ? "PROTECT"
-         : op == AZAHAR_EDIT_SYNC_CODE ? "SYNC_CODE" : "?",
-         rg->guest_va, rg->user_va, rg->size);
+    quiet = op == AZAHAR_EDIT_SYNC_CODE;
+    if (!quiet)
+        emit("== azaharEdit %s guest %08x user %08x size %08x\n",
+             op == AZAHAR_EDIT_MAP ? "MAP" : op == AZAHAR_EDIT_UNMAP ? "UNMAP" : op == AZAHAR_EDIT_PROTECT ? "PROTECT"
+             : op == AZAHAR_EDIT_SYNC_CODE ? "SYNC_CODE" : "?",
+             rg->guest_va, rg->user_va, rg->size);
     if (op == AZAHAR_EDIT_SYNC_CODE) {
         if ((rg->user_va & 0xFFFu) || (rg->size & 0xFFFu) || !rg->size) {
             ret = AZAHAR_ERR_ARG;
@@ -1788,7 +1791,8 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     }
 
 out:
-    emit("  -> %d\n", ret);
+    if (!quiet || ret != 0)
+        emit("  -> %d\n", ret);
     log_close();
     EXIT_SYSCALL(state);
     return ret;
