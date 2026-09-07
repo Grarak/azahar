@@ -1722,7 +1722,8 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     }
     const AzaharRange *rg = &azahar_edit_req.range;
     const uint32_t op = azahar_edit_req.op;
-    quiet = op == AZAHAR_EDIT_SYNC_CODE;
+    /* PROTECT comes per armed page from the guest write tracker: logged only when it fails */
+    quiet = op == AZAHAR_EDIT_SYNC_CODE || op == AZAHAR_EDIT_PROTECT;
     if (!quiet)
         emit("== azaharEdit %s guest %08x user %08x size %08x\n",
              op == AZAHAR_EDIT_MAP ? "MAP" : op == AZAHAR_EDIT_UNMAP ? "UNMAP" : op == AZAHAR_EDIT_PROTECT ? "PROTECT"
@@ -1772,8 +1773,9 @@ int azaharEdit(const AzaharEditRequest *user_req) {
                 *d = (op == AZAHAR_EDIT_UNMAP) ? 0u : azahar_small_page(*d & 0xFFFFF000u, rg->perm);
                 done++;
             }
-            emit("  %u page(s) %s, %u not mapped\n", done,
-                 op == AZAHAR_EDIT_UNMAP ? "unmapped" : "reprotected", missing);
+            if (!quiet || missing)
+                emit("  %u page(s) %s, %u not mapped\n", done,
+                     op == AZAHAR_EDIT_UNMAP ? "unmapped" : "reprotected", missing);
             if (op == AZAHAR_EDIT_PROTECT && missing) {
                 ret = AZAHAR_ERR_ARG;
             }
@@ -1794,6 +1796,28 @@ out:
     if (!quiet || ret != 0)
         emit("  -> %d\n", ret);
     log_close();
+    EXIT_SYSCALL(state);
+    return ret;
+}
+
+// The counters the release prints, readable while a title runs: how many SGI service
+// windows core 2 has opened, the last pending mask that opened one, how many timed out, and
+// the resident loop's heartbeat - so a freeze log's last second says whether core 2 was still
+// polling and whether a cross-core call had just been serviced or was pending.
+int azaharSgiStats(AzaharSgiStats *user_out) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    AzaharSgiStats out;
+    out.windows = azahar_sgi_windows;
+    out.last_pend = azahar_sgi_last_pend;
+    out.stuck = azahar_sgi_stuck;
+    out.heartbeat = azahar_heartbeat;
+    out.installed = azahar_installed;
+    out.pending_now = 0;
+    if (azahar_installed && gic_va) {
+        out.pending_now = *(volatile uint32_t *)(gic_va + GICD_ISPENDR0) & 0x7FFFu;
+    }
+    const int ret = ksceKernelCopyToUser(user_out, &out, sizeof(out)) < 0 ? AZAHAR_ERR_ARG : 0;
     EXIT_SYSCALL(state);
     return ret;
 }
