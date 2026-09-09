@@ -103,7 +103,31 @@
 // still synced as written; azaharRun writes none on the success path for the same reason.
 static SceUID azahar_fd = -1;
 
+// Logging is opt-in: ux0:data/azahar/log present means native.txt and the kernel printf
+// mirror as before; absent (the default) means no file, no printf, and emit() returns at
+// once. Checked once per take.
+static int azahar_log_checked, azahar_log_wanted;
+static int azahar_log_enabled(void) {
+    if (!azahar_log_checked) {
+        azahar_log_checked = 1;
+        const SceUID fd = ksceIoOpen(OUT_DIR "/log", SCE_O_RDONLY, 0);
+        azahar_log_wanted = fd >= 0;
+        if (fd >= 0) {
+            ksceIoClose(fd);
+        }
+    }
+    return azahar_log_wanted;
+}
+
 static void log_open(void) {
+    if (!azahar_log_enabled()) {
+        azahar_mute = 1;
+        out_fd = -1;
+        buf_len = 0;
+        log_sync = 0;
+        return;
+    }
+    azahar_mute = 0;
     if (azahar_fd < 0) {
         ksceIoMkdir(OUT_DIR, 0777);
         azahar_fd = ksceIoOpen(AZAHAR_LOG_PATH, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
@@ -114,6 +138,9 @@ static void log_open(void) {
 }
 
 static void log_close(void) {
+    if (azahar_mute) {
+        return;
+    }
     flush_buf();
     out_fd = -1;
     log_sync = 0;
@@ -401,6 +428,19 @@ static volatile uint32_t azahar_sgi_windows, azahar_sgi_last_pend, azahar_sgi_st
 // 1: every azaharRun logs its entry and exit (the trigger app's test); 0: only faults, preemptions
 // and errors (the emulator). The test app asks for it through azaharMap's count sign — see azaharMap.
 static int azahar_verbose;
+// Folded (the default): no resident thread. azaharRun switches the calling core into the guest
+// world for one slice and back, so the emulation thread and the guest share a core and the
+// other three are the kernel's. ux0:data/azahar/resident selects the old design, a kernel
+// thread holding core 2 and the emulation thread posting commands to it from another core.
+static int azahar_folded = 1;
+static int azahar_resident_requested(void) {
+    const SceUID fd = ksceIoOpen(OUT_DIR "/resident", SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    ksceIoClose(fd);
+    return 1;
+}
 
 #define MODE_SVC 0x13u
 static volatile uint32_t sv_sp_svc, sv_pmr;
@@ -413,7 +453,7 @@ static volatile uint32_t sv_sp_svc, sv_pmr;
 // The table switch, both directions. ARM ARM B3.10.4 example B3-3 with erratum 754322's dsb on
 // each side; TTBCR and TTBR0 change inside one break-before-make block because between them the
 // CPU would read a 1024-entry table as though it had 4096 (azaharnative STAGE_OWN, 2026-08-26).
-static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid) {
+static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid, int icache) {
     asm volatile("dsb                             \n"
                  "mcr p15, 0, %[zero], c13, c0, 1 \n"
                  "isb                             \n"
@@ -423,13 +463,17 @@ static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid) {
                  "mcr p15, 0, %[ctx],  c13, c0, 1 \n"
                  "dsb                             \n"
                  "mcr p15, 0, %[zero], c8, c7, 0  \n" // TLBIALL
-                 "mcr p15, 0, %[zero], c7, c5, 0  \n" // ICIALLU: guest code was written as data
                  "mcr p15, 0, %[zero], c7, c5, 6  \n" // BPIALL
                  "dsb                             \n"
                  "isb                             \n"
                  :
                  : [tcr] "r"(ttbcr), [ttb] "r"(ttbr0), [ctx] "r"(ctxid), [zero] "r"(0u)
                  : "memory");
+    if (icache) {
+        // Guest code was written as data: the instruction cache is physically tagged, so this
+        // is only needed on the way in, and Sony's code on the way out has not changed.
+        asm volatile("mcr p15, 0, %0, c7, c5, 0 \n dsb \n isb" ::"r"(0u) : "memory");
+    }
 }
 
 static void core2_install(void) {
@@ -504,7 +548,7 @@ static void core2_install(void) {
 
     // N = 0: the table base is bits [31:14].
     const uint32_t ours = ((uint32_t)azahar_l1_pa & 0xFFFFC000u) | (sv_ttbr0 & 0x3FFFu);
-    core2_switch(sv_ttbcr & ~7u, ours, sv_ctxid);
+    core2_switch(sv_ttbcr & ~7u, ours, sv_ctxid, 1);
     azahar_ttbcr_seen = rd_ttbcr();
 
     // Our vectors, executable only because our table says so.
@@ -516,7 +560,7 @@ static void core2_install(void) {
 static void core2_uninstall(void) {
     azahar_installed = 0;
     asm volatile("mcr p15, 0, %0, c12, c0, 0 \n isb" ::"r"(sv_vbar) : "memory");
-    core2_switch(sv_ttbcr, sv_ttbr0, sv_ctxid);
+    core2_switch(sv_ttbcr, sv_ttbr0, sv_ctxid, 0);
     azahar_set_banked_sp(MODE_UND, sv_sp_und);
     azahar_set_banked_sp(MODE_ABT, sv_sp_abt);
     azahar_set_banked_sp(MODE_SVC, sv_sp_svc);
@@ -696,6 +740,51 @@ static void core2_run(void) {
                   : (reason == AZAHAR_EXIT_PABT) ? azahar_exit_info[6] : 0u;
     azahar_progress = 50;
     azahar_cmd_status = 0;
+}
+
+// Folded mode: one slice on the calling core. The same install, run and uninstall the
+// resident thread does once at map, once per command and once at release, done here per
+// slice around azahar_enter. The PMR mask holds from install to uninstall, so nothing of Sony's
+// runs on this core in between; the moment the mask lifts, anything that pended (the tick,
+// a cross-core call) is delivered into Sony's own handler, which replaces the SGI window.
+// The syscall's kernel stack is the host stack azahar_enter saves and the vectors come back to.
+static void fold_run(void) {
+    core2_install();
+    core2_run();
+    core2_uninstall();
+}
+
+// Folded mode's timer calibration: the private timer of this core, free-running against the
+// system clock for AZAHAR_TIMER_MEASURE_US. The thread is pinned, so the counter read after the
+// delay is the same core's.
+static void fold_measure_timer(void) {
+    azahar_timer_hz = 0;
+    if (!gic_va) {
+        return;
+    }
+    volatile uint32_t *const isen = (volatile uint32_t *)(gic_va + GICD_ISENABLER0);
+    const uint32_t was_enabled = (*isen >> PTIMER_PPI) & 1u;
+    *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
+    *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
+    *(volatile uint32_t *)(gic_va + PTIMER_LOAD) = 0xFFFFFFFFu;
+    *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = PTIMER_CTRL_ENABLE | PTIMER_CTRL_RELOAD;
+    asm volatile("dsb \n isb" ::: "memory");
+    const uint32_t s0 = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
+    const uint32_t t0 = ksceKernelGetSystemTimeLow();
+    ksceKernelDelayThread(AZAHAR_TIMER_MEASURE_US);
+    const uint32_t s1 = *(volatile uint32_t *)(gic_va + PTIMER_COUNTER);
+    const uint32_t t1 = ksceKernelGetSystemTimeLow();
+    *(volatile uint32_t *)(gic_va + PTIMER_CONTROL) = 0;
+    *(volatile uint32_t *)(gic_va + PTIMER_STATUS) = 1;
+    if (!was_enabled) {
+        *(volatile uint32_t *)(gic_va + GICD_ICENABLER0) = 1u << PTIMER_PPI;
+    }
+    asm volatile("dsb \n isb" ::: "memory");
+    const uint32_t ticks = s0 - s1, us = t1 - t0; // counts down
+    if (us) {
+        azahar_timer_hz = (uint32_t)(((uint64_t)ticks * 1000000ull) / us);
+    }
+    emit("  private timer (folded): %u ticks in %u us -> %u Hz\n", ticks, us, azahar_timer_hz);
 }
 
 static int core2_entry(SceSize args, void *argp) {
@@ -964,6 +1053,13 @@ static int azahar_on_proc_gone(SceUID pid) {
     log_open();
     emit("== client process gone (state %d)\n", azahar_state);
     pmu_host_stop_all();
+    if (azahar_folded) {
+        free_blocks();
+        azahar_state = ST_NONE;
+        azahar_client_pid = -1;
+        log_release();
+        return 0;
+    }
     if (azahar_state == ST_MAPPED) {
         const int r = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);
         emit("  uninstall -> %d\n", r);
@@ -1021,6 +1117,30 @@ int azaharTakeCore(void) {
         goto out;
     }
     azahar_gic();
+    azahar_folded = !azahar_resident_requested();
+    if (azahar_folded) {
+        if (azahar_state == ST_RELEASED) {
+            // A parked resident thread from a session that ran in the other mode.
+            ret = AZAHAR_ERR_STATE;
+            goto out;
+        }
+        if ((ret = alloc_block("azahar_l1", AZAHAR_L1_ENTRIES * 4, 0x4000, &azahar_l1_uid, &azahar_l1, &azahar_l1_pa)) ||
+            (ret = alloc_block("azahar_l2", AZAHAR_L2_COUNT * 0x400, 0x1000, &azahar_l2_uid, &azahar_l2, &azahar_l2_pa)) ||
+            (ret = alloc_block("azahar_vec", 0x100000, 0x100000, &azahar_vec_uid, &azahar_vec, &azahar_vec_pa))) {
+            free_blocks();
+            goto out;
+        }
+        azahar_detached = 0;
+        azahar_installed = 0;
+        azahar_client_pid = ksceKernelGetProcessId();
+        if (azahar_proc_handler < 0) {
+            azahar_proc_handler = ksceKernelRegisterProcEventHandler("vanative", &azahar_proc_events, 0);
+            emit("  process-event handler: 0x%08x\n", (uint32_t)azahar_proc_handler);
+        }
+        emit("  folded: no resident thread, the caller's core runs the guest\n");
+        azahar_state = ST_TAKEN;
+        goto out;
+    }
 
     if (azahar_state == ST_RELEASED) {
         // A previous title released the core without handing it back (azaharRelease): the
@@ -1575,6 +1695,18 @@ int azaharMap(const AzaharMapRequest *user_req) {
     if ((ret = build_table(&azahar_req)) != 0) {
         goto out;
     }
+    if (azahar_folded) {
+        // Prove the world switch on this core once, both ways, before any guest runs.
+        core2_install();
+        core2_uninstall();
+        emit("  installed and removed once on cpu%u: ttbcr %08x -> %08x, vbar %08x -> %08x, "
+             "pmr %02x -> %02x, cpacr %08x fpexc %08x\n",
+             (uint32_t)ksceKernelCpuId(), sv_ttbcr, azahar_ttbcr_seen, sv_vbar, azahar_vec_va, sv_pmr,
+             AZAHAR_PMR_MASK, sv_cpacr, sv_fpexc);
+        fold_measure_timer();
+        azahar_state = ST_MAPPED;
+        goto out;
+    }
     if ((ret = core2_command(CMD_INSTALL, AZAHAR_WAIT_STEPS)) != 0) {
         goto out;
     }
@@ -1647,7 +1779,10 @@ int azaharRun(AzaharRunRequest *user_req) {
              azahar_run_req.quantum_us, azahar_run_quantum_ticks);
     }
 
-    if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
+    if (azahar_folded) {
+        fold_run();
+        ret = 0;
+    } else if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
         emit("== azaharRun  pc %08x cpsr %08x sp %08x r0 %08x r1 %08x  quantum %u us = %u ticks\n",
              azahar_run_req.ctx.r[15], azahar_ctx.cpsr, azahar_ctx.r[13], azahar_ctx.r[0], azahar_ctx.r[1],
              azahar_run_req.quantum_us, azahar_run_quantum_ticks);
@@ -1822,6 +1957,51 @@ int azaharSgiStats(AzaharSgiStats *user_out) {
     return ret;
 }
 
+// Every thread of the client with the registers the kernel holds for it: where a thread
+// that stopped retiring work actually is. ksceKernelGetThreadCpuRegisters wants the thread
+// suspended, so each thread but the caller's is debug-suspended around the read and resumed
+// at once. This is what found the 2026-09-08 freeze (an overtaken notification wait).
+int azaharThreadDump(void) {
+    uint32_t state;
+    ENTER_SYSCALL(state);
+    int count = 0;
+    if (azahar_client_pid >= 0) {
+        log_open();
+        emit("== azaharThreadDump\n");
+        static SceUID ids[128];
+        int copied = 0;
+        if (ksceKernelGetThreadIdList(azahar_client_pid, ids, 128, &copied) >= 0) {
+            for (int i = 0; i < copied; i++) {
+                SceKernelThreadInfo info;
+                info.size = sizeof(info);
+                if (ksceKernelGetThreadInfo(ids[i], &info) < 0) {
+                    continue;
+                }
+                SceThreadCpuRegisters regs;
+                __builtin_memset(&regs, 0, sizeof(regs));
+                int r = -1;
+                if (ids[i] != ksceKernelGetThreadId()) {
+                    const int sus = ksceKernelDebugSuspendThread(ids[i], 0x100);
+                    r = ksceKernelGetThreadCpuRegisters(ids[i], &regs);
+                    if (sus >= 0) {
+                        ksceKernelDebugResumeThread(ids[i], 0x100);
+                    }
+                }
+                emit("  %-24s thid %08x status %x prio %3d cpu %d aff %05x wait %d/%08x  user pc %08x "
+                     "lr %08x sp %08x  kernel pc %08x lr %08x  (regs %d)\n",
+                     info.name, (uint32_t)ids[i], (uint32_t)info.status, info.currentPriority,
+                     info.lastExecutedCpuId, (uint32_t)info.currentCpuAffinityMask,
+                     (int)info.waitType, (uint32_t)info.waitId, regs.entry[0].pc, regs.entry[0].lr,
+                     regs.entry[0].sp, regs.entry[1].pc, regs.entry[1].lr, r);
+                count++;
+            }
+        }
+        log_close();
+    }
+    EXIT_SYSCALL(state);
+    return count;
+}
+
 int azaharPmuReadAll(AzaharPmuAll *user_out) {
     uint32_t state;
     ENTER_SYSCALL(state);
@@ -1888,6 +2068,17 @@ int azaharRelease(void) {
 
     pmu_host_stop_all();
 
+    if (azahar_folded) {
+        if (azahar_state != ST_MAPPED && azahar_state != ST_TAKEN) {
+            ret = AZAHAR_ERR_STATE;
+            goto out;
+        }
+        emit("  %u run(s) since the map (folded)\n", azahar_run_count);
+        free_blocks();
+        azahar_state = ST_NONE;
+        azahar_client_pid = -1;
+        goto out;
+    }
     if (azahar_state == ST_MAPPED) {
         ret = core2_command(CMD_UNINSTALL, AZAHAR_WAIT_STEPS);
         emit("  uninstall -> %d (vbar back to %08x)\n", ret, sv_vbar);

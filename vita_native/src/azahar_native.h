@@ -143,4 +143,21 @@ int azaharPmuReadAll(AzaharPmuAll *out);
 }
 #endif
 
+
+/// The SGI service-window counters and the resident loop's heartbeat (resident mode; the
+/// folded mode reports zeros except installed). pending_now is the banked GICD_ISPENDR0.
+typedef struct AzaharSgiStats {
+    uint32_t windows;
+    uint32_t last_pend;
+    uint32_t stuck;
+    uint32_t heartbeat;
+    uint32_t installed;
+    uint32_t pending_now;
+} AzaharSgiStats;
+int azaharSgiStats(AzaharSgiStats *out);
+/// Writes every thread of the client with its kernel-held registers (user and kernel pc,
+/// lr, sp; status, priority, last core, wait) to ux0:data/azahar/native.txt, when logging
+/// is enabled (ux0:data/azahar/log). Returns the number of threads seen, 0 without a client.
+int azaharThreadDump(void);
+
 #endif
