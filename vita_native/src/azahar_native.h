@@ -139,11 +139,6 @@ int azaharEdit(const AzaharEditRequest *req);
 int azaharPmuRead(AzaharPmuStats *out);
 int azaharPmuReadAll(AzaharPmuAll *out);
 
-#ifdef __cplusplus
-}
-#endif
-
-
 /// The SGI service-window counters and the resident loop's heartbeat (resident mode; the
 /// folded mode reports zeros except installed). pending_now is the banked GICD_ISPENDR0.
 typedef struct AzaharSgiStats {
@@ -159,5 +154,10 @@ int azaharSgiStats(AzaharSgiStats *out);
 /// lr, sp; status, priority, last core, wait) to ux0:data/azahar/native.txt, when logging
 /// is enabled (ux0:data/azahar/log). Returns the number of threads seen, 0 without a client.
 int azaharThreadDump(void);
+
+#ifdef __cplusplus
+}
+#endif
+
 
 #endif
