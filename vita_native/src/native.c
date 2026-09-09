@@ -682,17 +682,29 @@ static void core2_run(void) {
     }
 
     if (azahar_tlb_dirty) {
-        // Descriptors changed under us since the last run: drop every stale translation,
-        // predicted branch and cached instruction before the guest sees the new map.
-        asm volatile("dsb                            \n"
-                     "mcr p15, 0, %0, c8, c7, 0      \n" // TLBIALL
-                     "mcr p15, 0, %0, c7, c5, 6      \n" // BPIALL
-                     "mcr p15, 0, %0, c7, c5, 0      \n" // ICIALLU
-                     "dsb                            \n"
-                     "isb                            \n"
+        // Descriptors changed under us since the last run, so a translation may be stale and
+        // the TLB always goes. What else is stale depends on the edit, and this used to drop
+        // everything for all of them: the line was written when MAP was the only edit, and
+        // mapping a guest code range does need all three, since the app wrote those
+        // instructions through its own view and this core may have executed different code at
+        // the address before. PROTECT and SYNC_CODE came later and the blanket was never
+        // narrowed. A permission change moves no memory and rewrites no instruction, so the
+        // instruction cache and the branch predictor are still correct for it, and the guest
+        // write tracker makes one of those edits per armed run of pages.
+        asm volatile("dsb                       \n"
+                     "mcr p15, 0, %0, c8, c7, 0 \n" // TLBIALL
                      :
                      : "r"(0u)
                      : "memory");
+        if (azahar_icache_stale) {
+            asm volatile("mcr p15, 0, %0, c7, c5, 6 \n"  // BPIALL
+                         "mcr p15, 0, %0, c7, c5, 0 \n"  // ICIALLU
+                         :
+                         : "r"(0u)
+                         : "memory");
+            azahar_icache_stale = 0;
+        }
+        asm volatile("dsb \n isb" ::: "memory");
         azahar_tlb_dirty = 0;
     }
     azahar_progress = 2;
@@ -1899,6 +1911,9 @@ out:
 }
 
 static AzaharEditRequest azahar_edit_req;
+/// The span of descriptors the edit in progress wrote, or NULL for one that may have touched
+/// the tables at large.
+static uint32_t *edit_dirty_lo, *edit_dirty_hi;
 
 int azaharEdit(const AzaharEditRequest *user_req) {
     uint32_t state;
@@ -1919,6 +1934,7 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     const uint32_t op = azahar_edit_req.op;
     /* PROTECT comes per armed page from the guest write tracker: logged only when it fails */
     quiet = op == AZAHAR_EDIT_SYNC_CODE || op == AZAHAR_EDIT_PROTECT;
+    edit_dirty_lo = edit_dirty_hi = NULL;
     if (!quiet)
         emit("== azaharEdit %s guest %08x user %08x size %08x\n",
              op == AZAHAR_EDIT_MAP ? "MAP" : op == AZAHAR_EDIT_UNMAP ? "UNMAP" : op == AZAHAR_EDIT_PROTECT ? "PROTECT"
@@ -1942,6 +1958,7 @@ int azaharEdit(const AzaharEditRequest *user_req) {
         }
         asm volatile("dsb" ::: "memory");
         azahar_tlb_dirty = 1;
+        azahar_icache_stale = 1; // the whole point of this op: the guest rewrote instructions
         goto out;
     }
     if (!check_range(rg, op == AZAHAR_EDIT_MAP) ||
@@ -1957,6 +1974,9 @@ int azaharEdit(const AzaharEditRequest *user_req) {
         case AZAHAR_EDIT_UNMAP:
         case AZAHAR_EDIT_PROTECT: {
             unsigned done = 0, missing = 0;
+            // The descriptors this edit actually writes, so the clean below can cover them
+            // rather than the whole table array.
+            uint32_t *lo = NULL, *hi = NULL;
             for (uint32_t off = 0; off < rg->size; off += 0x1000) {
                 const uint32_t gva = rg->guest_va + off;
                 const int t = l2_for(gva >> 20, 0);
@@ -1966,6 +1986,12 @@ int azaharEdit(const AzaharEditRequest *user_req) {
                     continue;
                 }
                 *d = (op == AZAHAR_EDIT_UNMAP) ? 0u : azahar_small_page(*d & 0xFFFFF000u, rg->perm);
+                if (lo == NULL || d < lo) {
+                    lo = d;
+                }
+                if (hi == NULL || d > hi) {
+                    hi = d;
+                }
                 done++;
             }
             if (!quiet || missing)
@@ -1974,6 +2000,8 @@ int azaharEdit(const AzaharEditRequest *user_req) {
             if (op == AZAHAR_EDIT_PROTECT && missing) {
                 ret = AZAHAR_ERR_ARG;
             }
+            edit_dirty_lo = lo;
+            edit_dirty_hi = hi;
             break;
         }
         default:
@@ -1981,10 +2009,28 @@ int azaharEdit(const AzaharEditRequest *user_req) {
             break;
     }
     if (ret == 0) {
-        ksceKernelDcacheCleanRange(azahar_l2, AZAHAR_L2_COUNT * 0x400);
-        ksceKernelDcacheCleanRange(azahar_l1, AZAHAR_L1_ENTRIES * 4);
+        // Only what changed. Cleaning the whole table array was 256 KB of cache maintenance
+        // plus 16 KB of the top level on every call, and guest write tracking makes one call
+        // per armed run of pages, hundreds of times a second: that, not the invalidation the
+        // next slice does, is what made the console slower with tracking on than without
+        // (2026-09-09, Smash at 72 to 92% speed against 100%). A map may create tables and
+        // write the top level, so it still cleans both in full; it happens when a mapping
+        // changes, not per frame.
+        if (edit_dirty_lo != NULL) {
+            uint8_t *const first = (uint8_t *)edit_dirty_lo;
+            uint8_t *const last = (uint8_t *)edit_dirty_hi + 4;
+            ksceKernelDcacheCleanRange(first, (SceSize)(last - first));
+        } else {
+            ksceKernelDcacheCleanRange(azahar_l2, AZAHAR_L2_COUNT * 0x400);
+            ksceKernelDcacheCleanRange(azahar_l1, AZAHAR_L1_ENTRIES * 4);
+        }
         asm volatile("dsb" ::: "memory");
         azahar_tlb_dirty = 1;
+        if (op != AZAHAR_EDIT_PROTECT) {
+            // A map can bring different code to an address this core has executed at, and an
+            // unmap is cheap enough not to argue about.
+            azahar_icache_stale = 1;
+        }
     }
 
 out:
