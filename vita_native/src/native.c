@@ -139,6 +139,9 @@ static void log_open(void) {
 
 static void log_close(void) {
     if (azahar_mute) {
+        // The mute lasts exactly as long as the native call: the probe stages in main.c share
+        // emit() and log for their own reasons.
+        azahar_mute = 0;
         return;
     }
     flush_buf();
@@ -433,6 +436,13 @@ static int azahar_verbose;
 // other three are the kernel's. ux0:data/azahar/resident selects the old design, a kernel
 // thread holding core 2 and the emulation thread posting commands to it from another core.
 static int azahar_folded = 1;
+// The instruction cache is invalidated when the guest's code may have changed under us, not
+// on every install: folded mode installs once per slice, and an ICIALLU each time would throw
+// away the emulation thread's own cached code three thousand times a second. The map and every
+// azaharEdit set it, core2_install consumes it, and core2_run's azahar_tlb_dirty path does the same
+// job for a descriptor change mid-session.
+static volatile uint32_t azahar_icache_stale = 1;
+
 static int azahar_resident_requested(void) {
     const SceUID fd = ksceIoOpen(OUT_DIR "/resident", SCE_O_RDONLY, 0);
     if (fd < 0) {
@@ -548,7 +558,8 @@ static void core2_install(void) {
 
     // N = 0: the table base is bits [31:14].
     const uint32_t ours = ((uint32_t)azahar_l1_pa & 0xFFFFC000u) | (sv_ttbr0 & 0x3FFFu);
-    core2_switch(sv_ttbcr & ~7u, ours, sv_ctxid, 1);
+    core2_switch(sv_ttbcr & ~7u, ours, sv_ctxid, (int)azahar_icache_stale);
+    azahar_icache_stale = 0;
     azahar_ttbcr_seen = rd_ttbcr();
 
     // Our vectors, executable only because our table says so.
@@ -563,7 +574,13 @@ static void core2_uninstall(void) {
     core2_switch(sv_ttbcr, sv_ttbr0, sv_ctxid, 0);
     azahar_set_banked_sp(MODE_UND, sv_sp_und);
     azahar_set_banked_sp(MODE_ABT, sv_sp_abt);
-    azahar_set_banked_sp(MODE_SVC, sv_sp_svc);
+    // Never the mode we are running in: azahar_set_banked_sp writes the live stack pointer, and
+    // install and uninstall do not stand at the same depth, so this would move the stack under
+    // the caller and it would return into nothing. Both designs install from SVC, so SVC is
+    // the entry that has to be skipped; UND, ABT and IRQ are always foreign here.
+    if ((rd_cpsr() & 0x1Fu) != MODE_SVC) {
+        azahar_set_banked_sp(MODE_SVC, sv_sp_svc);
+    }
     azahar_set_banked_sp(MODE_IRQ, sv_sp_irq);
     wr_tpidruro(sv_tpidruro);
     wr_tpidrurw(sv_tpidrurw);
@@ -1346,6 +1363,14 @@ static int build_table(const AzaharMapRequest *req) {
     // TTBR0 is one global table; TTBR1 is per process, and the one core 2 needs is the resident
     // kernel thread's, not this syscall's — the first run (2026-08-29) read the app's TTBR1 here,
     // whose pages are not where the kernel keeps its own, and found nothing to merge.
+    if (azahar_core2_vbar == 0 || azahar_core2_sp == 0) {
+        // Nothing captured the core's context: in the resident design core2_entry does it,
+        // in the folded one azaharMap does it for the caller. Without it this function would
+        // read Sony's vectors from address zero, which killed the syscall (2026-09-09).
+        emit("  no core context: vbar %08x sp %08x ttbr1 %08x\n", azahar_core2_vbar, azahar_core2_sp,
+             azahar_core2_ttbr1);
+        return AZAHAR_ERR_STATE;
+    }
     const uint32_t kernel_l1_pa = rd_ttbr0() & 0xFFFFF000u;
     const uint32_t ttbr1_pa = azahar_core2_ttbr1 & 0xFFFFC000u;
     const uint32_t *kernel_l1 = find_kernel_page(kernel_l1_pa);
@@ -1353,16 +1378,23 @@ static int build_table(const AzaharMapRequest *req) {
         emit("  kernel L1 pa %08x not found in the low 8 MB\n", kernel_l1_pa);
         return AZAHAR_ERR_TABLE;
     }
+    // Only megabytes at or above 0x40000000 come from the upper table; the kernel's code, its
+    // thread stacks and this module all live in the low gigabyte, which TTBR0 covers globally.
+    // A page that cannot be located is therefore left out rather than fatal: the folded design
+    // reads the app process's TTBR1, whose pages are not where the kernel keeps its own
+    // (measured 2026-08-29). The preflight below refuses an address that needed one.
     const uint32_t *upper[4] = {NULL, NULL, NULL, NULL};
     for (unsigned pg = 1; pg < 4; pg++) {
         upper[pg] = find_kernel_page(ttbr1_pa + pg * 0x1000u);
         if (!upper[pg]) {
-            emit("  TTBR1 page %u (pa %08x) not found\n", pg, ttbr1_pa + pg * 0x1000u);
-            return AZAHAR_ERR_TABLE;
+            emit("  TTBR1 page %u (pa %08x) not found; nothing above %08x can be kept\n", pg,
+                 ttbr1_pa + pg * 0x1000u, pg << 30);
         }
     }
     // The kernel's entry for L1 index `idx`, from whichever of its two tables holds it.
-#define KERNEL_L1(idx) ((idx) < 1024u ? kernel_l1[(idx)] : upper[(idx) >> 10][(idx) & 1023u])
+#define KERNEL_L1(idx)                                                                             \
+    ((idx) < 1024u ? kernel_l1[(idx)]                                                              \
+                   : (upper[(idx) >> 10] != NULL ? upper[(idx) >> 10][(idx) & 1023u] : 0u))
 
     for (unsigned i = 0; i < AZAHAR_L1_ENTRIES; i++) {
         azahar_l1[i] = 0;
@@ -1501,8 +1533,10 @@ static int build_table(const AzaharMapRequest *req) {
     keep[nkeep].len = (uint32_t)(uintptr_t)azahar_irq_stack_top -
                       ((uint32_t)(uintptr_t)azahar_stray_stack_top - 0x40u);
     nkeep++;
-    keep[nkeep].addr = azahar_core2_sp - 0x4000u;
-    keep[nkeep].len = 0x4800u;
+    // The stack the slice runs on: the resident thread's own, or in folded mode the caller's
+    // syscall stack, whose depth differs between azaharMap and azaharRun - hence the slack each way.
+    keep[nkeep].addr = azahar_core2_sp - 0x8000u;
+    keep[nkeep].len = 0x10000u;
     nkeep++;
     if (gic_va != 0) {
         keep[nkeep].addr = gic_va;
@@ -1641,8 +1675,18 @@ static int build_table(const AzaharMapRequest *req) {
                              azahar_core2_sp, gic_va, (uint32_t)(uintptr_t)&core2_run};
     static const char *const crit_name[] = {"entry code", "context", "core-2 stack", "gic",
                                             "core-2 C code"};
+    // The GIC may legitimately be absent (azahar_gic says so and the guest runs unmasked); the
+    // rest may not, and a zero address used to pass this check by being skipped.
+    static const uint8_t crit_required[] = {1, 1, 1, 0, 1};
     for (unsigned i = 0; i < sizeof(crit) / sizeof(crit[0]); i++) {
-        if (crit[i] && (azahar_l1[crit[i] >> 20] & 3u) == 0) {
+        if (crit[i] == 0) {
+            if (!crit_required[i]) {
+                continue;
+            }
+            emit("  preflight: %s address is zero\n", crit_name[i]);
+            return AZAHAR_ERR_TABLE;
+        }
+        if ((azahar_l1[crit[i] >> 20] & 3u) == 0) {
             emit("  preflight: %s at %08x -> l1[%03x] invalid\n", crit_name[i], crit[i],
                  crit[i] >> 20);
             return AZAHAR_ERR_TABLE;
@@ -1692,6 +1736,20 @@ int azaharMap(const AzaharMapRequest *user_req) {
         }
     }
 
+    if (azahar_folded) {
+        // The slice runs on this thread, on this core, on this stack: what core2_entry records
+        // about the resident thread is recorded here about the caller. The stack is the
+        // syscall's, and the tables are the ones in force while the app runs.
+        uint32_t sp;
+        asm volatile("mov %0, sp" : "=r"(sp));
+        azahar_on_core = (uint32_t)ksceKernelCpuId() & 3;
+        azahar_core2_vbar = rd_vbar();
+        azahar_core2_cpsr = rd_cpsr();
+        azahar_core2_ttbr1 = rd_ttbr1();
+        azahar_core2_sp = sp;
+        emit("  folded: cpu%u vbar %08x ttbr1 %08x sp %08x\n", azahar_on_core, azahar_core2_vbar,
+             azahar_core2_ttbr1, azahar_core2_sp);
+    }
     if ((ret = build_table(&azahar_req)) != 0) {
         goto out;
     }
