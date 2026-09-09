@@ -1707,9 +1707,9 @@ static int build_table(const AzaharMapRequest *req) {
     }
 
     // The app's pages were cleaned one by one above; the tables and vectors go with them.
+    // The vector page is code and core 2 fetches it through a mapping of its own, so it is
+    // cleaned; the tables are read by the walker, which is coherent with these caches.
     ksceKernelDcacheCleanRange(azahar_vec, 0x100);
-    ksceKernelDcacheCleanRange(azahar_l2, AZAHAR_L2_COUNT * 0x400);
-    ksceKernelDcacheCleanRange(azahar_l1, AZAHAR_L1_ENTRIES * 4);
     asm volatile("dsb" ::: "memory");
     return 0;
 }
@@ -1911,9 +1911,6 @@ out:
 }
 
 static AzaharEditRequest azahar_edit_req;
-/// The span of descriptors the edit in progress wrote, or NULL for one that may have touched
-/// the tables at large.
-static uint32_t *edit_dirty_lo, *edit_dirty_hi;
 
 int azaharEdit(const AzaharEditRequest *user_req) {
     uint32_t state;
@@ -1934,7 +1931,6 @@ int azaharEdit(const AzaharEditRequest *user_req) {
     const uint32_t op = azahar_edit_req.op;
     /* PROTECT comes per armed page from the guest write tracker: logged only when it fails */
     quiet = op == AZAHAR_EDIT_SYNC_CODE || op == AZAHAR_EDIT_PROTECT;
-    edit_dirty_lo = edit_dirty_hi = NULL;
     if (!quiet)
         emit("== azaharEdit %s guest %08x user %08x size %08x\n",
              op == AZAHAR_EDIT_MAP ? "MAP" : op == AZAHAR_EDIT_UNMAP ? "UNMAP" : op == AZAHAR_EDIT_PROTECT ? "PROTECT"
@@ -2000,8 +1996,8 @@ int azaharEdit(const AzaharEditRequest *user_req) {
             if (op == AZAHAR_EDIT_PROTECT && missing) {
                 ret = AZAHAR_ERR_ARG;
             }
-            edit_dirty_lo = lo;
-            edit_dirty_hi = hi;
+            (void)lo;
+            (void)hi;
             break;
         }
         default:
@@ -2009,21 +2005,14 @@ int azaharEdit(const AzaharEditRequest *user_req) {
             break;
     }
     if (ret == 0) {
-        // Only what changed. Cleaning the whole table array was 256 KB of cache maintenance
-        // plus 16 KB of the top level on every call, and guest write tracking makes one call
-        // per armed run of pages, hundreds of times a second: that, not the invalidation the
-        // next slice does, is what made the console slower with tracking on than without
-        // (2026-09-09, Smash at 72 to 92% speed against 100%). A map may create tables and
-        // write the top level, so it still cleans both in full; it happens when a mapping
-        // changes, not per frame.
-        if (edit_dirty_lo != NULL) {
-            uint8_t *const first = (uint8_t *)edit_dirty_lo;
-            uint8_t *const last = (uint8_t *)edit_dirty_hi + 4;
-            ksceKernelDcacheCleanRange(first, (SceSize)(last - first));
-        } else {
-            ksceKernelDcacheCleanRange(azahar_l2, AZAHAR_L2_COUNT * 0x400);
-            ksceKernelDcacheCleanRange(azahar_l1, AZAHAR_L1_ENTRIES * 4);
-        }
+        // No cache maintenance on the descriptors, only the barrier that orders them before
+        // the invalidation the next slice does. The tables live in ordinary cacheable kernel
+        // memory and our TTBR0 keeps Sony's own walk attributes (core2_install takes the low
+        // fourteen bits of the kernel's), so the table walker reads them coherently, the way
+        // the kernel's own tables are read: it edits those constantly and cleans nothing.
+        // This used to clean the whole array on every call, 256 KB of descriptors plus 16 KB
+        // of the top level, whatever the edit had touched, and the guest write tracker makes
+        // one call per armed run of pages, hundreds of times a second.
         asm volatile("dsb" ::: "memory");
         azahar_tlb_dirty = 1;
         if (op != AZAHAR_EDIT_PROTECT) {
