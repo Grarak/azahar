@@ -131,6 +131,10 @@ extern "C" {
 #endif
 
 // User-side prototypes (the kernel exports these as syscalls).
+/// azaharTakeCore's success value when the module folded the guest into the caller: no core is
+/// held, and each slice runs on whichever core calls azaharRun. Plain 0 means a core was taken
+/// and the caller must stay off it.
+#define AZAHAR_TAKE_FOLDED 1
 int azaharTakeCore(void);
 int azaharMap(const AzaharMapRequest *req);
 int azaharRun(AzaharRunRequest *req);
@@ -148,6 +152,9 @@ typedef struct AzaharSgiStats {
     uint32_t heartbeat;
     uint32_t installed;
     uint32_t pending_now;
+    /// The core the last slice ran on: the resident thread's in the held design, the caller's
+    /// own in the folded one, where it answers "is the guest where the partition put it".
+    uint32_t core;
 } AzaharSgiStats;
 int azaharSgiStats(AzaharSgiStats *out);
 /// Writes every thread of the client with its kernel-held registers (user and kernel pc,

@@ -1156,6 +1156,7 @@ int azaharTakeCore(void) {
         }
         emit("  folded: no resident thread, the caller's core runs the guest\n");
         azahar_state = ST_TAKEN;
+        ret = AZAHAR_TAKE_FOLDED;
         goto out;
     }
 
@@ -1838,6 +1839,7 @@ int azaharRun(AzaharRunRequest *user_req) {
     }
 
     if (azahar_folded) {
+        azahar_on_core = (uint32_t)ksceKernelCpuId() & 3;
         fold_run();
         ret = 0;
     } else if ((ret = core2_command(CMD_RUN, AZAHAR_RUN_WAIT_STEPS)) != 0) {
@@ -2007,6 +2009,7 @@ int azaharSgiStats(AzaharSgiStats *user_out) {
     out.heartbeat = azahar_heartbeat;
     out.installed = azahar_installed;
     out.pending_now = 0;
+    out.core = azahar_on_core;
     if (azahar_installed && gic_va) {
         out.pending_now = *(volatile uint32_t *)(gic_va + GICD_ISPENDR0) & 0x7FFFu;
     }
