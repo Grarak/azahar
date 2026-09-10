@@ -51,3 +51,8 @@ if (MSVC)
     include(BundleTarget)
     bundle_target_in_place(tests)
 endif()
+
+# The tile codec test on its own, so the NEON codec can be checked on a target where the
+# full tests binary does not build (the Vita fork's kernel tests are behind its API).
+add_executable(texture_codec_tests video_core/texture_codec.cpp)
+target_link_libraries(texture_codec_tests PRIVATE citra_common video_core catch2 Threads::Threads)
