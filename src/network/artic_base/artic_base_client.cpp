@@ -5,6 +5,7 @@
 #include "artic_base_client.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/thread.h"
 
 #include "algorithm"
 #include "chrono"
@@ -126,6 +127,7 @@ void Client::UDPStream::Start() {
 }
 
 void Client::UDPStream::Handle() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     struct sockaddr_in* servaddr = reinterpret_cast<sockaddr_in*>(serv_sockaddr_in.data());
     socklen_t serv_sockaddr_len = static_cast<socklen_t>(serv_sockaddr_in.size());
     memcpy(servaddr, client.GetServerAddr().data(), client.GetServerAddr().size());
@@ -508,6 +510,7 @@ void Client::SignalCommunicationError(const std::string& msg) {
 }
 
 void Client::PingFunction() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     // Max silence time => 7 secs interval + 3 secs wait + 10 seconds timeout = 25 seconds
     while (ping_run) {
         std::chrono::time_point<std::chrono::steady_clock> last = last_sent_request;
@@ -708,6 +711,7 @@ Client::Handler::Handler(Client& _client, u32 _addr, u16 _port, int _id)
     : id(_id), client(_client), addr(_addr), port(_port) {
     thread = new std::thread(
         [](Handler* handler) {
+            Common::SetCurrentThreadRole(Common::ThreadRole::Other);
             handler->RunLoop();
             handler->should_run = false;
             if (--handler->client.running_handlers == 0) {

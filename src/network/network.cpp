@@ -4,10 +4,33 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "enet/enet.h"
 #include "network/network.h"
+#ifdef ENABLE_ROOM
+#include "enet/enet.h"
+#endif
 
 namespace Network {
+
+#ifndef ENABLE_ROOM
+
+// Built without the room protocol. The accessors remain because callers ask for the room member
+// on paths that are not multiplayer-specific (title load, shutdown, save-state load); an empty
+// weak_ptr is the same answer a frontend that never called Init() already gives them.
+bool Init() {
+    return false;
+}
+
+std::weak_ptr<Room> GetRoom() {
+    return {};
+}
+
+std::weak_ptr<RoomMember> GetRoomMember() {
+    return {};
+}
+
+void Shutdown() {}
+
+#else
 
 static std::shared_ptr<RoomMember> g_room_member; ///< RoomMember (Client) for network games
 static std::shared_ptr<Room> g_room;              ///< Room (Server) for network games
@@ -46,5 +69,7 @@ void Shutdown() {
     enet_deinitialize();
     LOG_DEBUG(Network, "shutdown OK");
 }
+
+#endif // ENABLE_ROOM
 
 } // namespace Network

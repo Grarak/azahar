@@ -9,6 +9,7 @@
 #include <set>
 #include <thread>
 #include "common/assert.h"
+#include "common/thread.h"
 #include "enet/enet.h"
 #include "network/packet.h"
 #include "network/room_member.h"
@@ -156,6 +157,7 @@ bool RoomMember::RoomMemberImpl::IsConnected() const {
 }
 
 void RoomMember::RoomMemberImpl::MemberLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     // Receive packets while the connection is open
     while (IsConnected()) {
         std::lock_guard network_lock(network_mutex);

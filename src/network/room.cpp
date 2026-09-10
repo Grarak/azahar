@@ -10,6 +10,7 @@
 #include <sstream>
 #include <thread>
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "enet/enet.h"
 #include "network/packet.h"
 #include "network/room.h"
@@ -248,6 +249,7 @@ public:
 
 // RoomImpl
 void Room::RoomImpl::ServerLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     while (state != State::Closed) {
         ENetEvent event;
         if (enet_host_service(server, &event, 16) > 0) {

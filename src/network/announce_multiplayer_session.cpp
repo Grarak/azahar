@@ -8,6 +8,7 @@
 #include "announce_multiplayer_session.h"
 #include "common/announce_multiplayer_room.h"
 #include "common/assert.h"
+#include "common/thread.h"
 #include "network/network.h"
 
 #ifdef ENABLE_WEB_SERVICE
@@ -100,6 +101,7 @@ void AnnounceMultiplayerSession::UpdateBackendData(std::shared_ptr<Network::Room
 }
 
 void AnnounceMultiplayerSession::AnnounceMultiplayerLoop() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     // Invokes all current bound error callbacks.
     const auto ErrorCallback = [this](Common::WebResult result) {
         std::lock_guard<std::mutex> lock(callback_mutex);
