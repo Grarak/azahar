@@ -85,6 +85,20 @@ public:
         return values_capacity - free_list.size();
     }
 
+    /// Calls func(SlotId, T&) for every live slot.
+    template <typename Func>
+    void ForEach(Func&& func) noexcept {
+        std::size_t index = 0;
+        for (u64 bits : stored_bitset) {
+            for (std::size_t bit = 0; bits; ++bit, bits >>= 1) {
+                if ((bits & 1) != 0) {
+                    func(SlotId{static_cast<u32>(index + bit)}, values[index + bit].object);
+                }
+            }
+            index += 64;
+        }
+    }
+
 private:
     struct NonTrivialDummy {
         NonTrivialDummy() noexcept {}

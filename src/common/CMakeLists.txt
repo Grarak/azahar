@@ -1,6 +1,8 @@
 include(GenerateSCMRev)
 
 add_library(citra_common STATIC EXCLUDE_FROM_ALL
+    host_shared_memory.cpp
+    host_shared_memory.h
     aarch64/cpu_detect.cpp
     aarch64/cpu_detect.h
     aarch64/oaknut_abi.h
@@ -9,6 +11,7 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     announce_multiplayer_room.h
     arch.h
     archives.h
+    async_handle.h
     assert.h
     atomic_ops.h
     detached_tasks.cpp
@@ -55,7 +58,10 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     math_util.cpp
     math_util.h
     memory_detect.cpp
+    named_thread.cpp
+    named_thread.h
     memory_detect.h
+    pipeline_stats.h
     memory_ref.h
     memory_ref.cpp
     microprofile.cpp
@@ -99,6 +105,8 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     timer.h
     unique_function.h
     vector_math.h
+    wake_flag.cpp
+    wake_flag.h
     web_util.cpp
     web_util.h
     x64/cpu_detect.cpp
