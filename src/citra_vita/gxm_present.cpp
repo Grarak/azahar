@@ -295,6 +295,9 @@ struct JobSpan {
     u16 scene;
 };
 
+#ifdef VITA_DIAGNOSTICS
+// Reads the GPU's own counters for the last second and prints them. Diagnostic only:
+// the release build neither starts the counters nor carries the strings.
 void GpuLiveFrame() {
     SceRazorGpuLiveResultInfo res{};
     JobSpan spans[128];
@@ -509,8 +512,15 @@ void GpuLiveFrame() {
     std::memcpy(live.buffer, buffers, sizeof(buffers));
     live.report_at_us = now + 1000000;
 }
+#else
+void GpuLiveFrame() {}
+#endif
 
 u32 GpuLiveGroup() {
+#ifndef VITA_DIAGNOSTICS
+    // No counters in the release build, so the module is never loaded either.
+    return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_NUM;
+#else
     // One group per run, so the first flag named here wins. gpuhud comes last because it is
     // about drawing the numbers rather than about which ones to collect.
     if (GxmRenderer::GxmFlag("gpulive0")) {
@@ -526,6 +536,7 @@ u32 GpuLiveGroup() {
         return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_OVERVIEW_1;
     }
     return SCE_RAZOR_GPU_LIVE_METRICS_GROUP_NUM;
+#endif
 }
 
 /// The HUD module hooks libgxm when libgxm initialises, so it has to be loaded before
@@ -1773,6 +1784,7 @@ void EndFrame() {
     }
     g.frame_index++;
     ptimes.frames++;
+#ifdef VITA_DIAGNOSTICS
     if (const u64 now = sceKernelGetProcessTimeWide(); now >= ptimes.report_at_us) {
         if (ptimes.report_at_us != 0 && ptimes.frames != 0) {
             const u32 n = ptimes.frames;
@@ -1787,6 +1799,7 @@ void EndFrame() {
         ptimes = PresentTimes{};
         ptimes.report_at_us = now + 1000000;
     }
+#endif
     if (live.on) {
         GpuLiveFrame();
     }

@@ -248,10 +248,14 @@ void SetupNetwork() {
 }
 
 void SetupLogging() {
+#ifdef VITA_DIAGNOSTICS
     Common::Log::Initialize();
     Common::Log::Filter filter;
     filter.ParseFilterString("*:Info");
     Common::Log::SetGlobalFilter(filter);
+#endif
+    // The release build starts no logging backend at all, so every LOG_* macro reaches a
+    // filter that discards it before it formats anything.
 }
 
 /// The Vita boots at a conservative clock; a software-rendered 3DS needs every megahertz.
@@ -449,6 +453,10 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 
         // Once a second: the speed line to the console, the full record - GPU health, the
         // emulation thread's time split, all four cores' PMU counters - to the perf blob.
+#ifdef VITA_DIAGNOSTICS
+        // Everything measured once a second, and where it is printed. Compiled in only
+        // for the diagnostic build: the release build takes no clock readings, drains no
+        // counters, and prints nothing.
         {
             static SceUInt64 last_perf_us = 0;
             const SceUInt64 now_us = sceKernelGetProcessTimeWide();
@@ -608,6 +616,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 }
             }
         }
+#endif // VITA_DIAGNOSTICS
         // Nothing to present from here: a finished frame is presented by the render thread
         // where it arrives (EmuWindowVita::SwapBuffers), so this thread never waits on one.
     }

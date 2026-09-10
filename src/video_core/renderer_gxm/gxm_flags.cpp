@@ -15,6 +15,7 @@ namespace GxmRenderer {
 
 namespace {
 
+#ifdef VITA_DIAGNOSTICS
 const std::vector<std::string>& Flags() {
     static const std::vector<std::string> flags = [] {
         std::vector<std::string> out;
@@ -46,6 +47,7 @@ const std::vector<std::string>& Flags() {
     }();
     return flags;
 }
+#endif
 
 } // Anonymous namespace
 
@@ -82,11 +84,17 @@ void RunSurfaceDumpIfRequested() {
 }
 
 bool GxmFlag(const char* name) {
+#ifdef VITA_DIAGNOSTICS
     for (const auto& flag : Flags()) {
         if (flag == name) {
             return true;
         }
     }
+#else
+    // The release build has no bring-up switches. Nothing reads the file, nothing reads the
+    // environment, and every GxmFlag call site folds away to the default behaviour.
+    (void)name;
+#endif
     return false;
 }
 

@@ -8,7 +8,9 @@ namespace GxmRenderer {
 
 /**
  * Bring-up switches read once from ux0:data/azahar/gxm_flags.txt: whitespace-separated
- * words, one per switch, so a console round trip needs no rebuild. Absent file: nothing set.
+ * words, one per switch, so a console round trip needs no rebuild. Absent file: nothing
+ * set. Compiled in only when VITA_DIAGNOSTICS is defined; the release build answers
+ * false to every one of them and reads no file.
  *
  *   logdraw   log one draw's state and first vertex per report, and the first few
  *             format-converting GPU blits with their rectangles

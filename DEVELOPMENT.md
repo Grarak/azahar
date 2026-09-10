@@ -143,6 +143,9 @@ VITASDK=/usr/local/vitasdk cmake -S . -B build-vita -GNinja \
 ninja -C build-vita citra_vita.vpk-vpk
 ```
 
+That is the release build. Add `-DENABLE_LTO=OFF` for the diagnostic one; see
+below.
+
 That produces `citra_vita.vpk` and, as a sub-build, the kernel plugin
 `azaharnative.skprx`. Both are needed; `vita_native/README.md` says where the
 plugin goes.
@@ -151,11 +154,35 @@ Four flags in that toolchain file are correctness rather than preference, and
 each of them fails silently rather than erroring. They are documented where they
 are set — do not remove one because it looks redundant.
 
-## Bring-up switches
+## Two builds
 
-The Vita build reads whitespace-separated words from
-`ux0:data/azahar/gxm_flags.txt` at startup, documented in
-`src/video_core/renderer_gxm/gxm_flags.h`. They exist so that a question can be
+`ENABLE_LTO` picks between them, and the difference is what is *compiled in*
+rather than what is switched off at runtime.
+
+**Release**, `-O3` with LTO, is what a user runs. No logging backend is started,
+no clock is read for measurement, no counter is drained, and no file or
+environment variable is consulted to decide how to behave. The strings are not
+even in the binary.
+
+**Diagnostic**, `-O3` without LTO, has all of it: the per-second statistics line,
+the render-thread phase breadcrumb, the GPU's own counters, the on-screen stats
+overlay, and the bring-up switches. Every measurement quoted in this file and in
+TODO.md was taken with it. A bug worth reporting should be reproduced on it,
+because the release build cannot tell you anything about itself.
+
+```sh
+-DENABLE_LTO=ON    # release
+-DENABLE_LTO=OFF   # diagnostic
+```
+
+`VITA_DIAGNOSTICS` is the underlying switch and can be set on its own if you
+want the diagnostics with LTO, or a small binary without them.
+
+### Bring-up switches
+
+In the diagnostic build, whitespace-separated words are read once from
+`ux0:data/azahar/gxm_flags.txt` and documented in
+`src/video_core/renderer_gxm/gxm_flags.h`. They exist so a question can be
 answered on the console without a rebuild-and-reinstall cycle: run with a
 feature off and see whether a wrong picture follows it. The Razor GPU Live
 counter groups are selected the same way.

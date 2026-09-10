@@ -44,10 +44,11 @@ create_target_directory_groups(citra_vita)
 
 target_link_libraries(citra_vita PRIVATE citra_common citra_core input_common video_core)
 
-# Per-core PMU stats line, printed once a second, and the SGI window counters (azaharSgiStats,
-# 2026-09-07). Pulls those into the import table, so the vpk then only loads against a azahar-native
-# module new enough to export them; OFF builds a vpk that runs against any module.
-option(VITA_PMU "Per-second per-core PMU counter line" ON)
+# Per-core PMU stats line, printed once a second, and the SGI window counters. Pulls those
+# calls into the import table, so the vpk then only loads against a kernel module new enough to
+# export them; OFF builds a vpk that runs against any module. It is a measurement, so it
+# follows the diagnostic build.
+option(VITA_PMU "Per-second per-core PMU counter line" ${VITA_DIAGNOSTICS})
 if (VITA_PMU)
     target_compile_definitions(citra_vita PRIVATE CITRA_VITA_PMU)
 endif()
