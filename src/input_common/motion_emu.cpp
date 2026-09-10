@@ -86,6 +86,7 @@ private:
     std::thread motion_emu_thread;
 
     void MotionEmuThread() {
+        Common::SetCurrentThreadRole(Common::ThreadRole::Other);
         auto update_time = std::chrono::steady_clock::now();
         Common::Quaternion<float> q = Common::MakeQuaternion(Common::Vec3<float>(), 0);
         Common::Quaternion<float> old_q;

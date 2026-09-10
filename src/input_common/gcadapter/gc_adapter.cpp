@@ -17,6 +17,7 @@
 
 #include "common/logging/log.h"
 #include "common/param_package.h"
+#include "common/thread.h"
 #include "input_common/gcadapter/gc_adapter.h"
 
 // Workaround for older libusb versions not having libusb_init_context.
@@ -50,6 +51,7 @@ Adapter::~Adapter() {
 }
 
 void Adapter::AdapterInputThread() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     LOG_DEBUG(Input, "GC Adapter input thread started");
     s32 payload_size{};
     AdapterPayload adapter_payload{};
@@ -199,6 +201,7 @@ void Adapter::UpdateSettings(std::size_t port) {
 }
 
 void Adapter::AdapterScanThread() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     adapter_scan_thread_running = true;
     adapter_input_thread_running = false;
     if (adapter_input_thread.joinable()) {

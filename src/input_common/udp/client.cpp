@@ -10,6 +10,7 @@
 #include <thread>
 #include <boost/asio.hpp>
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "input_common/udp/client.h"
 #include "input_common/udp/protocol.h"
 
@@ -126,6 +127,7 @@ private:
 };
 
 static void SocketLoop(Socket* socket) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     socket->StartReceive();
     socket->StartSend(Socket::clock::now());
     socket->Loop();
@@ -212,6 +214,7 @@ void TestCommunication(const std::string& host, u16 port, u8 pad_index, u32 clie
                        const std::function<void()>& success_callback,
                        const std::function<void()>& failure_callback) {
     std::thread([=] {
+        Common::SetCurrentThreadRole(Common::ThreadRole::Other);
         Common::Event success_event;
         SocketCallback callback{[](Response::Version version) {}, [](Response::PortInfo info) {},
                                 [&](Response::PadData data) { success_event.Set(); }};
@@ -234,6 +237,7 @@ CalibrationConfigurationJob::CalibrationConfigurationJob(
     std::function<void(u16, u16, u16, u16)> data_callback) {
 
     std::thread([=, this] {
+        Common::SetCurrentThreadRole(Common::ThreadRole::Other);
         u16 min_x{UINT16_MAX};
         u16 min_y{UINT16_MAX};
         u16 max_x{};

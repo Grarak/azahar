@@ -19,6 +19,7 @@
 #include "common/logging/log.h"
 #include "common/math_util.h"
 #include "common/param_package.h"
+#include "common/thread.h"
 #include "common/threadsafe_queue.h"
 #include "core/frontend/input.h"
 #include "input_common/sdl/sdl_impl.h"
@@ -815,6 +816,7 @@ SDLState::SDLState() {
     initialized = true;
     if (start_thread) {
         poll_thread = std::thread([this] {
+            Common::SetCurrentThreadRole(Common::ThreadRole::Other);
             using namespace std::chrono_literals;
             while (initialized) {
                 SDL_PumpEvents();
