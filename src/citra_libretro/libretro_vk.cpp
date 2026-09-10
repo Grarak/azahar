@@ -9,6 +9,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "common/thread.h"
 #include "citra_libretro/environment.h"
 #include "citra_libretro/libretro_vk.h"
 #include "common/assert.h"
@@ -831,6 +832,7 @@ void MasterSemaphoreLibRetro::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore
 }
 
 void MasterSemaphoreLibRetro::WaitThread(std::stop_token token) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     const vk::Device device{instance.GetDevice()};
 
     while (!token.stop_requested()) {

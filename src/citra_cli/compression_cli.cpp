@@ -49,7 +49,6 @@ static bool perform_z3ds_operation(bool is_compressing, const std::string& src_f
 
 int ParseCompressionCommand(int argc, char* argv[]) {
     Common::Log::Initialize();
-    Common::Log::Start();
 
     const std::string common_error_addendum = "\nCheck log for more details.";
 
