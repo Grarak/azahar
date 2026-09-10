@@ -10,6 +10,7 @@
 #include "common/alignment.h"
 #include "common/color.h"
 #include "video_core/rasterizer_cache/pixel_format.h"
+#include "video_core/rasterizer_cache/texture_codec_neon.h"
 #include "video_core/texture/etc1.h"
 #include "video_core/utils.h"
 
@@ -196,12 +197,50 @@ constexpr void EncodePixel4(u32 x, u32 y, const u8* source_pixel, u8* dest_tile_
     }
 }
 
-template <bool morton_to_linear, PixelFormat format, bool converted>
-constexpr void MortonCopyTile(u32 stride, std::span<u8> tile_buffer, std::span<u8> linear_buffer) {
+// simd = false forces the scalar reference path; the NEON specialisations in
+// texture_codec_neon.h are diffed against it by tests/video_core/texture_codec.cpp.
+template <bool morton_to_linear, PixelFormat format, bool converted, bool simd = true>
+inline void MortonCopyTile(u32 stride, std::span<u8> tile_buffer, std::span<u8> linear_buffer) {
     constexpr u32 bytes_per_pixel = GetFormatBpp(format) / 8;
     constexpr u32 linear_bytes_per_pixel = converted ? 4 : GetFormatBytesPerPixel(format);
     constexpr bool is_compressed = format == PixelFormat::ETC1 || format == PixelFormat::ETC1A4;
     constexpr bool is_4bit = format == PixelFormat::I4 || format == PixelFormat::A4;
+
+#ifdef AZAHAR_TEXTURE_CODEC_NEON
+    if constexpr (simd) {
+        if constexpr (is_compressed && morton_to_linear) {
+            NeonCodec::DecodeETC1Tile(stride, tile_buffer.data(), linear_buffer.data(),
+                                      format == PixelFormat::ETC1A4);
+            return;
+        } else if constexpr (morton_to_linear) {
+            if (NeonCodec::DecodeTile<format, converted>(stride, tile_buffer.data(),
+                                                         linear_buffer.data())) {
+                return;
+            }
+        } else {
+            if (NeonCodec::EncodeTile<format, converted>(stride, tile_buffer.data(),
+                                                         linear_buffer.data())) {
+                return;
+            }
+        }
+    }
+#endif
+
+    if constexpr (is_compressed && morton_to_linear) {
+        // One pass per tile instead of re-parsing the subtile words per texel; measured as the
+        // hottest thing the GL render thread does on a Cortex-class host (ETC1-heavy titles
+        // spend ~30% of it decompressing uploads).
+        u8 rgba[8][8][4];
+        Pica::Texture::DecodeETC1TileRGBA8(tile_buffer.data(), format == PixelFormat::ETC1A4,
+                                           rgba);
+        for (u32 y = 0; y < 8; y++) {
+            for (u32 x = 0; x < 8; x++) {
+                std::memcpy(linear_buffer.data() + ((7 - y) * stride + x) * linear_bytes_per_pixel,
+                            rgba[y][x], 4);
+            }
+        }
+        return;
+    }
 
     for (u32 y = 0; y < 8; y++) {
         for (u32 x = 0; x < 8; x++) {
@@ -253,7 +292,7 @@ constexpr void MortonCopyTile(u32 stride, std::span<u8> tile_buffer, std::span<u
  * start_offset/end_offset are useful here as they tell us exactly where the data should be placed
  * in the linear_buffer.
  */
-template <bool morton_to_linear, PixelFormat format, bool converted = false>
+template <bool morton_to_linear, PixelFormat format, bool converted = false, bool simd = true>
 static constexpr void MortonCopy(u32 width, u32 height, u32 start_offset, u32 end_offset,
                                  std::span<u8> linear_buffer, std::span<u8> tiled_buffer) {
     constexpr u32 bytes_per_pixel = GetFormatBpp(format) / 8;
@@ -296,7 +335,7 @@ static constexpr void MortonCopy(u32 width, u32 height, u32 start_offset, u32 en
     if (start_offset < aligned_start_offset && !morton_to_linear) {
         std::array<u8, tile_size> tmp_buf;
         auto linear_data = linear_buffer.subspan(linear_offset, linear_tile_stride);
-        MortonCopyTile<morton_to_linear, format, converted>(width, tmp_buf, linear_data);
+        MortonCopyTile<morton_to_linear, format, converted, simd>(width, tmp_buf, linear_data);
 
         std::memcpy(tiled_buffer.data(), tmp_buf.data() + start_offset - aligned_down_start_offset,
                     std::min(aligned_start_offset, end_offset) - start_offset);
@@ -313,7 +352,7 @@ static constexpr void MortonCopy(u32 width, u32 height, u32 start_offset, u32 en
         while (tiled_offset < buffer_end) {
             auto linear_data = linear_buffer.subspan(linear_offset, linear_tile_stride);
             auto tiled_data = tiled_buffer.subspan(tiled_offset, tile_size);
-            MortonCopyTile<morton_to_linear, format, converted>(width, tiled_data, linear_data);
+            MortonCopyTile<morton_to_linear, format, converted, simd>(width, tiled_data, linear_data);
             tiled_offset += tile_size;
             linear_next_tile();
         }
@@ -324,7 +363,7 @@ static constexpr void MortonCopy(u32 width, u32 height, u32 start_offset, u32 en
     if (end_offset > std::max(aligned_start_offset, aligned_end_offset) && !morton_to_linear) {
         std::array<u8, tile_size> tmp_buf;
         auto linear_data = linear_buffer.subspan(linear_offset, linear_tile_stride);
-        MortonCopyTile<morton_to_linear, format, converted>(width, tmp_buf, linear_data);
+        MortonCopyTile<morton_to_linear, format, converted, simd>(width, tmp_buf, linear_data);
         std::memcpy(tiled_buffer.data() + tiled_offset, tmp_buf.data(),
                     end_offset - aligned_end_offset);
     }
