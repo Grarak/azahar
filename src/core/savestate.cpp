@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <sstream>
+#include <zstd.h>
 #include <cryptopp/hex.h>
 #include <fmt/ranges.h>
 #include "common/archives.h"
@@ -13,12 +14,127 @@
 #include "common/swap.h"
 #include "common/zstd_compression.h"
 #include "core/core.h"
+#include "core/hle/kernel/thread.h"
 #include "core/loader/loader.h"
 #include "core/movie.h"
 #include "core/savestate.h"
+#include "video_core/gpu.h"
 #include "network/network.h"
 
 namespace Core {
+
+namespace {
+
+/**
+ * Compresses everything written through it straight into a file, so a save never materializes
+ * the raw serialized image. On a 32-bit host that image (~150 MB) plus its compressed copy was
+ * enough to exhaust the address space once the GL renderer and its JIT moved in.
+ */
+class ZstdFileOStreamBuf final : public std::streambuf {
+public:
+    explicit ZstdFileOStreamBuf(FileUtil::IOFile& file_) : file{file_} {
+        cctx = ZSTD_createCCtx();
+        in_buffer.resize(ZSTD_CStreamInSize());
+        out_buffer.resize(ZSTD_CStreamOutSize());
+        setp(reinterpret_cast<char*>(in_buffer.data()),
+             reinterpret_cast<char*>(in_buffer.data() + in_buffer.size()));
+    }
+
+    ~ZstdFileOStreamBuf() override {
+        ZSTD_freeCCtx(cctx);
+    }
+
+    /// Flushes remaining input and the zstd epilogue. True if every write reached the file.
+    bool Finish() {
+        Compress(ZSTD_e_end);
+        return ok;
+    }
+
+private:
+    int_type overflow(int_type ch) override {
+        Compress(ZSTD_e_continue);
+        if (ch != traits_type::eof()) {
+            *pptr() = static_cast<char>(ch);
+            pbump(1);
+        }
+        return ok ? ch : traits_type::eof();
+    }
+
+    int sync() override {
+        Compress(ZSTD_e_continue);
+        return ok ? 0 : -1;
+    }
+
+    void Compress(ZSTD_EndDirective mode) {
+        ZSTD_inBuffer input{in_buffer.data(), static_cast<std::size_t>(pptr() - pbase()), 0};
+        std::size_t remaining;
+        do {
+            ZSTD_outBuffer output{out_buffer.data(), out_buffer.size(), 0};
+            remaining = ZSTD_compressStream2(cctx, &output, &input, mode);
+            if (ZSTD_isError(remaining)) {
+                ok = false;
+                return;
+            }
+            if (output.pos != 0 && file.WriteBytes(out_buffer.data(), output.pos) != output.pos) {
+                ok = false;
+                return;
+            }
+        } while (mode == ZSTD_e_end ? remaining != 0 : input.pos < input.size);
+        setp(reinterpret_cast<char*>(in_buffer.data()),
+             reinterpret_cast<char*>(in_buffer.data() + in_buffer.size()));
+    }
+
+    FileUtil::IOFile& file;
+    ZSTD_CCtx* cctx{};
+    std::vector<u8> in_buffer;
+    std::vector<u8> out_buffer;
+    bool ok = true;
+};
+
+/// Decompresses a zstd frame on demand as the archive reads, avoiding the full decompressed
+/// image (the compressed input stays in memory; it is a fifth of the size).
+class ZstdIStreamBuf final : public std::streambuf {
+public:
+    explicit ZstdIStreamBuf(std::span<const u8> compressed_) : compressed{compressed_} {
+        dctx = ZSTD_createDCtx();
+        out_buffer.resize(ZSTD_DStreamOutSize());
+        input = {compressed.data(), compressed.size(), 0};
+    }
+
+    ~ZstdIStreamBuf() override {
+        ZSTD_freeDCtx(dctx);
+    }
+
+private:
+    int_type underflow() override {
+        if (gptr() < egptr()) {
+            return traits_type::to_int_type(*gptr());
+        }
+        ZSTD_outBuffer output{out_buffer.data(), out_buffer.size(), 0};
+        while (output.pos == 0) {
+            if (input.pos >= input.size) {
+                return traits_type::eof();
+            }
+            const std::size_t ret = ZSTD_decompressStream(dctx, &output, &input);
+            if (ZSTD_isError(ret)) {
+                return traits_type::eof();
+            }
+            if (ret == 0 && output.pos == 0) {
+                return traits_type::eof();
+            }
+        }
+        char* base = reinterpret_cast<char*>(out_buffer.data());
+        setg(base, base, base + output.pos);
+        return traits_type::to_int_type(*gptr());
+    }
+
+    std::span<const u8> compressed;
+    ZSTD_DCtx* dctx{};
+    ZSTD_inBuffer input{};
+    std::vector<u8> out_buffer;
+};
+
+} // Anonymous namespace
 
 #pragma pack(push, 1)
 struct CSTHeader {
@@ -152,15 +268,6 @@ void System::SaveState(u32 slot) const {
         }
     }
 
-    std::ostringstream sstream{std::ios_base::binary};
-    // Serialize
-    oarchive oa{sstream};
-    oa&* this;
-
-    const std::string& str{sstream.str()};
-    const auto data = std::span<const u8>{reinterpret_cast<const u8*>(str.data()), str.size()};
-    auto buffer = Common::Compression::CompressDataZSTDDefault(data);
-
     const u64 movie_id = movie.GetCurrentMovieID();
     const auto path = GetSaveStatePath(title_id, movie_id, slot);
     if (!FileUtil::CreateFullPath(path)) {
@@ -187,9 +294,46 @@ void System::SaveState(u32 slot) const {
     std::memcpy(header.build_name.data(), build_fullname.c_str(),
                 std::min(build_fullname.length(), sizeof(header.build_name) - 1));
 
-    if (file.WriteBytes(&header, sizeof(header)) != sizeof(header) ||
-        file.WriteBytes(buffer.data(), buffer.size()) != buffer.size()) {
+    if (file.WriteBytes(&header, sizeof(header)) != sizeof(header)) {
         throw std::runtime_error("Could not write to file " + path);
+    }
+
+    // Serialize straight through the compressor into the file.
+    ZstdFileOStreamBuf zstd_buf{file};
+    std::ostream stream{&zstd_buf};
+    {
+        oarchive oa{stream};
+        oa&* this;
+    }
+    stream.flush();
+    if (!zstd_buf.Finish()) {
+        throw std::runtime_error("Could not write to file " + path);
+    }
+}
+
+/**
+ * Puts back whatever deserialization cannot.
+ *
+ * A save state restores the page table and the backing memory wholesale, without going through the
+ * calls that normally announce such changes. Anything caching a view of guest memory is therefore
+ * stale, and under native execution that means the host address space still points at the memory
+ * the guest had before the load.
+ */
+void System::AfterStateLoaded() {
+    memory->RefreshMappingObserver();
+
+    for (u32 core_id = 0; core_id < static_cast<u32>(cpu_cores.size()); core_id++) {
+        auto& cpu_core = *cpu_cores[core_id];
+        cpu_core.ClearInstructionCache();
+
+        // Deserialization restores each thread's saved context but never puts the running one back
+        // into the CPU, because that normally happens on a context switch and a load is not one.
+        // Left alone the core keeps the register file it had before the load while the memory
+        // under it has been replaced wholesale, which a backend executing guest code directly does
+        // not survive.
+        if (Kernel::Thread* thread = kernel->GetThreadManager(core_id).GetCurrentThread()) {
+            cpu_core.LoadContext(thread->context);
+        }
     }
 }
 
@@ -199,17 +343,20 @@ void System::LoadState(u32 slot) {
             throw std::runtime_error("The current app loader doesn't support save states");
         }
     }
-    if (Network::GetRoomMember().lock()->IsConnected()) {
-        throw std::runtime_error("Unable to load while connected to multiplayer");
+#ifdef ENABLE_ROOM
+    // The room member only exists once Network::Init has run, which some frontends skip.
+    if (auto room_member = Network::GetRoomMember().lock()) {
+        if (room_member->IsConnected()) {
+            throw std::runtime_error("Unable to load while connected to multiplayer");
+        }
     }
+#endif
 
     const u64 movie_id = movie.GetCurrentMovieID();
     const auto path = GetSaveStatePath(title_id, movie_id, slot);
 
-    std::vector<u8> decompressed;
+    std::vector<u8> buffer(FileUtil::GetSize(path) - sizeof(CSTHeader));
     {
-        std::vector<u8> buffer(FileUtil::GetSize(path) - sizeof(CSTHeader));
-
         FileUtil::IOFile file(path, "rb");
 
         // load header
@@ -222,23 +369,29 @@ void System::LoadState(u32 slot) {
         SaveStateInfo info;
         info.slot = slot;
         if (!ValidateSaveState(header, info, title_id, movie_id) ||
-            info.status == SaveStateInfo::ValidationStatus::BuildMismatch) {
+            (!load_state_any_build &&
+             info.status == SaveStateInfo::ValidationStatus::BuildMismatch)) {
             throw std::runtime_error("Invalid savestate");
         }
 
         if (file.ReadBytes(buffer.data(), buffer.size()) != buffer.size()) {
             throw std::runtime_error("Could not read from file at " + path);
         }
-        decompressed = Common::Compression::DecompressDataZSTD(buffer);
     }
-    std::istringstream sstream{
-        std::string{reinterpret_cast<char*>(decompressed.data()), decompressed.size()},
-        std::ios_base::binary};
-    decompressed.clear();
 
-    // Deserialize
-    iarchive ia{sstream};
-    ia&* this;
+    LOG_INFO(Core, "savestate: {} compressed bytes read", buffer.size());
+    // Deserialize, decompressing as the archive reads; only the compressed image is resident.
+    {
+        ZstdIStreamBuf zstd_buf{buffer};
+        std::istream stream{&zstd_buf};
+        iarchive ia{stream};
+        LOG_INFO(Core, "savestate: archive open");
+        ia&* this;
+    }
+    LOG_INFO(Core, "savestate: deserialized");
+
+    AfterStateLoaded();
+    LOG_INFO(Core, "savestate: after-load fixups done");
 }
 
 std::vector<u8> System::SaveStateBuffer() const {
@@ -313,9 +466,12 @@ bool System::LoadStateBuffer(std::vector<u8> buffer) {
     decompressed.clear();
 
     // Deserialize
-    iarchive ia{sstream};
-    ia&* this;
+    {
+        iarchive ia{sstream};
+        ia&* this;
+    }
 
+    AfterStateLoaded();
     return true;
 }
 
