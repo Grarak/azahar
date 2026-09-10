@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include <optional>
 #include "common/vector_math.h"
 #include "video_core/pica/packed_attribute.h"
@@ -54,12 +56,14 @@ struct ShaderSetup {
 private:
     void MakeProgramCodeDirty() {
         program_code_hash_dirty = true;
+        code_sync_dirty = true;
         // program_code_pending_fixup = true;
         // has_fixup = false;
     }
 
     void MakeSwizzleDataDirty() {
         swizzle_data_hash_dirty = true;
+        code_sync_dirty = true;
     }
 
 public:
@@ -93,6 +97,7 @@ public:
             return;
 
         inst = value;
+        code_sync_dirty = true;
         if (!program_code_hash_dirty) {
             MakeProgramCodeDirty();
         }
@@ -117,6 +122,7 @@ public:
             return;
 
         data = value;
+        code_sync_dirty = true;
         if (!swizzle_data_hash_dirty) {
             MakeSwizzleDataDirty();
         }
@@ -161,6 +167,24 @@ public:
     const void* cached_shader{};
     bool uniforms_dirty = true;
 
+    /// Cross-thread sync flags for the render-thread mirror: set on every mutation, cleared when
+    /// the corresponding block ships. Start dirty so the first shipment seeds the mirror.
+    bool uniforms_sync_dirty = true;
+    bool code_sync_dirty = true;
+
+    /// Float-uniform window touched since the last shipment, [sync_f_lo, sync_f_hi). Games write
+    /// a handful of vectors between draws; shipping the whole 1.5 KB block for each was a
+    /// visible slice of the emulation thread's memcpy time. Starts full so the first shipment
+    /// seeds the mirror, and deserialization keeps the constructed full window for the same
+    /// reason. Bool and int uniforms are 32 bytes together and always travel whole.
+    u32 sync_f_lo = 0;
+    u32 sync_f_hi = 96;
+
+    void WidenFloatSyncWindow(u32 first, u32 end) {
+        sync_f_lo = std::min(sync_f_lo, first);
+        sync_f_hi = std::max(sync_f_hi, end);
+    }
+
     // bool requires_fixup = false;
     // bool has_fixup = false;
 
@@ -197,6 +221,12 @@ private:
         // ar & has_fixup;
         if (Archive::is_loading::value) {
             uniforms_dirty = true;
+            // A load rewrites everything the mirror thinks it knows; reship it all, whatever
+            // the sync flags and float window said before the load.
+            uniforms_sync_dirty = true;
+            code_sync_dirty = true;
+            sync_f_lo = 0;
+            sync_f_hi = 96;
         }
     }
 };
