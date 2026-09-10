@@ -6,6 +6,9 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#if defined(__ARM_FEATURE_SAT)
+#include <arm_acle.h>
+#endif
 #include "audio_core/audio_types.h"
 #include "audio_core/codec.h"
 #include "common/assert.h"
@@ -25,51 +28,51 @@ StereoBuffer16 DecodeADPCM(const u8* const data, const std::size_t sample_count,
         0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
     };
 
-    const std::size_t ret_size =
-        sample_count % 2 == 0 ? sample_count : sample_count + 1; // Ensure multiple of two.
-    StereoBuffer16 ret(ret_size);
+    // Whole nibble pairs are decoded, so an odd count produces one sample more, and the
+    // filter state advances over it too (the DSP decodes bytes, not samples).
+    const std::size_t decoded = sample_count % 2 == 0 ? sample_count : sample_count + 1;
+    StereoBuffer16 ret(decoded);
+    if (decoded == 0) {
+        return ret;
+    }
 
     int yn1 = state.yn1, yn2 = state.yn2;
-
-    const std::size_t NUM_FRAMES =
-        (sample_count + (SAMPLES_PER_FRAME - 1)) / SAMPLES_PER_FRAME; // Round up.
-    for (std::size_t framei = 0; framei < NUM_FRAMES; framei++) {
-        const int frame_header = data[framei * FRAME_LEN];
-        const int scale = 1 << (frame_header & 0xF);
+    s16* out = ret.data()->data();
+    // Everything in 11-bit fixed point, the second order filter, then back. 0x400 == 0.5 in
+    // 11-bit fixed point. Filter: y[n] = x[n] + 0.5 + c1 * y[n-1] + c2 * y[n-2]. The result
+    // saturates to 16 bits, one instruction where the target has it: the feedback makes this
+    // a serial chain, and the clamp's compares were the longest link.
+    const auto decode = [&](int nibble, int shift, int coef1, int coef2) {
+        const int xn = SIGNED_NIBBLES[nibble] << shift;
+        const int raw = ((xn << 11) + 0x400 + coef1 * yn1 + coef2 * yn2) >> 11;
+#if defined(__ARM_FEATURE_SAT)
+        const int val = __ssat(raw, 16);
+#else
+        const int val = std::clamp(raw, -32768, 32767);
+#endif
+        yn2 = yn1;
+        yn1 = val;
+        out[0] = static_cast<s16>(val);
+        out[1] = static_cast<s16>(val);
+        out += 2;
+    };
+    const u8* frame = data;
+    for (std::size_t remaining = decoded; remaining != 0; frame += FRAME_LEN) {
+        const int frame_header = frame[0];
+        // The scale is a power of two: multiplying a nibble by it is a shift.
+        const int shift = frame_header & 0xF;
         const int idx = (frame_header >> 4) & 0x7;
-
         // Coefficients are fixed point with 11 bits fractional part.
         const int coef1 = adpcm_coeff[idx * 2 + 0];
         const int coef2 = adpcm_coeff[idx * 2 + 1];
-
-        // Decodes an audio sample. One nibble produces one sample.
-        const auto decode_sample = [&](const int nibble) -> s16 {
-            const int xn = nibble * scale;
-            // We first transform everything into 11 bit fixed point, perform the second order
-            // digital filter, then transform back.
-            // 0x400 == 0.5 in 11 bit fixed point.
-            // Filter: y[n] = x[n] + 0.5 + c1 * y[n-1] + c2 * y[n-2]
-            int val = ((xn << 11) + 0x400 + coef1 * yn1 + coef2 * yn2) >> 11;
-            // Clamp to output range.
-            val = std::clamp(val, -32768, 32767);
-            // Advance output feedback.
-            yn2 = yn1;
-            yn1 = val;
-            return (s16)val;
-        };
-
-        std::size_t outputi = framei * SAMPLES_PER_FRAME;
-        std::size_t datai = framei * FRAME_LEN + 1;
-        for (std::size_t i = 0; i < SAMPLES_PER_FRAME && outputi < sample_count; i += 2) {
-            const s16 sample1 = decode_sample(SIGNED_NIBBLES[data[datai] >> 4]);
-            ret[outputi].fill(sample1);
-            outputi++;
-
-            const s16 sample2 = decode_sample(SIGNED_NIBBLES[data[datai] & 0xF]);
-            ret[outputi].fill(sample2);
-            outputi++;
-
-            datai++;
+        const std::size_t count = std::min(SAMPLES_PER_FRAME, remaining);
+        remaining -= count;
+        const u8* nibbles = frame + 1;
+        const u8* const nibbles_end = nibbles + count / 2;
+        for (; nibbles != nibbles_end; nibbles++) {
+            const int byte = *nibbles;
+            decode(byte >> 4, shift, coef1, coef2);
+            decode(byte & 0xF, shift, coef1, coef2);
         }
     }
 

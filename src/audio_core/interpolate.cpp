@@ -23,22 +23,26 @@ static void StepOverSamples(State& state, StereoBuffer16& input, float rate, Ste
     if (input.empty())
         return;
 
-    input.insert(input.begin(), {state.xn2, state.xn1});
+    // The two history samples go in front (into the buffer's slack), so index 0 is x[n-2].
+    input.push_front(state.xn1);
+    input.push_front(state.xn2);
 
     const u64 step_size = static_cast<u64>(rate * scale_factor);
     u64 fposition = state.fposition;
     std::size_t inputi = 0;
 
+    const auto* const samples = input.data();
+    const std::size_t count = input.size();
     while (outputi < output.size()) {
         inputi = static_cast<std::size_t>(fposition / scale_factor);
 
-        if (inputi + 2 >= input.size()) {
-            inputi = input.size() - 2;
+        if (inputi + 2 >= count) {
+            inputi = count - 2;
             break;
         }
 
-        u64 fraction = fposition & scale_mask;
-        output[outputi++] = fn(fraction, input[inputi], input[inputi + 1], input[inputi + 2]);
+        const u32 fraction = static_cast<u32>(fposition & scale_mask);
+        output[outputi++] = fn(fraction, samples[inputi], samples[inputi + 1], samples[inputi + 2]);
 
         fposition += step_size;
     }
@@ -47,28 +51,31 @@ static void StepOverSamples(State& state, StereoBuffer16& input, float rate, Ste
     state.xn1 = input[inputi + 1];
     state.fposition = fposition - inputi * scale_factor;
 
-    input.erase(input.begin(), std::next(input.begin(), inputi + 2));
+    input.pop_front(inputi + 2);
 }
 
 void None(State& state, StereoBuffer16& input, float rate, StereoFrame16& output,
           std::size_t& outputi) {
     StepOverSamples(
         state, input, rate, output, outputi,
-        [](u64 fraction, const auto& x0, const auto& x1, const auto& x2) { return x0; });
+        [](u32 fraction, const auto& x0, const auto& x1, const auto& x2) { return x0; });
 }
 
 void Linear(State& state, StereoBuffer16& input, float rate, StereoFrame16& output,
             std::size_t& outputi) {
     // Note on accuracy: Some values that this produces are +/- 1 from the actual firmware.
     StepOverSamples(state, input, rate, output, outputi,
-                    [](u64 fraction, const auto& x0, const auto& x1, const auto& x2) {
+                    [](u32 fraction, const auto& x0, const auto& x1, const auto& x2) {
                         // This is a saturated subtraction. (Verified by black-box fuzzing.)
-                        s64 delta0 = std::clamp<s64>(x1[0] - x0[0], -32768, 32767);
-                        s64 delta1 = std::clamp<s64>(x1[1] - x0[1], -32768, 32767);
-
+                        const s32 delta0 = std::clamp<s32>(x1[0] - x0[0], -32768, 32767);
+                        const s32 delta1 = std::clamp<s32>(x1[1] - x0[1], -32768, 32767);
+                        // 15 bits of the 24-bit fraction times a 16-bit delta fits a 32-bit
+                        // product; the dropped 9 bits are far below the +/-1 the firmware's
+                        // own result already differs by. No 64-bit arithmetic on the A9.
+                        const s32 f = static_cast<s32>(fraction >> 9);
                         return std::array<s16, 2>{
-                            static_cast<s16>(x0[0] + fraction * delta0 / scale_factor),
-                            static_cast<s16>(x0[1] + fraction * delta1 / scale_factor),
+                            static_cast<s16>(x0[0] + ((f * delta0) >> 15)),
+                            static_cast<s16>(x0[1] + ((f * delta1) >> 15)),
                         };
                     });
 }
