@@ -54,7 +54,7 @@
 #define AZAHAR_WAIT_STEP_US 50000
 #define AZAHAR_WAIT_STEPS 40        // 2 s
 #define AZAHAR_RUN_WAIT_STEPS 200   // 10 s: no preemption yet, so a guest may take a while to svc
-#define AZAHAR_PMR_MASK 0x10u       // PLAN.md §8.9: passes the private timer, masks everything else
+#define AZAHAR_PMR_MASK 0x10u       // passes the private timer, masks everything else
 
 #ifndef GICC_PMR
 #define GICC_PMR 0x104u
@@ -1790,8 +1790,8 @@ int azaharMap(const AzaharMapRequest *user_req) {
          sv_cpacr, sv_fpexc);
 
     // The private timer's clock, from the idle loop's samples of the free-running counter
-    // against the system clock. PLAN.md §14.2 carries a device-tree claim of a fixed 144 MHz
-    // against the A9 ratio; this is the number the quantum is converted with.
+    // against the system clock. A device-tree claim of a fixed 144 MHz against the A9
+    // ratio exists; this is the number the quantum is actually converted with.
     azahar_timer_hz = 0;
     if (gic_va) {
         const uint32_t s0 = azahar_timer_sample, t0 = ksceKernelGetSystemTimeLow();

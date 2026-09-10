@@ -2,8 +2,8 @@
 //
 // The PS Vita is Sony's handheld games console; this is a hobby emulator project running on a
 // console the author owns. The plugin takes one CPU core away from the Vita's scheduler and
-// runs guest (Nintendo 3DS) code on it natively, at the guest's own addresses. ~/3ds-vita/PLAN.md
-// §8 is the design; §8.11 is the launch-to-first-instruction sequence this implements.
+// runs guest (Nintendo 3DS) code on it natively, at the guest's own addresses. DEVELOPMENT.md
+// beside this file is the design.
 
 #ifndef AZAHAR_NATIVE_H
 #define AZAHAR_NATIVE_H

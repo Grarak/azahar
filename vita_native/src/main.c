@@ -197,7 +197,7 @@ static void emit(const char *fmt, ...) {
 // space and not just the low quarter: the low quarter is the kernel's shared table, but a
 // device alias like the private peripheral block is just as likely to sit in per-process
 // TTBR1 space, and a search that misses it silently costs the entire routing section — the
-// one measurement PLAN.md §8 turns on.
+// one measurement that most depends on it.
 //
 // A megabyte whose L1 entry is absent (FS 0x05) cannot contain the alias, so it is skipped
 // whole. That reduces a 1M-page sweep to 4096 probes plus 256 per claimed megabyte.
@@ -341,7 +341,7 @@ static int sysinfo_ready(void) {
     return 1;
 }
 
-// The mask getter PLAN.md §14.4 says does not exist.
+// The mask getter that is documented as not existing.
 //
 // That section records: "A companion sceKernelGetActiveCpuMask (0x0C3CBB8B) existed at 1.69 but
 // is gone by 3.60; read activeCpuMask through sceKernelGetSystemInfo instead." True of the named
