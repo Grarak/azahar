@@ -112,4 +112,29 @@ void SetCurrentThreadPriority(ThreadPriority new_priority);
 
 void SetCurrentThreadName(const char* name);
 
+/**
+ * Which part of the emulator a thread belongs to.
+ *
+ * On a fixed four-core handheld there is no scheduler decision worth making: the emulation and
+ * render threads each want a core to themselves for a whole frame, and the two rasterizer
+ * workers want the rest. The roles name that partition so the policy lives in one place instead
+ * of being spread across the thread creation sites.
+ */
+enum class ThreadRole {
+    Other,
+    Emulation,
+    Render,
+    RasterWorker,
+    ShaderCompiler,
+    AudioSink,
+};
+
+/**
+ * Pins the calling thread to the core its role owns, where the platform has a fixed partition
+ * (the Vita port, and Linux hosts with at least four cores, so the same partition can be tested
+ * off-console). `index` distinguishes threads sharing a role, currently the rasterizer workers.
+ * A no-op everywhere else - a desktop scheduler does better than a hardcoded map.
+ */
+void SetCurrentThreadRole(ThreadRole role, std::size_t index = 0);
+
 } // namespace Common
