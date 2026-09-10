@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <mutex>
+#include "common/thread.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
@@ -159,6 +160,7 @@ void MasterSemaphoreFence::SubmitWork(vk::CommandBuffer cmdbuf, vk::Semaphore wa
 }
 
 void MasterSemaphoreFence::WaitThread(std::stop_token token) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     const vk::Device device{instance.GetDevice()};
     while (!token.stop_requested()) {
         vk::Fence fence;

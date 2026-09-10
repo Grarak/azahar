@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "common/async_handle.h"
 #include "common/hash.h"
 #include "common/thread_worker.h"
 #include "video_core/pica/regs_pipeline.h"
@@ -13,35 +14,6 @@
 
 #define LAYOUT_HASH static_cast<u64>(sizeof(T)), static_cast<u64>(alignof(T))
 #define FIELD_HASH(x) static_cast<u64>(offsetof(T, x)), static_cast<u64>(sizeof(x))
-
-namespace Common {
-
-struct AsyncHandle {
-public:
-    AsyncHandle(bool is_done_ = false) : is_done{is_done_} {}
-
-    [[nodiscard]] bool IsDone() noexcept {
-        return is_done.load(std::memory_order::relaxed);
-    }
-
-    void WaitDone() noexcept {
-        std::unique_lock lock{mutex};
-        condvar.wait(lock, [this] { return is_done.load(std::memory_order::relaxed); });
-    }
-
-    void MarkDone(bool done = true) noexcept {
-        std::scoped_lock lock{mutex};
-        is_done = done;
-        condvar.notify_all();
-    }
-
-private:
-    std::condition_variable condvar;
-    std::mutex mutex;
-    std::atomic_bool is_done{false};
-};
-
-} // namespace Common
 
 namespace Vulkan {
 

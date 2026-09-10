@@ -115,6 +115,7 @@ void Scheduler::DispatchWork() {
 }
 
 void Scheduler::WorkerThread(std::stop_token stop_token) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     Common::SetCurrentThreadName("VulkanWorker");
 
     const auto TryPopQueue{[this](auto& work) -> bool {
