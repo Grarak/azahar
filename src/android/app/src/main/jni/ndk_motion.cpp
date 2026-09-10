@@ -3,6 +3,7 @@
 
 #include <android/sensor.h>
 
+#include "common/thread.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/vector_math.h"
@@ -109,6 +110,7 @@ public:
         : update_period(update_period_) {
         if (asynchronous) {
             poll_thread = std::thread([this] {
+                Common::SetCurrentThreadRole(Common::ThreadRole::Other);
                 Construct();
                 auto start = std::chrono::high_resolution_clock::now();
                 while (!stop_polling) {

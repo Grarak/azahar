@@ -454,10 +454,6 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 )") DECLARE_KEY(use_virtual_sd) BOOST_HANA_STRING(R"(
 
 [System]
-# The system model that Citra will try to emulate
-# 0: Old 3DS (default), 1: New 3DS
-)") DECLARE_KEY(is_new_3ds) BOOST_HANA_STRING(R"(
-
 # Whether to use LLE system applets, if installed
 # 0: No, 1 (default): Yes
 )") DECLARE_KEY(lle_applets) BOOST_HANA_STRING(R"(

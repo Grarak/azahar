@@ -920,7 +920,6 @@ void Java_org_citra_citra_1emu_NativeLibrary_createConfigFile([[maybe_unused]] J
 void Java_org_citra_citra_1emu_NativeLibrary_createLogFile([[maybe_unused]] JNIEnv* env,
                                                            [[maybe_unused]] jobject obj) {
     Common::Log::Initialize();
-    Common::Log::Start();
     LOG_INFO(Frontend, "Logging backend initialised");
 }
 
