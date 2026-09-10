@@ -8,8 +8,11 @@
 #include <optional>
 #include <string>
 #include <boost/serialization/array.hpp>
+#include <boost/serialization/map.hpp>
+#include <map>
 #include <boost/serialization/vector.hpp>
 #include "common/common_types.h"
+#include "core/guest_write_tracker.h"
 #include "common/memory_ref.h"
 #include "common/swap.h"
 
@@ -64,16 +67,33 @@ struct PageTable {
      * corresponding entry in the `attributes` array is of type `Memory`.
      */
 
-    // The reason for this rigmarole is to keep the 'raw' and 'refs' arrays in sync.
-    // We need 'raw' for dynarmic and 'refs' for serialization
+    // The reason for this rigmarole is to keep the 'raw' array and the references in sync.
+    // We need 'raw' for the executors and the references for serialization and for the
+    // executors' mapping observers. The references are kept as runs of consecutive pages
+    // backed by consecutive bytes of one block, not one per page: a MemoryRef is 24 bytes,
+    // and one per page of a 4 GB space was 24 MB per page table - on the Vita, a fifth of
+    // everything the emulator has beside the guest's FCRAM (2026-09-01). A mapping of any
+    // size is one run, so the whole table is a few dozen entries.
     struct Pointers {
+
+        struct Run {
+            u32 pages{};
+            /// The first page's reference; page i of the run is at offset + i * page size.
+            MemoryRef ref;
+
+            template <class Archive>
+            void serialize(Archive& ar, const unsigned int) {
+                ar & pages;
+                ar & ref;
+            }
+        };
 
         struct Entry {
             Entry(Pointers& pointers_, VAddr idx_) : pointers(pointers_), idx(idx_) {}
 
             Entry& operator=(MemoryRef value) {
                 pointers.raw[idx] = value.GetPtr();
-                pointers.refs[idx] = std::move(value);
+                pointers.SetRef(idx, std::move(value));
                 return *this;
             }
 
@@ -90,13 +110,22 @@ struct PageTable {
             return Entry(*this, static_cast<VAddr>(idx));
         }
 
-        const MemoryRef& Ref(std::size_t idx) {
-            return refs[idx];
+        /// The reference backing page idx, or a null one when nothing does.
+        [[nodiscard]] MemoryRef Ref(std::size_t idx) const;
+
+        /// Records (or, for a null value, forgets) the reference backing page idx, merging
+        /// with contiguous neighbours.
+        void SetRef(std::size_t idx, MemoryRef value);
+
+        void Clear() {
+            raw.fill(nullptr);
+            runs.clear();
         }
 
     private:
         std::array<u8*, PAGE_TABLE_NUM_ENTRIES> raw;
-        std::array<MemoryRef, PAGE_TABLE_NUM_ENTRIES> refs;
+        /// Keyed by first page index.
+        std::map<u32, Run> runs;
         friend struct PageTable;
     };
 
@@ -133,11 +162,17 @@ struct PageTable {
 private:
     template <class Archive>
     void serialize(Archive& ar, const unsigned int) {
-        ar & pointers.refs;
+        ar & pointers.runs;
         ar & attributes;
         ar & watchpoint_pages_map;
-        for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
-            pointers.raw[i] = pointers.refs[i].GetPtr();
+        if constexpr (Archive::is_loading::value) {
+            pointers.raw.fill(nullptr);
+            for (auto& [start, run] : pointers.runs) {
+                u8* const base = run.ref.GetPtr();
+                for (u32 i = 0; i < run.pages; i++) {
+                    pointers.raw[start + i] = base + static_cast<std::size_t>(i) * CITRA_PAGE_SIZE;
+                }
+            }
         }
     }
     friend class boost::serialization::access;
@@ -264,10 +299,61 @@ enum class FlushMode {
     FlushAndInvalidate,
 };
 
+/**
+ * Notified whenever the emulated process's mappings change.
+ *
+ * The native ARM backend uses this to keep the host address space in step with the guest page
+ * table: guest code executes at its own addresses, so every page the guest maps has to be mapped
+ * at the same address on the host.
+ */
+class MappingObserver {
+public:
+    virtual ~MappingObserver() = default;
+
+    /// A range became mapped to host memory reachable from `target`.
+    virtual void OnMapped(VAddr base, u32 size, MemoryRef target) = 0;
+
+    /// A range stopped being ordinary memory, whether unmapped or turned over to the rasterizer.
+    virtual void OnUnmapped(VAddr base, u32 size) = 0;
+
+    /// The emulated process changed, so every mapping the observer holds is stale.
+    virtual void OnPageTableChanged() = 0;
+};
+
 class MemorySystem {
 public:
     explicit MemorySystem(Core::System& system);
     ~MemorySystem();
+
+    /// Which pages the guest's CPU has written since the surface cache last looked; see
+    /// guest_write_tracker.h. Present on every build, tracking only where a platform arms it.
+    [[nodiscard]] GuestWriteTracker& WriteTracker() {
+        return *write_tracker;
+    }
+
+    /**
+     * Registers the observer notified of mapping changes to the active page table. Only one
+     * observer is supported, and passing nullptr clears it.
+     */
+    void SetMappingObserver(MappingObserver* observer);
+
+    /**
+     * Rebuilds the mapping observer's view of the address space from scratch.
+     *
+     * Needed after deserializing a save state, which repopulates the page table directly instead
+     * of going through MapPages, and replaces the backing memory besides. An observer left holding
+     * the mappings from before the load would be pointing at memory that is no longer the guest's.
+     */
+    void RefreshMappingObserver();
+
+    /**
+     * Re-reports every mapping of the given page table to the mapping observer, replacing
+     * whatever view it held. For observers that follow a specific process's table rather than
+     * the memory system's notion of "current" - the kernel only updates the latter for the
+     * core it considers running, so a table installed for another core never passes through it.
+     */
+    void SyncMappingObserver(PageTable& page_table);
+
 
     /**
      * Maps an allocated buffer onto a region of the emulated process address space.
@@ -282,7 +368,7 @@ public:
     void UnmapRegion(PageTable& page_table, VAddr base, u32 size);
 
     /// Currently active page table
-    void SetCurrentPageTable(std::shared_ptr<PageTable> page_table);
+    void SetCurrentPageTable(const std::shared_ptr<PageTable>& page_table);
     std::shared_ptr<PageTable> GetCurrentPageTable() const;
 
     /**
@@ -660,6 +746,17 @@ public:
      */
     void RasterizerMarkRegionCached(PAddr start, u32 size, bool cached);
 
+    /**
+     * Disables RasterizerMarkRegionCached. With rendering on its own thread the cache would be
+     * flipping page attributes that the emulation thread and the native mirror are reading
+     * concurrently — and under the native CPU backend the interception it buys never fires for
+     * guest writes anyway.
+     */
+    void SetRasterizerCacheMarkingEnabled(bool enabled);
+
+    /// Whether a guest CPU write into a cached page still reaches the rasterizer cache.
+    [[nodiscard]] bool RasterizerCacheMarkingEnabled() const;
+
     /// For a rasterizer-accessible PAddr, gets a list of all possible VAddr
     std::vector<VAddr> PhysicalToVirtualAddressForRasterizer(PAddr addr);
 
@@ -726,6 +823,7 @@ private:
      */
     MemoryRef GetPointerForRasterizerCache(VAddr addr) const;
 
+public:
     class PhysMemRegionInfo {
     public:
         // Use a pointer to the shared pointer instead of the shared pointer directly to prevent
@@ -747,13 +845,16 @@ private:
     };
     PhysMemRegionInfo GetPhysMemRegionInfo(PAddr address);
 
+private:
     void MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef memory, PageType type);
+
+    /// Reports pages [first, end) of the given page table to the mapping observer.
+    void NotifyMappingObserver(PageTable& page_table, u32 first, u32 end);
 
 private:
     class Impl;
     std::unique_ptr<Impl> impl;
-
-    PhysMemRegionInfo phys_mem_region_info_cache{};
+    std::unique_ptr<GuestWriteTracker> write_tracker;
 
     friend class boost::serialization::access;
     template <class Archive>

@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
+#include "common/host_shared_memory.h"
 #include "common/logging/log.h"
 #include "common/optional_helper.h"
 #include "common/settings.h"
@@ -43,9 +44,79 @@ constexpr u32 SIGSEGV = 11;
 
 namespace Memory {
 
+MemoryRef PageTable::Pointers::Ref(std::size_t idx) const {
+    const u32 page = static_cast<u32>(idx);
+    auto it = runs.upper_bound(page);
+    if (it == runs.begin()) {
+        return {};
+    }
+    --it;
+    if (it->first + it->second.pages <= page) {
+        return {};
+    }
+    return MemoryRef(it->second.ref.GetBackingMem(),
+                     it->second.ref.GetOffset() +
+                         static_cast<u64>(page - it->first) * CITRA_PAGE_SIZE);
+}
+
+void PageTable::Pointers::SetRef(std::size_t idx, MemoryRef value) {
+    const u32 page = static_cast<u32>(idx);
+    // Whatever run covers this page loses it: split around it.
+    auto it = runs.upper_bound(page);
+    if (it != runs.begin()) {
+        --it;
+        const u32 start = it->first;
+        if (start + it->second.pages > page) {
+            const Run covering = it->second;
+            const u32 before = page - start;
+            const u32 after = start + covering.pages - page - 1;
+            runs.erase(it);
+            if (before) {
+                runs.emplace(start, Run{before, covering.ref});
+            }
+            if (after) {
+                runs.emplace(page + 1,
+                             Run{after, MemoryRef(covering.ref.GetBackingMem(),
+                                                  covering.ref.GetOffset() +
+                                                      static_cast<u64>(before + 1) *
+                                                          CITRA_PAGE_SIZE)});
+            }
+        }
+    }
+    if (!value) {
+        return;
+    }
+    const auto same_block = [&](const MemoryRef& a, const MemoryRef& b, u64 a_to_b_bytes) {
+        return a.GetBackingMem() == b.GetBackingMem() && a.GetOffset() + a_to_b_bytes == b.GetOffset();
+    };
+    auto succ = runs.find(page + 1);
+    const bool join_succ =
+        succ != runs.end() && same_block(value, succ->second.ref, CITRA_PAGE_SIZE);
+    auto after_page = runs.lower_bound(page);
+    if (after_page != runs.begin()) {
+        auto pred = std::prev(after_page);
+        if (pred->first + pred->second.pages == page &&
+            same_block(pred->second.ref, value,
+                       static_cast<u64>(pred->second.pages) * CITRA_PAGE_SIZE)) {
+            pred->second.pages++;
+            if (join_succ) {
+                pred->second.pages += succ->second.pages;
+                runs.erase(succ);
+            }
+            return;
+        }
+    }
+    if (join_succ) {
+        Run joined{succ->second.pages + 1, std::move(value)};
+        runs.erase(succ);
+        runs.emplace(page, std::move(joined));
+        return;
+    }
+    runs.emplace(page, Run{1, std::move(value)});
+}
+
 void PageTable::Clear() {
-    pointers.raw.fill(nullptr);
-    pointers.refs.fill(MemoryRef());
+    pointers.Clear();
     attributes.fill(PageType::Unmapped);
 }
 
@@ -101,10 +172,18 @@ class MemorySystem::Impl {
 public:
     // Visual Studio would try to allocate these on compile time
     // if they are std::array which would exceed the memory limit.
-    std::unique_ptr<u8[]> fcram = std::make_unique<u8[]>(Memory::FCRAM_N3DS_SIZE);
-    std::unique_ptr<u8[]> vram = std::make_unique<u8[]>(Memory::VRAM_SIZE);
-    std::unique_ptr<u8[]> n3ds_extra_ram = std::make_unique<u8[]>(Memory::N3DS_EXTRA_RAM_SIZE);
-    std::unique_ptr<u8[]> dsp_ram = std::make_unique<u8[]>(Memory::DSP_RAM_SIZE);
+    // Aliasable so that the native ARM backend can map these same pages at the addresses the guest
+    // uses. Falls back to a plain allocation where the host cannot alias, which every other
+    // backend is indifferent to.
+    Common::HostSharedMemory fcram{Memory::FCRAM_SIZE, "azahar-fcram"};
+    Common::HostSharedMemory vram{Memory::VRAM_SIZE, "azahar-vram"};
+    // Only a New 3DS has this, and only an Old 3DS is emulated, so it is never allocated. The
+    // block stays declared because the physical-address paths still name the region.
+    Common::HostSharedMemory n3ds_extra_ram{0, "azahar-n3ds-ram"};
+    Common::HostSharedMemory dsp_ram{Memory::DSP_RAM_SIZE, "azahar-dsp-ram"};
+
+    MappingObserver* mapping_observer{};
+    bool rasterizer_marking_enabled = true;
 
     Core::System& system;
     std::shared_ptr<PageTable> current_page_table = nullptr;
@@ -123,13 +202,13 @@ public:
     const u8* GetPtr(Region r) const {
         switch (r) {
         case Region::VRAM:
-            return vram.get();
+            return vram.Data();
         case Region::DSP:
-            return dsp_ram.get();
+            return dsp_ram.Data();
         case Region::FCRAM:
-            return fcram.get();
+            return fcram.Data();
         case Region::N3DS:
-            return n3ds_extra_ram.get();
+            return n3ds_extra_ram.Data();
         default:
             UNREACHABLE();
         }
@@ -138,31 +217,37 @@ public:
     u8* GetPtr(Region r) {
         switch (r) {
         case Region::VRAM:
-            return vram.get();
+            return vram.Data();
         case Region::DSP:
-            return dsp_ram.get();
+            return dsp_ram.Data();
         case Region::FCRAM:
-            return fcram.get();
+            return fcram.Data();
         case Region::N3DS:
-            return n3ds_extra_ram.get();
+            return n3ds_extra_ram.Data();
+        default:
+            UNREACHABLE();
+        }
+    }
+
+    const Common::HostSharedMemory& GetBlock(Region r) const {
+        switch (r) {
+        case Region::VRAM:
+            return vram;
+        case Region::DSP:
+            return dsp_ram;
+        case Region::FCRAM:
+            return fcram;
+        case Region::N3DS:
+            return n3ds_extra_ram;
         default:
             UNREACHABLE();
         }
     }
 
     u32 GetSize(Region r) const {
-        switch (r) {
-        case Region::VRAM:
-            return VRAM_SIZE;
-        case Region::DSP:
-            return DSP_RAM_SIZE;
-        case Region::FCRAM:
-            return FCRAM_N3DS_SIZE;
-        case Region::N3DS:
-            return N3DS_EXTRA_RAM_SIZE;
-        default:
-            UNREACHABLE();
-        }
+        // From the block itself: FCRAM and the New 3DS extra RAM are sized to the console being
+        // emulated, and a constant here would describe memory that was never allocated.
+        return static_cast<u32>(GetBlock(r).Size());
     }
 
     u32 GetPC() const noexcept {
@@ -314,13 +399,15 @@ public:
                 return;
             }
 
-            auto& renderer = system.GPU().Renderer();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
             u32 overlap_size = overlap_end - overlap_start;
 
-            auto* rasterizer = renderer.Rasterizer();
+            // Through the threaded facade: the raw GL rasterizer's caches may only be touched
+            // on the render thread, and these flushes arrive from the emulation thread (DMA,
+            // y2r, applet captures) and even filesystem worker threads.
+            auto* rasterizer = system.GPU().CacheRasterizer();
             switch (mode) {
             case FlushMode::Flush:
                 rasterizer->FlushRegion(physical_start, overlap_size);
@@ -346,14 +433,15 @@ private:
     friend class boost::serialization::access;
     template <class Archive>
     void serialize(Archive& ar, const unsigned int file_version) {
-        bool save_n3ds_ram = Settings::values.is_new_3ds.GetValue();
+        // Kept in the stream so the savestate layout does not move; always false now.
+        bool save_n3ds_ram = false;
         ar & save_n3ds_ram;
-        ar& boost::serialization::make_binary_object(vram.get(), Memory::VRAM_SIZE);
+        ar& boost::serialization::make_binary_object(vram.Data(), Memory::VRAM_SIZE);
         ar& boost::serialization::make_binary_object(
-            fcram.get(), save_n3ds_ram ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
+            fcram.Data(), save_n3ds_ram ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
         ar& boost::serialization::make_binary_object(
-            n3ds_extra_ram.get(), save_n3ds_ram ? Memory::N3DS_EXTRA_RAM_SIZE : 0);
-        ar& boost::serialization::make_binary_object(dsp_ram.get(), Memory::DSP_RAM_SIZE);
+            n3ds_extra_ram.Data(), save_n3ds_ram ? Memory::N3DS_EXTRA_RAM_SIZE : 0);
+        ar& boost::serialization::make_binary_object(dsp_ram.Data(), Memory::DSP_RAM_SIZE);
         ar & cache_marker;
         ar & page_table_list;
         // dsp is set from Core::System at startup
@@ -383,6 +471,11 @@ public:
         return impl.GetSize(R);
     }
 
+    const Common::HostSharedMemory* AliasableBlock() const override {
+        const Common::HostSharedMemory& block = impl.GetBlock(R);
+        return block.SupportsAliasing() ? &block : nullptr;
+    }
+
 private:
     MemorySystem::Impl& impl;
 
@@ -399,7 +492,11 @@ MemorySystem::Impl::Impl(Core::System& system_)
       n3ds_extra_ram_mem(std::make_shared<BackingMemImpl<Region::N3DS>>(*this)),
       dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {}
 
-MemorySystem::MemorySystem(Core::System& system) : impl(std::make_unique<Impl>(system)) {}
+MemorySystem::MemorySystem(Core::System& system)
+    : impl(std::make_unique<Impl>(system)), write_tracker(std::make_unique<GuestWriteTracker>()) {
+    write_tracker->RegisterBlock(impl->fcram.Data(), impl->fcram.Size(), FCRAM_PADDR);
+    write_tracker->RegisterBlock(impl->vram.Data(), impl->vram.Size(), VRAM_PADDR);
+}
 MemorySystem::~MemorySystem() = default;
 
 template <class Archive>
@@ -409,8 +506,18 @@ void MemorySystem::serialize(Archive& ar, const unsigned int file_version) {
 
 SERIALIZE_IMPL(MemorySystem)
 
-void MemorySystem::SetCurrentPageTable(std::shared_ptr<PageTable> page_table) {
+void MemorySystem::SetCurrentPageTable(const std::shared_ptr<PageTable>& page_table) {
+    // Called on every guest thread switch, almost always with the table already in force. Rebuilding
+    // the observer's view of a million pages each time would cost far more than the emulation.
+    const bool changed = impl->current_page_table != page_table;
     impl->current_page_table = page_table;
+
+    if (changed && impl->mapping_observer != nullptr) {
+        impl->mapping_observer->OnPageTableChanged();
+        if (page_table != nullptr) {
+            NotifyMappingObserver(*page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+        }
+    }
 }
 
 std::shared_ptr<PageTable> MemorySystem::GetCurrentPageTable() const {
@@ -517,6 +624,7 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
                                      FlushMode::FlushAndInvalidate);
     }
 
+    const u32 first = base;
     u32 end = base + size;
     while (base != end) {
         ASSERT_MSG(base < PAGE_TABLE_NUM_ENTRIES, "out of range mapping at {:08X}", base);
@@ -534,7 +642,79 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
         if (memory != nullptr && memory.GetSize() > CITRA_PAGE_SIZE)
             memory += CITRA_PAGE_SIZE;
     }
+
+    if (impl->mapping_observer != nullptr && &page_table == impl->current_page_table.get()) {
+        NotifyMappingObserver(page_table, first, end);
+    }
 }
+
+/**
+ * Reports the state of pages [first, end) to the mapping observer, coalescing runs that are
+ * contiguous in both guest address and host memory. Without the coalescing a 32 MiB mapping would
+ * become thousands of separate host mappings.
+ */
+void MemorySystem::NotifyMappingObserver(PageTable& page_table, u32 first, u32 end) {
+    auto* observer = impl->mapping_observer;
+
+    u32 run_start = first;
+    while (run_start < end) {
+        const bool run_is_memory = page_table.attributes[run_start] == PageType::Memory &&
+                                   page_table.pointers[run_start] != nullptr;
+
+        u32 run_end = run_start + 1;
+        if (run_is_memory) {
+            // Extend while the host pointers stay as contiguous as the guest addresses.
+            const u8* expected = page_table.pointers[run_start] + CITRA_PAGE_SIZE;
+            while (run_end < end && page_table.attributes[run_end] == PageType::Memory &&
+                   page_table.pointers[run_end] == expected) {
+                expected += CITRA_PAGE_SIZE;
+                run_end++;
+            }
+        } else {
+            while (run_end < end && !(page_table.attributes[run_end] == PageType::Memory &&
+                                      page_table.pointers[run_end] != nullptr)) {
+                run_end++;
+            }
+        }
+
+        const VAddr run_vaddr = run_start << CITRA_PAGE_BITS;
+        const u32 run_size = (run_end - run_start) << CITRA_PAGE_BITS;
+        if (run_is_memory) {
+            observer->OnMapped(run_vaddr, run_size, page_table.pointers.Ref(run_start));
+        } else {
+            observer->OnUnmapped(run_vaddr, run_size);
+        }
+
+        run_start = run_end;
+    }
+}
+
+void MemorySystem::SyncMappingObserver(PageTable& page_table) {
+    if (impl->mapping_observer == nullptr) {
+        return;
+    }
+    impl->mapping_observer->OnPageTableChanged();
+    NotifyMappingObserver(page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+}
+
+void MemorySystem::RefreshMappingObserver() {
+    if (impl->mapping_observer == nullptr) {
+        return;
+    }
+    impl->mapping_observer->OnPageTableChanged();
+    if (impl->current_page_table != nullptr) {
+        NotifyMappingObserver(*impl->current_page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+    }
+}
+
+void MemorySystem::SetMappingObserver(MappingObserver* observer) {
+    impl->mapping_observer = observer;
+    if (observer != nullptr && impl->current_page_table != nullptr) {
+        observer->OnPageTableChanged();
+        NotifyMappingObserver(*impl->current_page_table, 0, PAGE_TABLE_NUM_ENTRIES);
+    }
+}
+
 
 void MemorySystem::MapMemoryRegion(PageTable& page_table, VAddr base, u32 size, MemoryRef target) {
     ASSERT_MSG((size & CITRA_PAGE_MASK) == 0, "non-page aligned size: {:08X}", size);
@@ -892,11 +1072,15 @@ std::string MemorySystem::ReadCString(VAddr vaddr, std::size_t max_length) {
 }
 
 MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address) {
-    if (address >= phys_mem_region_info_cache.region_start &&
-        address < phys_mem_region_info_cache.region_end) {
-        return phys_mem_region_info_cache;
-    }
-
+    // This lookup runs concurrently on the emulation thread and the render thread. It used to go
+    // through a shared single-entry cache, which one thread could rewrite while the other was
+    // mid-read; the torn result paired one region's backing memory with another region's start,
+    // yielding a well-formed pointer into the wrong part of guest RAM. The command-list parser
+    // reading one chain segment through such a pointer walked stale bytes, never saw the list's
+    // irq_request, and the title froze waiting for a P3D that had silently been dropped
+    // (Smash at match entry, software renderer, measured as a parser read exactly
+    // 0x7a00000 bytes off FCRAM's host base). The scan below is four compares against a
+    // constexpr table - it does not need a cache, and it must not have a shared one.
     constexpr std::array memory_areas = {
         std::make_pair(VRAM_PADDR, VRAM_SIZE),
         std::make_pair(DSP_RAM_PADDR, DSP_RAM_SIZE),
@@ -913,28 +1097,21 @@ MemorySystem::PhysMemRegionInfo MemorySystem::GetPhysMemRegionInfo(PAddr address
     if (area == memory_areas.end()) [[unlikely]] {
         LOG_ERROR(HW_Memory, "Unknown GetPhysMemRegionInfo @ {:#08X} at PC {:#08X}", address,
                   impl->GetPC());
-        phys_mem_region_info_cache = PhysMemRegionInfo();
-        return phys_mem_region_info_cache;
+        return PhysMemRegionInfo();
     }
 
     switch (area->first) {
     case VRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->vram_mem, area->first, area->second};
-        break;
+        return {&impl->vram_mem, area->first, area->second};
     case DSP_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->dsp_mem, area->first, area->second};
-        break;
+        return {&impl->dsp_mem, area->first, area->second};
     case FCRAM_PADDR:
-        phys_mem_region_info_cache = {&impl->fcram_mem, area->first, area->second};
-        break;
+        return {&impl->fcram_mem, area->first, area->second};
     case N3DS_EXTRA_RAM_PADDR:
-        phys_mem_region_info_cache = {&impl->n3ds_extra_ram_mem, area->first, area->second};
-        break;
+        return {&impl->n3ds_extra_ram_mem, area->first, area->second};
     default:
         UNREACHABLE();
     }
-
-    return phys_mem_region_info_cache;
 }
 
 u8* MemorySystem::GetPhysicalPointer(PAddr address) {
@@ -955,7 +1132,14 @@ MemoryRef MemorySystem::GetPhysicalRef(PAddr address) {
         return {nullptr};
     }
 
-    u32 offset_into_region = address - target_mem.region_start;
+    const u32 offset_into_region = address - target_mem.region_start;
+    // A region can be matched while the offset still lands past its backing allocation (e.g.
+    // fills or textures running past the end of VRAM). MemoryRef's constructor asserts on
+    // that, which turned bad guest addresses into emulator crashes - notably from the
+    // software blitter's own validity check. Report them as invalid instead.
+    if (offset_into_region > (*target_mem.backing_mem)->GetSize()) [[unlikely]] {
+        return {nullptr};
+    }
     return {*target_mem.backing_mem, offset_into_region};
 }
 
@@ -984,8 +1168,16 @@ std::vector<VAddr> MemorySystem::PhysicalToVirtualAddressForRasterizer(PAddr add
     return {};
 }
 
+void MemorySystem::SetRasterizerCacheMarkingEnabled(bool enabled) {
+    impl->rasterizer_marking_enabled = enabled;
+}
+
+bool MemorySystem::RasterizerCacheMarkingEnabled() const {
+    return impl->rasterizer_marking_enabled;
+}
+
 void MemorySystem::RasterizerMarkRegionCached(PAddr start, u32 size, bool cached) {
-    if (start == 0) {
+    if (start == 0 || !impl->rasterizer_marking_enabled) {
         return;
     }
 
@@ -1268,28 +1460,29 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
 }
 
 u32 MemorySystem::GetFCRAMOffset(const u8* pointer) const {
-    ASSERT(pointer >= impl->fcram.get() && pointer <= impl->fcram.get() + Memory::FCRAM_N3DS_SIZE);
-    return static_cast<u32>(pointer - impl->fcram.get());
+    ASSERT(pointer >= impl->fcram.Data() &&
+           pointer <= impl->fcram.Data() + impl->fcram.Size());
+    return static_cast<u32>(pointer - impl->fcram.Data());
 }
 
 u8* MemorySystem::GetFCRAMPointer(std::size_t offset) {
-    ASSERT(offset <= Memory::FCRAM_N3DS_SIZE);
-    return impl->fcram.get() + offset;
+    ASSERT(offset <= impl->fcram.Size());
+    return impl->fcram.Data() + offset;
 }
 
 const u8* MemorySystem::GetFCRAMPointer(std::size_t offset) const {
-    ASSERT(offset <= Memory::FCRAM_N3DS_SIZE);
-    return impl->fcram.get() + offset;
+    ASSERT(offset <= impl->fcram.Size());
+    return impl->fcram.Data() + offset;
 }
 
 MemoryRef MemorySystem::GetFCRAMRef(std::size_t offset) const {
-    ASSERT(offset <= Memory::FCRAM_N3DS_SIZE);
+    ASSERT(offset <= impl->fcram.Size());
     return MemoryRef(impl->fcram_mem, offset);
 }
 
 u8* MemorySystem::GetDspMemory(std::size_t offset) const {
     ASSERT(offset <= Memory::DSP_RAM_SIZE);
-    return impl->dsp_ram.get() + offset;
+    return impl->dsp_ram.Data() + offset;
 }
 
 } // namespace Memory
