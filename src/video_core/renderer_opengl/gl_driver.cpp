@@ -125,10 +125,20 @@ bool Driver::IsCustomFormatSupported(VideoCore::CustomPixelFormat format) const 
 }
 
 void Driver::ReportDriverInfo() {
-    // Report the context version and the vendor string
-    gl_version = std::string_view{reinterpret_cast<const char*>(glGetString(GL_VERSION))};
-    gpu_vendor = std::string_view{reinterpret_cast<const char*>(glGetString(GL_VENDOR))};
-    gpu_model = std::string_view{reinterpret_cast<const char*>(glGetString(GL_RENDERER))};
+    // Report the context version and the vendor string. glGetString returns null when no
+    // context is current, and string_view would then run strlen on it; that is a caller bug
+    // worth naming rather than a segfault three frames down.
+    const auto query = [](GLenum name, const char* what) -> std::string_view {
+        const auto* value = reinterpret_cast<const char*>(glGetString(name));
+        if (value == nullptr) {
+            LOG_ERROR(Render_OpenGL, "glGetString({}) returned null: no current GL context", what);
+            return "unknown";
+        }
+        return std::string_view{value};
+    };
+    gl_version = query(GL_VERSION, "GL_VERSION");
+    gpu_vendor = query(GL_VENDOR, "GL_VENDOR");
+    gpu_model = query(GL_RENDERER, "GL_RENDERER");
 
     LOG_INFO(Render_OpenGL, "GL_VERSION: {}", gl_version);
     LOG_INFO(Render_OpenGL, "GL_VENDOR: {}", gpu_vendor);
@@ -177,7 +187,10 @@ void Driver::CheckExtensionSupport() {
     nv_fragment_shader_interlock = GLAD_GL_NV_fragment_shader_interlock;
     intel_fragment_shader_ordering = GLAD_GL_INTEL_fragment_shader_ordering;
     blend_minmax_factor = GLAD_GL_AMD_blend_minmax_factor || GLAD_GL_NV_blend_minmax_factor;
-    is_suitable = GLAD_GL_VERSION_4_3 || GLAD_GL_ES_VERSION_3_2;
+    // GLES 3.1 qualifies when the frontend validated the required extension set and aliased
+    // the 3.2-core entry points (see EmuWindow's context ladder); LUTs use 2D textures there.
+    is_suitable = GLAD_GL_VERSION_4_3 || GLAD_GL_ES_VERSION_3_2 || GLAD_GL_ES_VERSION_3_1 ||
+                  GLAD_GL_ES_VERSION_3_0;
 }
 
 void Driver::FindBugs() {

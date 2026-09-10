@@ -51,6 +51,13 @@ public:
 
     void SwapBuffers() override;
     void TryPresent(int timeout_ms, bool is_secondary) override;
+
+    /// Composes the screens into an offscreen buffer and reads them back as RGBA8, for the
+    /// frame dumper's "what the renderer produced" half. The GL counterpart of the software
+    /// frontend's ComposeSoftwareFrame: it is a re-compose, and exists only to be diffed
+    /// against the window readback that the same present writes.
+    bool ComposeOffscreen(const Layout::FramebufferLayout& layout,
+                          std::vector<u8>& out) override;
     void PrepareVideoDumping() override;
     void CleanupVideoDumping() override;
 
@@ -78,7 +85,14 @@ private:
                                 Layout::DisplayOrientation orientation);
 
     // Loads framebuffer from emulated memory into the display information structure
-    void LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuffer, ScreenInfo& screen_info,
+    /// Which of a screen's two candidate framebuffer addresses to present. Prefers the one the
+    /// render thread most recently finished writing; falls back to the register selection.
+    /// See the software renderer's namesake for why completion order and not the registers.
+    PAddr PickFramebufferAddr(u32 pane, const Pica::FramebufferConfig& framebuffer,
+                              bool right_eye) const;
+
+    void LoadFBToScreenInfo(u32 pane, const Pica::FramebufferConfig& framebuffer,
+                            ScreenInfo& screen_info,
                             bool right_eye, const Pica::ColorFill& color_fill);
 
 private:

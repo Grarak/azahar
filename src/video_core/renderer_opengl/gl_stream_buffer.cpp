@@ -4,6 +4,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "video_core/renderer_opengl/gl_driver.h"
 #include "video_core/renderer_opengl/gl_stream_buffer.h"
@@ -24,14 +25,30 @@ OGLStreamBuffer::OGLStreamBuffer(Driver& driver, GLenum target, GLsizeiptr size,
         allocate_size *= 2;
     }
 
-    if (GLAD_GL_ARB_buffer_storage) {
+    // EXT_buffer_storage is the same feature under a GLES context (llvmpipe exposes it there).
+    if (GLAD_GL_ARB_buffer_storage || GLAD_GL_EXT_buffer_storage) {
         persistent = true;
         coherent = prefer_coherent;
         GLbitfield flags =
             GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | (coherent ? GL_MAP_COHERENT_BIT : 0);
-        glBufferStorage(gl_target, allocate_size, nullptr, flags);
+        if (GLAD_GL_ARB_buffer_storage) {
+            glBufferStorage(gl_target, allocate_size, nullptr, flags);
+        } else {
+            glBufferStorageEXT(gl_target, allocate_size, nullptr, flags);
+        }
         mapped_ptr = static_cast<u8*>(glMapBufferRange(
             gl_target, 0, buffer_size, flags | (coherent ? 0 : GL_MAP_FLUSH_EXPLICIT_BIT)));
+        if (mapped_ptr == nullptr) {
+            // Seen on 32-bit hosts, where a large persistent mapping may simply not fit in the
+            // address space. The unmapped path maps and unmaps per use and still works.
+            LOG_ERROR(Render_OpenGL,
+                      "Persistent map of {} bytes failed (GL error {:#x}); falling back to a "
+                      "plain stream buffer",
+                      static_cast<u64>(allocate_size), glGetError());
+            persistent = false;
+            coherent = false;
+            glBufferData(gl_target, allocate_size, nullptr, GL_STREAM_DRAW);
+        }
     } else {
         glBufferData(gl_target, allocate_size, nullptr, GL_STREAM_DRAW);
     }
@@ -79,6 +96,8 @@ std::tuple<u8*, GLintptr, bool> OGLStreamBuffer::Map(GLsizeiptr size, GLintptr a
                            (invalidate ? GL_MAP_INVALIDATE_BUFFER_BIT : GL_MAP_UNSYNCHRONIZED_BIT);
         mapped_ptr = static_cast<u8*>(
             glMapBufferRange(gl_target, buffer_pos, buffer_size - buffer_pos, flags));
+        ASSERT_MSG(mapped_ptr != nullptr, "glMapBufferRange of {} bytes failed (GL error {:#x})",
+                   static_cast<u64>(buffer_size - buffer_pos), glGetError());
         mapped_offset = buffer_pos;
     }
 

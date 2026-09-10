@@ -6,6 +6,7 @@
 
 #include <utility>
 
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/dumping/backend.h"
 #include "core/frontend/emu_window.h"
@@ -42,6 +43,7 @@ void FrameDumperOpenGL::StopDumping() {
 }
 
 void FrameDumperOpenGL::PresentLoop(std::stop_token stop_token) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     const auto scope = context->Acquire();
     InitializeOpenGLObjects();
 

@@ -20,6 +20,13 @@ public:
     GLuint GetHandle() const;
     GLsizeiptr GetSize() const;
 
+    /// The stable client pointer when the buffer is persistently and coherently mapped; null
+    /// otherwise. Writes through it become visible to the GL without any flush call, from any
+    /// thread, as long as they happen-before the draw that reads them.
+    u8* CoherentMapping() const {
+        return (persistent && coherent) ? mapped_ptr : nullptr;
+    }
+
     /*
      * Allocates a linear chunk of memory in the GPU buffer with at least "size" bytes
      * and the optional alignment requirement.

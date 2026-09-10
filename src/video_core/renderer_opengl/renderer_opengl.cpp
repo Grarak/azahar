@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include "video_core/gpu.h"
+#include <cstdlib>
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/settings.h"
@@ -154,6 +156,37 @@ void RendererOpenGL::SwapBuffers() {
     rasterizer.TickFrame();
 }
 
+bool RendererOpenGL::ComposeOffscreen(const Layout::FramebufferLayout& layout,
+                                      std::vector<u8>& out) {
+    if (layout.width == 0 || layout.height == 0) {
+        return false;
+    }
+    OGLFramebuffer compose_framebuffer;
+    compose_framebuffer.Create();
+    const GLuint old_read_fb = state.draw.read_framebuffer;
+    const GLuint old_draw_fb = state.draw.draw_framebuffer;
+    state.draw.read_framebuffer = state.draw.draw_framebuffer = compose_framebuffer.handle;
+    state.Apply();
+
+    GLuint renderbuffer;
+    glGenRenderbuffers(1, &renderbuffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, layout.width, layout.height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer);
+
+    // flipped=true so the readback comes out top-down like the window dump's flip does.
+    DrawScreens(layout, true);
+    out.assign(static_cast<std::size_t>(layout.width) * layout.height * 4, 0);
+    glReadPixels(0, 0, layout.width, layout.height, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+
+    compose_framebuffer.Release();
+    state.draw.read_framebuffer = old_read_fb;
+    state.draw.draw_framebuffer = old_draw_fb;
+    state.Apply();
+    glDeleteRenderbuffers(1, &renderbuffer);
+    return true;
+}
+
 void RendererOpenGL::RenderScreenshot() {
     if (settings.screenshot_requested.exchange(false)) {
         // Draw this frame to the screenshot framebuffer
@@ -174,8 +207,20 @@ void RendererOpenGL::RenderScreenshot() {
 
         DrawScreens(layout, false);
 
-        glReadPixels(0, 0, layout.width, layout.height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
-                     settings.screenshot_bits);
+        if (driver.IsOpenGLES()) {
+            // GLES has neither GL_BGRA readback nor the 8_8_8_8_REV type; read RGBA bytes and
+            // swizzle in place so consumers see the same BGRA words the desktop path produces.
+            glReadPixels(0, 0, layout.width, layout.height, GL_RGBA, GL_UNSIGNED_BYTE,
+                         settings.screenshot_bits);
+            u8* bytes = static_cast<u8*>(settings.screenshot_bits);
+            const std::size_t count = static_cast<std::size_t>(layout.width) * layout.height;
+            for (std::size_t i = 0; i < count; i++) {
+                std::swap(bytes[i * 4 + 0], bytes[i * 4 + 2]);
+            }
+        } else {
+            glReadPixels(0, 0, layout.width, layout.height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
+                         settings.screenshot_bits);
+        }
 
         screenshot_framebuffer.Release();
         state.draw.read_framebuffer = old_read_fb;
@@ -206,14 +251,18 @@ void RendererOpenGL::PrepareRendertarget() {
             texture.format != framebuffer.color_format) {
             ConfigureFramebufferTexture(texture, framebuffer, color_fill);
         }
-        LoadFBToScreenInfo(framebuffer, screen_infos[i], i == 1, color_fill);
+        LoadFBToScreenInfo(i, framebuffer, screen_infos[i], i == 1, color_fill);
     }
 }
 
 void RendererOpenGL::RenderToMailbox(const Layout::FramebufferLayout& layout,
                                      std::unique_ptr<Frontend::TextureMailbox>& mailbox,
                                      bool flipped) {
-    if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
+    // With presentation on the render thread the duplicate-frame check is both redundant (the
+    // frameskip already drops frames nobody will see) and unsound: game_frames_updated is set on
+    // the emulation thread and consumed here, and when the cadence misaligns at boot the mailbox
+    // never receives its first real frame and the initial black one is re-presented forever.
+    if (threaded_presentation || !Settings::values.use_skip_duplicate_frames.GetValue() ||
         Core::PerfStats::game_frames_updated) {
         Frontend::Frame* frame;
         {
@@ -266,25 +315,56 @@ void RendererOpenGL::RenderToMailbox(const Layout::FramebufferLayout& layout,
     }
 }
 
+PAddr RendererOpenGL::PickFramebufferAddr(u32 pane, const Pica::FramebufferConfig& framebuffer,
+                                          bool right_eye) const {
+    const PAddr slot1 = !right_eye ? framebuffer.address_left1 : framebuffer.address_right1;
+    const PAddr slot2 = !right_eye ? framebuffer.address_left2 : framebuffer.address_right2;
+    const PAddr reg_addr = framebuffer.active_fb == 0 ? slot1 : slot2;
+    if (owner_gpu == nullptr) {
+        return reg_addr;
+    }
+    // The registers name the pair of buffers the guest writes next, but with a lagging
+    // renderer and a title rotating three buffers, the one holding the newest *completed*
+    // frame is outside that pair on every other present - selection constrained to the pair
+    // alternates between the newest frame and the one before it. PickDisplayAddr remembers
+    // every address this pane's registers have named and returns the newest completion among
+    // them, which is monotonic; 0 means nothing has a completion on record (the title draws
+    // into the display buffer directly), and register selection is all there is.
+    const PAddr best = owner_gpu->PickDisplayAddr(pane, slot1, slot2, reg_addr);
+    if (best != 0) {
+        return best;
+    }
+    return reg_addr;
+}
+
 /**
  * Loads framebuffer from emulated memory into the active OpenGL texture.
  */
-void RendererOpenGL::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuffer,
+void RendererOpenGL::LoadFBToScreenInfo(u32 pane, const Pica::FramebufferConfig& framebuffer,
                                         ScreenInfo& screen_info, bool right_eye,
                                         const Pica::ColorFill& color_fill) {
 
     if (framebuffer.address_right1 == 0 || framebuffer.address_right2 == 0)
         right_eye = false;
 
-    const PAddr framebuffer_addr =
-        framebuffer.active_fb == 0
-            ? (!right_eye ? framebuffer.address_left1 : framebuffer.address_right1)
-            : (!right_eye ? framebuffer.address_left2 : framebuffer.address_right2);
+    const PAddr framebuffer_addr = PickFramebufferAddr(pane, framebuffer, right_eye);
 
     LOG_TRACE(Render_OpenGL, "0x{:08x} bytes from 0x{:08x}({}x{}), fmt {:x}",
               framebuffer.stride * framebuffer.height, framebuffer_addr, framebuffer.width.Value(),
               framebuffer.height.Value(), framebuffer.format);
 
+    // The fill-hold, for titles that draw into the display buffer directly and so have no
+    // completions on record: each screen keeps its own picture until the transfer that fills it
+    // has actually run, because refreshing from a buffer whose fill is still queued is what put
+    // the top screen's picture on the bottom (the game recycles these buffers between the two
+    // screens, so an unfilled one still holds the other screen's last frame). When completion
+    // order picked the address above it already answered this and the test cannot fire.
+    // Asked of the owning GPU directly: during shutdown the system's GPU pointer is already
+    // null while the render thread is still presenting, and going through it crashed at exit.
+    if (screen_info.texture.width != 0 && owner_gpu != nullptr &&
+        owner_gpu->IsFillPending(framebuffer_addr)) {
+        return;
+    }
     int bpp = Pica::BytesPerPixel(framebuffer.color_format);
     std::size_t pixel_stride = framebuffer.stride / bpp;
 
@@ -295,7 +375,13 @@ void RendererOpenGL::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
     // only allows rows to have a memory alignement of 4.
     ASSERT(pixel_stride % 4 == 0);
 
-    if (color_fill.is_enabled ||
+    // A CPU-written framebuffer is shown from the copy the emulation thread took at the
+    // VBlank, so the picture is the one the guest had on show then, whatever it has written
+    // since (GPU::DisplaySnapshot). The right eye is never snapshotted and takes the live path.
+    const u8* snapshot =
+        owner_gpu != nullptr ? owner_gpu->DisplaySnapshot(pane == 2 ? 1 : 0, framebuffer_addr)
+                             : nullptr;
+    if (color_fill.is_enabled || snapshot != nullptr ||
         !rasterizer.AccelerateDisplay(framebuffer, framebuffer_addr, static_cast<u32>(pixel_stride),
                                       screen_info)) {
         u32 width = framebuffer.width;
@@ -305,9 +391,11 @@ void RendererOpenGL::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuff
         screen_info.display_texture = screen_info.texture.resource.handle;
         screen_info.display_texcoords = Common::Rectangle<f32>(0.f, 0.f, 1.f, 1.f);
 
-        rasterizer.FlushRegion(framebuffer_addr, framebuffer.stride * framebuffer.height);
-
-        u8* framebuffer_data = system.Memory().GetPhysicalPointer(framebuffer_addr);
+        const u8* framebuffer_data = snapshot;
+        if (framebuffer_data == nullptr) {
+            rasterizer.FlushRegion(framebuffer_addr, framebuffer.stride * framebuffer.height);
+            framebuffer_data = system.Memory().GetPhysicalPointer(framebuffer_addr);
+        }
 
         if (color_fill.is_enabled) {
             memcpy(fill_pixel, color_fill.AsVector().AsArray(), sizeof(fill_pixel));
@@ -885,6 +973,23 @@ void RendererOpenGL::TryPresent(int timeout_ms, bool is_secondary) {
         return;
     }
 
+    // This runs on the render thread, on the rasterizer's context, so whatever state the last
+    // game draw left is live here: glClear and glBlitFramebuffer both honour the scissor test
+    // and the colour mask. A title whose last draw before present used a small scissor
+    // (Smash's character select) then reached the window only inside that rectangle. Present
+    // through the tracked state with the scissor off and the mask open, and hand the
+    // rasterizer's state back afterwards.
+    const OpenGLState prev_state = OpenGLState::GetCurState();
+    OpenGLState present_state = prev_state;
+    present_state.scissor.enabled = false;
+    present_state.color_mask.red_enabled = GL_TRUE;
+    present_state.color_mask.green_enabled = GL_TRUE;
+    present_state.color_mask.blue_enabled = GL_TRUE;
+    present_state.color_mask.alpha_enabled = GL_TRUE;
+    present_state.draw.draw_framebuffer = 0;
+    present_state.draw.read_framebuffer = frame->present.handle;
+    present_state.Apply();
+
     // Clearing before a full overwrite of a fbo can signal to drivers that they can avoid a
     // readback since we won't be doing any blending
     glClear(GL_COLOR_BUFFER_BIT);
@@ -901,7 +1006,9 @@ void RendererOpenGL::TryPresent(int timeout_ms, bool is_secondary) {
     // glDeleteSync(frame.render_sync);
     // frame.render_sync = 0;
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, frame->present.handle);
+    // The present FBO may have been recreated above: bind it through the tracked state.
+    present_state.draw.read_framebuffer = frame->present.handle;
+    present_state.Apply();
     glBlitFramebuffer(0, 0, frame->width, frame->height, 0, 0, layout.width, layout.height,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
@@ -914,7 +1021,15 @@ void RendererOpenGL::TryPresent(int timeout_ms, bool is_secondary) {
     frame->present_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    // Hand the rasterizer's state back, but leave the read framebuffer on the window as the
+    // pre-blit code did: what runs next reads the default framebuffer (the frame dump's
+    // glReadPixels, and any window readback), while the rasterizer binds its own read target
+    // before each of its own reads. Restoring the rasterizer's read binding here made the
+    // dump read a texture-cache FBO instead of the window - a 3DS-sized picture in the corner
+    // of an otherwise black frame.
+    OpenGLState restored = prev_state;
+    restored.draw.read_framebuffer = 0;
+    restored.Apply();
 }
 
 void RendererOpenGL::PrepareVideoDumping() {

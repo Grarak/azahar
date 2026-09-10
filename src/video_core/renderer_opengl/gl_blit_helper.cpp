@@ -43,12 +43,38 @@ OGLSampler CreateSampler(GLenum filter) {
     return sampler;
 }
 
+/// glProgramUniform* is 3.1; on a 3.0 context the location qualifiers are stripped too, so
+/// resolve by name and set through the bound-program path.
+void SetProgramUniform2f(GLuint program, GLint location, const char* name, GLfloat x, GLfloat y) {
+    if (glProgramUniform2f != nullptr) {
+        glProgramUniform2f(program, location, x, y);
+        return;
+    }
+    GLint prev = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prev);
+    glUseProgram(program);
+    glUniform2f(glGetUniformLocation(program, name), x, y);
+    glUseProgram(static_cast<GLuint>(prev));
+}
+
+void SetProgramUniform1f(GLuint program, GLint location, const char* name, GLfloat x) {
+    if (glProgramUniform1f != nullptr) {
+        glProgramUniform1f(program, location, x);
+        return;
+    }
+    GLint prev = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prev);
+    glUseProgram(program);
+    glUniform1f(glGetUniformLocation(program, name), x);
+    glUseProgram(static_cast<GLuint>(prev));
+}
+
 OGLProgram CreateProgram(std::string_view frag, std::string_view debug_name) {
     OGLProgram program;
     program.SetDebugName(debug_name);
     program.Create(HostShaders::FULL_SCREEN_TRIANGLE_VERT, frag);
-    glProgramUniform2f(program.handle, 0, 1.f, 1.f);
-    glProgramUniform2f(program.handle, 1, 0.f, 0.f);
+    SetProgramUniform2f(program.handle, 0, "tex_scale", 1.f, 1.f);
+    SetProgramUniform2f(program.handle, 1, "tex_offset", 0.f, 0.f);
     return program;
 }
 
@@ -277,7 +303,7 @@ void BlitHelper::FilterXbrz(Surface& surface, const VideoCore::TextureBlit& blit
     SCOPE_EXIT({ prev_state.Apply(); });
     state.texture_units[0].texture_2d = surface.Handle(0);
     state.texture_units[0].target = GL_TEXTURE_2D;
-    glProgramUniform1f(xbrz_program.handle, 2, static_cast<GLfloat>(surface.res_scale));
+    SetProgramUniform1f(xbrz_program.handle, 2, "scale", static_cast<GLfloat>(surface.res_scale));
     SetParams(xbrz_program, surface.RealExtent(false), blit.src_rect);
     Draw(xbrz_program, surface.Handle(), draw_fbo.handle, blit.dst_level, blit.dst_rect);
 }
@@ -293,11 +319,10 @@ void BlitHelper::FilterMMPX(Surface& surface, const VideoCore::TextureBlit& blit
 
 void BlitHelper::SetParams(OGLProgram& program, const VideoCore::Extent& src_extent,
                            Common::Rectangle<u32> src_rect) {
-    glProgramUniform2f(
-        program.handle, 0,
+    SetProgramUniform2f(program.handle, 0, "tex_scale",
         static_cast<float>(src_rect.right - src_rect.left) / static_cast<float>(src_extent.width),
         static_cast<float>(src_rect.top - src_rect.bottom) / static_cast<float>(src_extent.height));
-    glProgramUniform2f(program.handle, 1,
+    SetProgramUniform2f(program.handle, 1, "tex_offset",
                        static_cast<float>(src_rect.left) / static_cast<float>(src_extent.width),
                        static_cast<float>(src_rect.bottom) / static_cast<float>(src_extent.height));
 }
