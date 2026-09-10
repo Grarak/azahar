@@ -4,6 +4,7 @@
 
 #include <thread>
 #include <boost/asio.hpp>
+#include "common/thread.h"
 #include "common/common_types.h"
 #include "common/logging/log.h"
 #include "core/rpc/packet.h"
@@ -20,7 +21,10 @@ public:
           new_request_callback(std::move(new_request_callback)) {
 
         StartReceive();
-        worker_thread = std::thread([this] { io_context.run(); });
+        worker_thread = std::thread([this] {
+            Common::SetCurrentThreadRole(Common::ThreadRole::Other);
+            io_context.run();
+        });
     }
 
     ~Impl() {

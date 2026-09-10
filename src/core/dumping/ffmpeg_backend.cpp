@@ -11,6 +11,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 #include "core/core_timing.h"
 #include "core/dumping/ffmpeg_backend.h"
 #include "video_core/gpu.h"
@@ -758,6 +759,7 @@ bool FFmpegBackend::StartDumping(const std::string& path, const Layout::Framebuf
         video_processing_thread.join();
     }
     video_processing_thread = std::thread([&] {
+        Common::SetCurrentThreadRole(Common::ThreadRole::Other);
         event1.Set();
         while (true) {
             event2.Wait();
@@ -783,6 +785,7 @@ bool FFmpegBackend::StartDumping(const std::string& path, const Layout::Framebuf
         audio_processing_thread.join();
     }
     audio_processing_thread = std::thread([&] {
+        Common::SetCurrentThreadRole(Common::ThreadRole::Other);
         VariableAudioFrame channel0, channel1;
         while (true) {
             channel0 = audio_frame_queues[0].PopWait();

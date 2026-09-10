@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/hle/kernel/process.h"
 #include "core/memory.h"
@@ -179,6 +180,7 @@ void RPCServer::HandleSingleRequest(std::unique_ptr<Packet> request_packet) {
 }
 
 void RPCServer::HandleRequestsLoop(std::stop_token stop_token) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     std::unique_ptr<RPC::Packet> request_packet;
 
     LOG_INFO(RPC_Server, "Request handler started.");
