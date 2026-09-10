@@ -23,6 +23,7 @@ enum class Semantic : u32 {
     Texcoord0_W,
     Normquat,
     View,
+    NormquatFlat,
 };
 
 static bool IsPassThroughTevStage(const Pica::TexturingRegs::TevStageConfig& stage) {
@@ -42,13 +43,27 @@ static constexpr char fragment_shader_precision_OES[] = R"(
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp int;
 precision highp float;
-precision highp samplerBuffer;
+#if __VERSION__ >= 310
 precision highp uimage2D;
+#endif
 #else
 precision mediump int;
 precision mediump float;
-precision mediump samplerBuffer;
+#if __VERSION__ >= 310
 precision mediump uimage2D;
+#endif
+#endif // GL_FRAGMENT_PRECISION_HIGH
+#endif
+)";
+
+// samplerBuffer does not exist on GLES without texture buffer support, so its precision
+// statement is emitted only alongside the samplerBuffer declarations.
+static constexpr char fragment_shader_precision_buffer_OES[] = R"(
+#if GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp samplerBuffer;
+#else
+precision mediump samplerBuffer;
 #endif // GL_FRAGMENT_PRECISION_HIGH
 #endif
 )";
@@ -67,7 +82,7 @@ struct LightSrc {
     float dist_atten_bias;
     float dist_atten_scale;
 };
-layout (binding = 2, std140) uniform fs_data {
+UNIFORM_BINDING(2) uniform fs_data {
     int framebuffer_scale;
     int alphatest_ref;
     float depth_scale;
@@ -546,20 +561,27 @@ void FragmentModule::WriteLighting() {
         }
     }
 
-    // If the barycentric extension is enabled, perform quaternion correction here.
+    // Per-fragment quaternion sign correction. With the barycentric extension each vertex's
+    // quaternion is flipped against vertex 0 before manual interpolation; without it, the flat
+    // (provoking vertex) copy plays the reference role: an interpolated quaternion that ended up
+    // in the wrong hemisphere is negated, which is exactly the short-arc fix the geometry shader
+    // used to apply per triangle. No geometry stage required either way.
     if (use_fragment_shader_barycentric) {
         out += "vec4 normquat_0 = normquats[0];\n"
                "vec4 normquat_1 = mix(normquats[1], -normquats[1], "
                "bvec4(AreQuaternionsOpposite(normquats[0], normquats[1])));\n"
                "vec4 normquat_2 = mix(normquats[2], -normquats[2], "
                "bvec4(AreQuaternionsOpposite(normquats[0], normquats[2])));\n"
-               "vec4 normquat = gl_BaryCoord.x * normquat_0 + gl_BaryCoord.y * normquat_1 + "
-               "gl_BaryCoord.z * normquat_2;\n";
+               "vec4 quat_corrected = gl_BaryCoord.x * normquat_0 + gl_BaryCoord.y * normquat_1 "
+               "+ gl_BaryCoord.z * normquat_2;\n";
+    } else {
+        out += "vec4 quat_corrected = (dot(normquat, normquat_flat) < 0.0) ? -normquat : "
+               "normquat;\n";
     }
 
     // Rotate the surface-local normal by the interpolated normal quaternion to convert it to
     // eyespace.
-    out += "vec4 normalized_normquat = normalize(normquat);\n"
+    out += "vec4 normalized_normquat = normalize(quat_corrected);\n"
            "vec3 normal = quaternion_rotate(normalized_normquat, surface_normal);\n"
            "vec3 tangent = quaternion_rotate(normalized_normquat, surface_tangent);\n";
 
@@ -823,8 +845,7 @@ void FragmentModule::WriteFog() {
     // Generate clamped fog factor from LUT for given fog index
     out += "float fog_i = clamp(floor(fog_index), 0.0, 127.0);\n"
            "float fog_f = fog_index - fog_i;\n"
-           "vec2 fog_lut_entry = texelFetch(texture_buffer_lut_lf, int(fog_i) + "
-           "fog_lut_offset).rg;\n"
+           "vec2 fog_lut_entry = lut_lf(int(fog_i) + fog_lut_offset);\n"
            "float fog_factor = fog_lut_entry.r + fog_lut_entry.g * fog_f;\n"
            "fog_factor = clamp(fog_factor, 0.0, 1.0);\n";
 
@@ -1053,7 +1074,7 @@ float ProcTexLookupLUT(int offset, float coord) {
     float index_i = clamp(floor(coord), 0.0, 127.0);
     float index_f = coord - index_i; // fract() cannot be used here because 128.0 needs to be
                                      // extracted as index_i = 127.0 and index_f = 1.0
-    vec2 entry = texelFetch(texture_buffer_lut_rg, int(index_i) + offset).rg;
+    vec2 entry = lut_rg(int(index_i) + offset);
     return clamp(entry.r + entry.g * index_f, 0.0, 1.0);
 }
     )";
@@ -1114,17 +1135,15 @@ float ProcTexNoiseCoef(vec2 x) {
     case ProcTexFilter::LinearMipmapNearest:
         out += "int lut_index_i = int(lut_coord) + lut_offset;\n";
         out += "float lut_index_f = fract(lut_coord);\n";
-        out += "return texelFetch(texture_buffer_lut_rgba, lut_index_i + "
-               "proctex_lut_offset) + "
+        out += "return lut_rgba(lut_index_i + proctex_lut_offset) + "
                "lut_index_f * "
-               "texelFetch(texture_buffer_lut_rgba, lut_index_i + proctex_diff_lut_offset);\n";
+               "lut_rgba(lut_index_i + proctex_diff_lut_offset);\n";
         break;
     case ProcTexFilter::Nearest:
     case ProcTexFilter::NearestMipmapLinear:
     case ProcTexFilter::NearestMipmapNearest:
         out += "lut_coord += float(lut_offset);\n";
-        out += "return texelFetch(texture_buffer_lut_rgba, int(round(lut_coord)) + "
-               "proctex_lut_offset);\n";
+        out += "return lut_rgba(int(round(lut_coord)) + proctex_lut_offset);\n";
         break;
     }
 
@@ -1253,8 +1272,14 @@ void FragmentModule::DefineExtensions() {
         } else if (profile.has_gl_arm_framebuffer_fetch) {
             out += "#extension GL_ARM_shader_framebuffer_fetch : enable\n";
             out += "#define destFactor gl_LastFragColorARM\n";
-        } else {
+        } else if (profile.has_texel_fetch) {
             out += "#define destFactor texelFetch(tex_color, ivec2(gl_FragCoord.xy), 0)\n";
+            use_blend_fallback = true;
+        } else {
+            // gl_FragCoord.xy already sits at the pixel centre, so dividing by the size lands
+            // on the texel centre and reads what texelFetch would.
+            out += "#define destFactor texture(tex_color, gl_FragCoord.xy / "
+                   "vec2(textureSize(tex_color, 0)))\n";
             use_blend_fallback = true;
         }
     }
@@ -1269,7 +1294,12 @@ void FragmentModule::DefineInterface() {
         if (profile.has_separable_shaders) {
             out += fmt::format("layout (location = {}) ", location);
         }
-        out += fmt::format("in {};\n", var);
+        // "flat in", never "in flat": GLSL ES 3.00 enforces qualifier order.
+        if (var.substr(0, 5) == "flat ") {
+            out += fmt::format("flat in {};\n", var.substr(5));
+        } else {
+            out += fmt::format("in {};\n", var);
+        }
     };
 
     // Input attributes
@@ -1282,6 +1312,7 @@ void FragmentModule::DefineInterface() {
         define_input("pervertex vec4 normquats[]", Semantic::Normquat);
     } else {
         define_input("vec4 normquat", Semantic::Normquat);
+        define_input("flat vec4 normquat_flat", Semantic::NormquatFlat);
     }
     define_input("vec3 view", Semantic::View);
 
@@ -1295,6 +1326,9 @@ void FragmentModule::DefineBindingsVK() {
     out += "layout(set = 0, binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n";
     out += "layout(set = 0, binding = 4) uniform samplerBuffer texture_buffer_lut_rg;\n";
     out += "layout(set = 0, binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n\n";
+    out += "vec2 lut_lf(int i) { return texelFetch(texture_buffer_lut_lf, i).rg; }\n";
+    out += "vec2 lut_rg(int i) { return texelFetch(texture_buffer_lut_rg, i).rg; }\n";
+    out += "vec4 lut_rgba(int i) { return texelFetch(texture_buffer_lut_rgba, i); }\n\n";
 
     // Texture samplers
     const auto texture_type = config.texture.texture0_type.Value();
@@ -1326,26 +1360,66 @@ void FragmentModule::DefineBindingsVK() {
 }
 
 void FragmentModule::DefineBindingsGL() {
-    // Uniform and texture buffers
+    // Uniform and texture buffers. Devices without texture buffer objects (GLES 3.1-class
+    // hardware) read the LUTs from 256-texel-wide 2D textures instead; the linear texel offsets
+    // in the uniforms stay identical, the lut_*() helpers do the address split.
     out += FSUniformBlockDef;
-    out += "layout(binding = 3) uniform samplerBuffer texture_buffer_lut_lf;\n";
-    out += "layout(binding = 4) uniform samplerBuffer texture_buffer_lut_rg;\n";
-    out += "layout(binding = 5) uniform samplerBuffer texture_buffer_lut_rgba;\n\n";
+    if (profile.has_texture_buffer) {
+        if (!profile.is_vulkan) {
+            out += fragment_shader_precision_buffer_OES;
+        }
+        out += "SAMPLER_BINDING(3) uniform samplerBuffer texture_buffer_lut_lf;\n";
+        out += "SAMPLER_BINDING(4) uniform samplerBuffer texture_buffer_lut_rg;\n";
+        out += "SAMPLER_BINDING(5) uniform samplerBuffer texture_buffer_lut_rgba;\n\n";
+        out += "vec2 lut_lf(int i) { return texelFetch(texture_buffer_lut_lf, i).rg; }\n";
+        out += "vec2 lut_rg(int i) { return texelFetch(texture_buffer_lut_rg, i).rg; }\n";
+        out += "vec4 lut_rgba(int i) { return texelFetch(texture_buffer_lut_rgba, i); }\n\n";
+    } else {
+        out += "SAMPLER_BINDING(3) uniform highp sampler2D texture_buffer_lut_lf;\n";
+        out += "SAMPLER_BINDING(4) uniform highp sampler2D texture_buffer_lut_rg;\n";
+        out += "SAMPLER_BINDING(5) uniform highp sampler2D texture_buffer_lut_rgba;\n\n";
+        if (profile.has_texel_fetch) {
+            out += "vec2 lut_lf(int i) { return texelFetch(texture_buffer_lut_lf, ivec2(i & 255, "
+                   "i >> 8), 0).rg; }\n";
+            out += "vec2 lut_rg(int i) { return texelFetch(texture_buffer_lut_rg, ivec2(i & 255, "
+                   "i >> 8), 0).rg; }\n";
+            out += "vec4 lut_rgba(int i) { return texelFetch(texture_buffer_lut_rgba, "
+                   "ivec2(i & 255, i >> 8), 0); }\n\n";
+        } else {
+            // No texelFetch: sample the texel centre instead. The LUT textures are
+            // nearest-filtered and clamped, and gl_FragCoord-style half-texel centres land
+            // exactly on the texel, so this reads the same value texelFetch would.
+            // Exact, not approximate: the LUT textures are power-of-two sized, so 1/256 and
+            // 1/rows are exact binary fractions and (k + 0.5) * 2^-n is exactly representable
+            // for k <= 255. GL_NEAREST then recovers texel k with no rounding anywhere.
+            const auto lut = [](const char* ret, const char* fn, const char* sampler,
+                                const char* swizzle, u32 rows) {
+                return fmt::format("{} {}(int i) {{ return texture({}, (vec2(i & 255, i >> 8) + "
+                                   "0.5) * vec2({:.10f}, {:.10f})){}; }}\n",
+                                   ret, fn, sampler, 1.0 / static_cast<double>(LUT_TEX_WIDTH),
+                                   1.0 / static_cast<double>(rows), swizzle);
+            };
+            out += lut("vec2", "lut_lf", "texture_buffer_lut_lf", ".rg", LUT_LF_ROWS);
+            out += lut("vec2", "lut_rg", "texture_buffer_lut_rg", ".rg", LUT_RG_ROWS);
+            out += lut("vec4", "lut_rgba", "texture_buffer_lut_rgba", "", LUT_RGBA_ROWS);
+            out += "\n";
+        }
+    }
 
     // Texture samplers
     const auto texture_type = config.texture.texture0_type.Value();
     for (u32 i = 0; i < 3; i++) {
         const auto sampler =
             i == 0 && texture_type == TextureType::TextureCube ? "samplerCube" : "sampler2D";
-        out += fmt::format("layout(binding = {0}) uniform {1} tex{0};\n", i, sampler);
+        out += fmt::format("SAMPLER_BINDING({0}) uniform {1} tex{0};\n", i, sampler);
     }
 
     // Utility textures
     if (user.use_custom_normal) {
-        out += "layout(binding = 6) uniform sampler2D tex_normal;\n";
+        out += "SAMPLER_BINDING(6) uniform sampler2D tex_normal;\n";
     }
     if (use_blend_fallback) {
-        out += "layout(binding = 7) uniform sampler2D tex_color;\n";
+        out += "SAMPLER_BINDING(7) uniform sampler2D tex_color;\n";
     }
 
     // Shadow textures
@@ -1402,7 +1476,7 @@ void FragmentModule::DefineLightingHelpers() {
 
     out += R"(
 float LookupLightingLUT(int lut_index, int index, float delta) {
-    vec2 entry = texelFetch(texture_buffer_lut_lf, lighting_lut_offset[lut_index >> 2][lut_index & 3] + index).rg;
+    vec2 entry = lut_lf(lighting_lut_offset[lut_index >> 2][lut_index & 3] + index);
     return entry.r + entry.g * delta;
 }
 

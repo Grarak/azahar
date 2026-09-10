@@ -18,7 +18,7 @@ constexpr std::string_view VSPicaUniformBlockDef = R"(
 #ifdef VULKAN
 layout (set = 0, binding = 0, std140) uniform vs_pica_data {
 #else
-layout (binding = 0, std140) uniform vs_pica_data {
+UNIFORM_BINDING(0) uniform vs_pica_data {
 #endif
     uint b;
     uvec4 i[4];
@@ -30,7 +30,7 @@ constexpr std::string_view VSUniformBlockDef = R"(
 #ifdef VULKAN
 layout (set = 0, binding = 1, std140) uniform vs_data {
 #else
-layout (binding = 1, std140) uniform vs_data {
+UNIFORM_BINDING(1) uniform vs_data {
 #endif
     bool enable_clip1;
     bool flip_viewport;
@@ -59,7 +59,14 @@ static std::string GetVertexInterfaceDeclaration(bool is_output, bool use_clip_p
         if (separable_shader) {
             out += fmt::format("layout (location={}) ", location);
         }
-        out += fmt::format("{}{};\n", is_output ? "out " : "in ", var);
+        // Interpolation qualifiers must precede the storage qualifier ("flat out", never
+        // "out flat" - GLSL ES 3.00 enforces the order).
+        std::string_view v{var};
+        if (v.substr(0, 5) == "flat ") {
+            out += fmt::format("flat {}{};\n", is_output ? "out " : "in ", v.substr(5));
+        } else {
+            out += fmt::format("{}{};\n", is_output ? "out " : "in ", v);
+        }
     };
 
     append_variable("vec4 primary_color", ATTRIBUTE_COLOR);
@@ -69,6 +76,7 @@ static std::string GetVertexInterfaceDeclaration(bool is_output, bool use_clip_p
     append_variable("float texcoord0_w", ATTRIBUTE_TEXCOORD0_W);
     append_variable("vec4 normquat", ATTRIBUTE_NORMQUAT);
     append_variable("vec3 view", ATTRIBUTE_VIEW);
+    append_variable("flat vec4 normquat_flat", ATTRIBUTE_NORMQUAT_FLAT);
 
     if (is_output && separable_shader) {
         // gl_PerVertex redeclaration is required for separate shader object
@@ -118,6 +126,7 @@ void main() {
     texcoord2 = vert_texcoord2;
     texcoord0_w = vert_texcoord0_w;
     normquat = vert_normquat;
+    normquat_flat = vert_normquat;
     view = vert_view;
     vec4 vtx_pos = SanitizeVertex(vert_position);
     if (flip_viewport) {
@@ -256,6 +265,7 @@ std::string GenerateVertexShader(const ShaderSetup& setup, const PicaVSConfig& c
         }
 
         out += "    normquat = GetVertexQuaternion();\n";
+        out += "    normquat_flat = normquat;\n";
         out += "    vec4 vtx_color = vec4(" + semantic(VSOutputAttributes::COLOR_R) + ", " +
                semantic(VSOutputAttributes::COLOR_G) + ", " +
                semantic(VSOutputAttributes::COLOR_B) + ", " +

@@ -33,6 +33,9 @@ enum Attributes {
     ATTRIBUTE_TEXCOORD0_W,
     ATTRIBUTE_NORMQUAT,
     ATTRIBUTE_VIEW,
+    /// Flat (provoking-vertex) copy of the normal quaternion: lets the fragment shader apply the
+    /// per-triangle short-arc sign fix without a geometry shader.
+    ATTRIBUTE_NORMQUAT_FLAT,
 };
 
 enum class AttribLoadFlags : u32 {
