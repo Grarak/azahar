@@ -31,7 +31,7 @@ protected:
     /// Sync vertex and framgent uniforms from PICA registers
     void SyncDrawUniforms();
 
-protected:
+public:
     /// Structure that the hardware rendered vertices are composed of
     struct HardwareVertex {
         HardwareVertex() = default;
@@ -46,6 +46,10 @@ protected:
         Common::Vec4f normquat;
         Common::Vec3f view;
     };
+
+    /// Ranges of ring vertices produced by AddTriangle since the last draw, when the vertex
+    /// ring is active; consumed by the subclass's DrawTriangles.
+    std::vector<VideoCore::VertexRingRange> pending_ring_ranges;
 
     struct VertexArrayInfo {
         u32 vs_input_index_min;

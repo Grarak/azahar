@@ -14,6 +14,9 @@
 #ifdef ENABLE_VULKAN
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #endif
+#ifdef ENABLE_GXM
+#include "video_core/renderer_gxm/renderer_gxm.h"
+#endif
 #include "video_core/video_core.h"
 
 #ifdef ENABLE_SDL2
@@ -21,6 +24,10 @@
 #endif
 
 namespace VideoCore {
+
+void (*surface_dump_hook)(void* user, const char* dir) = nullptr;
+void* surface_dump_user = nullptr;
+
 
 std::unique_ptr<RendererBase> CreateRenderer(Frontend::EmuWindow& emu_window,
                                              Frontend::EmuWindow* secondary_window,
@@ -45,6 +52,10 @@ std::unique_ptr<RendererBase> CreateRenderer(Frontend::EmuWindow& emu_window,
     case Settings::GraphicsAPI::OpenGL:
         return std::make_unique<OpenGL::RendererOpenGL>(system, pica, emu_window, secondary_window);
 #endif
+#ifdef ENABLE_GXM
+    case Settings::GraphicsAPI::Gxm:
+        return std::make_unique<GxmRenderer::RendererGxm>(system, pica, emu_window);
+#endif
     default:
         LOG_CRITICAL(Render,
                      "Unknown or unsupported graphics API {}, falling back to available default",
@@ -53,6 +64,8 @@ std::unique_ptr<RendererBase> CreateRenderer(Frontend::EmuWindow& emu_window,
         return std::make_unique<OpenGL::RendererOpenGL>(system, pica, emu_window, secondary_window);
 #elif ENABLE_VULKAN
         return std::make_unique<Vulkan::RendererVulkan>(system, pica, emu_window, secondary_window);
+#elif ENABLE_GXM
+        return std::make_unique<GxmRenderer::RendererGxm>(system, pica, emu_window);
 #elif ENABLE_SOFTWARE_RENDERER
         return std::make_unique<SwRenderer::RendererSoftware>(system, pica, emu_window);
 #else

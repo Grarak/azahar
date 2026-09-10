@@ -12,6 +12,10 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     gpu.cpp
     gpu.h
     gpu_debugger.h
+    gpu_thread.cpp
+    gpu_thread.h
+    threaded_rasterizer.cpp
+    threaded_rasterizer.h
     gpu_impl.h
     pica_types.h
     precompiled_headers.h
@@ -68,6 +72,10 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     right_eye_disabler.cpp
     right_eye_disabler.h
     shader/debug_data.h
+    shader/generator/cg_fs_shader_gen.cpp
+    shader/generator/cg_fs_shader_gen.h
+    shader/generator/cg_vs_shader_gen.cpp
+    shader/generator/cg_vs_shader_gen.h
     shader/generator/glsl_fs_shader_gen.cpp
     shader/generator/glsl_fs_shader_gen.h
     shader/generator/glsl_shader_decompiler.cpp
@@ -87,6 +95,9 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     shader/shader_interpreter.h
     shader/shader_jit.cpp
     shader/shader_jit.h
+    shader/a32_emitter.h
+    shader/shader_jit_a32_compiler.cpp
+    shader/shader_jit_a32_compiler.h
     shader/shader_jit_a64_compiler.cpp
     shader/shader_jit_a64_compiler.h
     shader/shader_jit_x64_compiler.cpp
@@ -98,7 +109,69 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
     utils.h
     video_core.cpp
     video_core.h
+    guest_framebuffer.cpp
+    guest_framebuffer.h
 )
+
+if (ENABLE_GXM)
+    if (VITA_RENDER_TRACE)
+        # GXM_PHASE: the render thread's breadcrumb, see common/pipeline_stats.h.
+        target_compile_definitions(video_core PRIVATE VITA_RENDER_TRACE)
+    endif()
+    target_sources(video_core PRIVATE
+        renderer_gxm/gxm_device.h
+        renderer_gxm/gxm_flags.cpp
+        renderer_gxm/gxm_flags.h
+        renderer_gxm/gxm_texture_runtime.cpp
+        renderer_gxm/gxm_texture_runtime.h
+        renderer_gxm/gxm_pipeline_cache.cpp
+        renderer_gxm/gxm_pipeline_cache.h
+        renderer_gxm/gxm_rasterizer.cpp
+        renderer_gxm/gxm_rasterizer.h
+        renderer_gxm/gxm_shader_tier.cpp
+        renderer_gxm/gxm_shader_tier.h
+        renderer_gxm/gxm_shader_util.cpp
+        renderer_gxm/gxm_shader_util.h
+        renderer_gxm/usse/fixed_usse_gen.cpp
+        renderer_gxm/usse/fixed_usse_gen.h
+        renderer_gxm/usse/fs_usse_gen.cpp
+        renderer_gxm/usse/fs_usse_gen.h
+        renderer_gxm/usse/gxp_writer.cpp
+        renderer_gxm/usse/gxp_writer.h
+        renderer_gxm/usse/usse_encoder.cpp
+        renderer_gxm/usse/usse_encoder.h
+        renderer_gxm/usse/usse_ir.cpp
+        renderer_gxm/usse/usse_ir.h
+        renderer_gxm/usse/vs_usse_gen.cpp
+        renderer_gxm/usse/vs_usse_gen.h
+        renderer_gxm/pica_to_gxm.h
+        renderer_gxm/renderer_gxm.cpp
+        renderer_gxm/renderer_gxm.h
+    )
+    # libgxm only: every program comes from the USSE emitters, nothing compiles on the console.
+    if (ENABLE_GXM_STUB)
+        if (NOT DEFINED ENV{VITASDK})
+            set(ENV{VITASDK} /usr/local/vitasdk)
+        endif()
+        target_sources(video_core PRIVATE
+            renderer_gxm/gxm_stub/gxm_stub.cpp
+            renderer_gxm/gxm_stub/gxm_stub.h
+        )
+        # Only gxm.h and what it includes: the vitasdk's include root also carries newlib's
+        # libc headers, which shadow the host's. Staged into the build tree at configure time.
+        set(_gxm_hdr_root ${CMAKE_CURRENT_BINARY_DIR}/vitasdk-gxm-headers)
+        foreach(_hdr IN ITEMS psp2/gxm.h psp2/types.h psp2common/types.h vitasdk/build_utils.h)
+            configure_file($ENV{VITASDK}/arm-vita-eabi/include/${_hdr} ${_gxm_hdr_root}/${_hdr} COPYONLY)
+        endforeach()
+        target_include_directories(video_core PUBLIC ${_gxm_hdr_root})
+        target_compile_definitions(video_core PUBLIC ENABLE_GXM ENABLE_GXM_STUB)
+        # vitasdk's gxm.h ORs enums of different types in its own constants.
+        target_compile_options(video_core PUBLIC -Wno-deprecated-enum-enum-conversion)
+    else()
+        target_include_directories(video_core PRIVATE $ENV{VITASDK}/arm-vita-eabi/include)
+        target_link_libraries(video_core PRIVATE SceGxm_stub)
+    endif()
+endif()
 
 if (ENABLE_SOFTWARE_RENDERER)
     target_sources(video_core PRIVATE
@@ -114,6 +187,8 @@ if (ENABLE_SOFTWARE_RENDERER)
         renderer_software/sw_proctex.h
         renderer_software/sw_rasterizer.cpp
         renderer_software/sw_rasterizer.h
+        renderer_software/sw_texture_cache.cpp
+        renderer_software/sw_texture_cache.h
         renderer_software/sw_texturing.cpp
         renderer_software/sw_texturing.h
     )
@@ -223,6 +298,55 @@ endif()
 
 if ("arm64" IN_LIST ARCHITECTURE)
     target_link_libraries(video_core PUBLIC oaknut)
+endif()
+
+if ("arm" IN_LIST ARCHITECTURE)
+    target_sources(video_core PRIVATE pica/pica_cmdlist_a32.S)
+    set_source_files_properties(pica/pica_cmdlist_a32.S PROPERTIES LANGUAGE ASM)
+    # The software rasterizer's per-pixel loop is register bound rather than arithmetic bound -
+    # a 3 KB stack frame, and about a fifth of its samples are stack reloads and a float
+    # constant fetched from the literal pool three times over. It is built at the build type's
+    # level, which for a debug-info build is -O2; give these -O3 regardless, since this is the
+    # renderer whose throughput decides whether a frame arrives. The frame pointer goes with
+    # it: a debug-info build keeps r11 reserved, and on a target with fourteen usable general
+    # registers that is one the pixel loop would rather have.
+    # APPEND, not PROPERTIES: COMPILE_OPTIONS is one property, so a second plain set on any of
+    # these files replaces this one instead of adding to it. That is what happened - the
+    # -ffp-contract=off block below overlaps three of these four, and sw_rasterizer.cpp, the
+    # file this is for, was building at -O2 with no frame-pointer flag.
+    set_property(SOURCE
+        renderer_software/sw_rasterizer.cpp
+        renderer_software/sw_texturing.cpp
+        renderer_software/sw_lighting.cpp
+        renderer_software/sw_blitter.cpp
+        APPEND PROPERTY COMPILE_OPTIONS -O3 -fomit-frame-pointer -funsafe-math-optimizations)
+    # Clang refuses a precompiled header built without unsafe float math in a translation unit
+    # that enables it, and the Vita build uses one. These four are the only files that differ,
+    # so they parse the headers themselves rather than the whole target losing its PCH or
+    # getting the math flag it has no use for.
+    set_source_files_properties(
+        renderer_software/sw_rasterizer.cpp
+        renderer_software/sw_texturing.cpp
+        renderer_software/sw_lighting.cpp
+        renderer_software/sw_blitter.cpp
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endif()
+
+# The software renderer keeps a scalar reference implementation and a NEON one that must agree.
+# GCC contracts float expressions into fused multiply-adds by default, which the scalar path
+# takes and the intrinsics do not, so the two disagree in the last bit - enough, at an exact
+# texel or depth-test boundary, to pick a different texel or a different side of the test.
+# Turning contraction off makes them agree. It is also free on cores without FMA (Cortex-A9 and
+# anything else on VFPv3), which is a target for this renderer.
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_property(SOURCE
+        renderer_software/sw_rasterizer.cpp
+        renderer_software/sw_framebuffer.cpp
+        renderer_software/sw_lighting.cpp
+        renderer_software/sw_clipper.cpp
+        renderer_software/sw_texturing.cpp
+        renderer_software/sw_proctex.cpp
+        APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 if (CITRA_USE_PRECOMPILED_HEADERS)

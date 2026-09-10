@@ -2,10 +2,14 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include "common/alignment.h"
+#include "common/logging/log.h"
 #include "common/math_util.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
+#include <cstring>
+#include <mutex>
 #include "video_core/rasterizer_accelerated.h"
 
 namespace VideoCore {
@@ -82,8 +86,54 @@ static bool AreQuaternionsOpposite(Common::Vec4<f24> qa, Common::Vec4<f24> qb) {
     return (Common::Dot(a, b) < 0.f);
 }
 
+static void NegateQuat(Pica::OutputVertex& v) {
+    v.quat.x = f24::FromFloat32(-v.quat.x.ToFloat32());
+    v.quat.y = f24::FromFloat32(-v.quat.y.ToFloat32());
+    v.quat.z = f24::FromFloat32(-v.quat.z.ToFloat32());
+    v.quat.w = f24::FromFloat32(-v.quat.w.ToFloat32());
+}
+
 void RasterizerAccelerated::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                                         const Pica::OutputVertex& v2) {
+    VertexRing* const ring = GetVertexRing();
+    if (ring != nullptr) {
+        // Zero-copy: the triangle goes straight into the mapped GL vertex buffer in guest
+        // layout — its only materialization. This runs on the thread that owns the GL context,
+        // so a full ring is drained with a blocking fence wait right here.
+        constexpr u32 tri_bytes = 3 * sizeof(Pica::OutputVertex);
+        // Under the ring's mutex: the emulation thread allocates from the same ring for the
+        // hardware draws it writes there directly.
+        u32 off;
+        {
+            std::scoped_lock lock{ring->mutex};
+            off = ring->TryAlloc(tri_bytes);
+        }
+        while (off == VertexRing::FULL) {
+            RingRetireBlocking();
+            std::scoped_lock lock{ring->mutex};
+            off = ring->TryAlloc(tri_bytes);
+        }
+        auto* const dst = reinterpret_cast<Pica::OutputVertex*>(ring->base + off);
+        std::memcpy(dst + 0, &v0, sizeof(Pica::OutputVertex));
+        std::memcpy(dst + 1, &v1, sizeof(Pica::OutputVertex));
+        std::memcpy(dst + 2, &v2, sizeof(Pica::OutputVertex));
+        if (AreQuaternionsOpposite(v0.quat, v1.quat)) {
+            NegateQuat(dst[1]);
+        }
+        if (AreQuaternionsOpposite(v0.quat, v2.quat)) {
+            NegateQuat(dst[2]);
+        }
+
+        const u32 first = off / sizeof(Pica::OutputVertex);
+        if (pending_ring_ranges.empty() ||
+            pending_ring_ranges.back().first + pending_ring_ranges.back().count != first) {
+            pending_ring_ranges.push_back({first, 0, 0});
+        }
+        pending_ring_ranges.back().count += 3;
+        pending_ring_ranges.back().end_pos = ring->cursor;
+        return;
+    }
+
     vertex_batch.emplace_back(v0, false);
     vertex_batch.emplace_back(v1, AreQuaternionsOpposite(v0.quat, v1.quat));
     vertex_batch.emplace_back(v2, AreQuaternionsOpposite(v0.quat, v2.quat));
