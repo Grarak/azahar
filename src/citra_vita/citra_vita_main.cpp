@@ -592,26 +592,6 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                                              rec.gpu_busy_ns / 10 / window_us, 100)),
                                          std::memory_order_relaxed);
                     queue_depth.store(system.GPU().RenderQueueDepth(), std::memory_order_relaxed);
-                    // Guest core utilisation: a core that has no thread to run idles its
-                    // timer forward to the next event, so busy is the rest of its ticks.
-                    static std::array<u64, 4> last_ticks{};
-                    static std::array<u64, 4> last_idle{};
-                    for (u32 core = 0; core < 4; core++) {
-                        u32 busy = 0;
-                        if (core < system.GetNumCores()) {
-                            const auto& timer = system.GetCore(core).GetTimer();
-                            const u64 ticks = timer.GetTicks();
-                            const u64 idle = timer.GetIdleTicks();
-                            const u64 dt = ticks - last_ticks[core];
-                            const u64 di = idle - last_idle[core];
-                            last_ticks[core] = ticks;
-                            last_idle[core] = idle;
-                            if (dt > 0 && di <= dt) {
-                                busy = static_cast<u32>((dt - di) * 100 / dt);
-                            }
-                        }
-                        core_busy[core].store(busy, std::memory_order_relaxed);
-                    }
                     valid.store(true, std::memory_order_release);
                 }
             }

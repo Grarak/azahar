@@ -20,9 +20,6 @@ inline std::atomic<u32> game_fps10{0};      ///< the guest's frame rate, tenths
 inline std::atomic<u32> shown_fps{0};       ///< frames presented in the last second
 inline std::atomic<u32> skipped_frames{0};  ///< frames whose draws frameskip dropped
 inline std::atomic<u32> guest_percent{0};   ///< core 2 running guest code natively
-/// The 3DS's own cores: emulated ticks each spent running a thread rather than idling to the
-/// next event, over the last second (the appcore and the syscore; 0 for cores a title lacks).
-inline std::array<std::atomic<u32>, 4> core_busy{};
 inline std::atomic<u32> emu_percent{0};     ///< the emulation thread inside RunLoop
 inline std::atomic<u32> render_percent{0};  ///< the render thread executing queued ops
 inline std::atomic<u32> queue_depth{0};     ///< ops queued to the render thread

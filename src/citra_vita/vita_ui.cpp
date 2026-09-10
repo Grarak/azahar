@@ -471,8 +471,6 @@ void Ui::DrawStatsHud() {
     // Three bare lines: speed/game fps, frame time/shown fps, guest core 0/core 1 busy.
     ImGui::Text("%u%%/%u", speed_percent.load(std::memory_order_relaxed), (fps10 + 5) / 10);
     ImGui::Text("%.1fms/%ufps", shown != 0 ? 1000.0f / static_cast<float>(shown) : 0.0f, shown);
-    ImGui::Text("%u%%/%u%%", core_busy[0].load(std::memory_order_relaxed),
-                core_busy[1].load(std::memory_order_relaxed));
     ImGui::End();
 #endif // VITA_DIAGNOSTICS
 }
