@@ -86,11 +86,13 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
     const std::size_t contiguous_output_size =
         config.texture_copy.size / output_width * (output_width + output_gap);
 
-    // Only need to flush output if it has a gap
-    if (output_gap != 0) {
+    // A gapped output writes only slices of the range, so the untouched gap bytes must hold
+    // flushed, current content in guest memory before the partial write - the old flush and
+    // invalidate stays for that case. A gapless copy rewrites every byte of the range, so the
+    // surfaces can absorb the result afterwards instead of being dropped and reloaded.
+    const bool absorb_output = output_gap == 0;
+    if (!absorb_output) {
         rasterizer->FlushAndInvalidateRegion(dst_addr, static_cast<u32>(contiguous_output_size));
-    } else {
-        rasterizer->InvalidateRegion(dst_addr, static_cast<u32>(contiguous_output_size));
     }
 
     u32 remaining_input = input_width;
@@ -114,6 +116,10 @@ void SwBlitter::TextureCopy(const Pica::DisplayTransferConfig& config) {
             remaining_output = output_width;
             dst_pointer += output_gap;
         }
+    }
+
+    if (absorb_output) {
+        rasterizer->NoteGuestWrite(dst_addr, static_cast<u32>(contiguous_output_size));
     }
 }
 
@@ -186,7 +192,6 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
     const u32 output_size = output_width * output_height * BytesPerPixel(config.output_format);
 
     rasterizer->FlushRegion(config.GetPhysicalInputAddress(), input_size);
-    rasterizer->InvalidateRegion(config.GetPhysicalOutputAddress(), output_size);
 
     for (u32 y = 0; y < output_height; ++y) {
         for (u32 x = 0; x < output_width; ++x) {
@@ -290,6 +295,9 @@ void SwBlitter::DisplayTransfer(const Pica::DisplayTransferConfig& config) {
             }
         }
     }
+
+    // Every output pixel was written above, so the surfaces absorb the range whole.
+    rasterizer->NoteGuestWrite(config.GetPhysicalOutputAddress(), output_size);
 }
 
 void SwBlitter::MemoryFill(const Pica::MemoryFillConfig& config) {
@@ -302,21 +310,19 @@ void SwBlitter::MemoryFill(const Pica::MemoryFillConfig& config) {
         return;
     }
 
-    if (!memory.IsValidPhysicalAddress(end_addr)) {
-        LOG_CRITICAL(HW_GPU, "invalid end address {:#010X}", end_addr);
-        return;
-    }
-
     if (end_addr <= start_addr) {
         LOG_CRITICAL(HW_GPU, "invalid memory range from {:#010X} to {:#010X}", start_addr,
                      end_addr);
         return;
     }
 
-    u8* start = memory.GetPhysicalPointer(start_addr);
-    u8* end = memory.GetPhysicalPointer(end_addr);
-
-    rasterizer->InvalidateRegion(start_addr, end_addr - start_addr);
+    // Fills may run past the end of their region (games do this against VRAM's end); clamp to
+    // the backing allocation instead of dropping the fill - skipping it leaves memory the game
+    // expects cleared untouched. (Out-of-range ends used to crash in the validity check.)
+    auto start_ref = memory.GetPhysicalRef(start_addr);
+    u8* start = start_ref.GetPtr();
+    const std::size_t span = start_ref.GetWriteBytes(end_addr - start_addr).size();
+    u8* end = start + span;
 
     if (config.fill_24bit) {
         // Fill with 24-bit values
@@ -341,6 +347,10 @@ void SwBlitter::MemoryFill(const Pica::MemoryFillConfig& config) {
             std::memcpy(ptr, &value_16bit, sizeof(u16));
         }
     }
+
+    // Every byte of the clamped span was just written; the surfaces absorb it instead of being
+    // dropped - this fill is the per-frame clear, and dropping made every frame reload it.
+    rasterizer->NoteGuestWrite(start_addr, static_cast<u32>(span));
 }
 
 } // namespace SwRenderer
