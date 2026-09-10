@@ -16,7 +16,7 @@
 #include "common/string_util.h"
 #include "core/hw/aes/key.h"
 #include "core/hw/rsa/rsa.h"
-#include "cryptopp/osrng.h"
+#include "common/vita_osrng.h"
 #include "cryptopp/rsa.h"
 
 namespace HW::RSA {
@@ -81,10 +81,12 @@ std::vector<u8> HexToVector(const std::string& hex) {
 }
 
 std::optional<std::pair<std::size_t, char>> ParseKeySlotName(const std::string& full_name) {
-    std::size_t slot;
+    // Not %zX - see ParseCommonKeyName in hw/aes/key.cpp: the z modifier does not exist in a
+    // newlib built without _WANT_IO_C99_FORMATS, and the conversion silently never matches.
+    unsigned int slot;
     char type;
     int end;
-    if (std::sscanf(full_name.c_str(), "slot0x%zX%c%n", &slot, &type, &end) == 2 &&
+    if (std::sscanf(full_name.c_str(), "slot0x%X%c%n", &slot, &type, &end) == 2 &&
         end == static_cast<int>(full_name.size())) {
         return std::make_pair(slot, type);
     } else {

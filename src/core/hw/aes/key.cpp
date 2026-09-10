@@ -59,9 +59,12 @@ std::vector<u8> HexToVector(const std::string& hex) {
 }
 
 std::optional<std::size_t> ParseCommonKeyName(const std::string& full_name) {
-    std::size_t index;
+    // Not %zd: the z modifier is a C99 format, and a newlib built without _WANT_IO_C99_FORMATS
+    // (vitasdk's is) does not know it, so the conversion never matches and every key is
+    // rejected. %u is the same width wherever this builds.
+    unsigned int index;
     int end;
-    if (std::sscanf(full_name.c_str(), "common%zd%n", &index, &end) == 1 &&
+    if (std::sscanf(full_name.c_str(), "common%u%n", &index, &end) == 1 &&
         end == static_cast<int>(full_name.size())) {
         return index;
     } else {
@@ -71,9 +74,9 @@ std::optional<std::size_t> ParseCommonKeyName(const std::string& full_name) {
 
 std::optional<std::pair<std::size_t, std::string>> ParseNfcSecretName(
     const std::string& full_name) {
-    std::size_t index;
+    unsigned int index;
     int end;
-    if (std::sscanf(full_name.c_str(), "nfcSecret%zd%n", &index, &end) == 1) {
+    if (std::sscanf(full_name.c_str(), "nfcSecret%u%n", &index, &end) == 1) {
         return std::make_pair(index, full_name.substr(end));
     } else {
         return std::nullopt;
@@ -81,10 +84,10 @@ std::optional<std::pair<std::size_t, std::string>> ParseNfcSecretName(
 }
 
 std::optional<std::pair<std::size_t, char>> ParseKeySlotName(const std::string& full_name) {
-    std::size_t slot;
+    unsigned int slot;
     char type;
     int end;
-    if (std::sscanf(full_name.c_str(), "slot0x%zXKey%c%n", &slot, &type, &end) == 2 &&
+    if (std::sscanf(full_name.c_str(), "slot0x%XKey%c%n", &slot, &type, &end) == 2 &&
         end == static_cast<int>(full_name.size())) {
         return std::make_pair(slot, type);
     } else {
