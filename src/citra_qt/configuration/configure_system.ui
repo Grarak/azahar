@@ -64,13 +64,6 @@
             <string>System Settings</string>
            </property>
            <layout class="QGridLayout" name="gridLayout">
-            <item row="0" column="0">
-             <widget class="QCheckBox" name="toggle_new_3ds">
-              <property name="text">
-               <string>Enable New 3DS mode</string>
-              </property>
-             </widget>
-            </item>
             <item row="1" column="0">
              <widget class="QCheckBox" name="toggle_lle_applets">
               <property name="text">
@@ -801,7 +794,6 @@ installed applications.</string>
   </layout>
  </widget>
  <tabstops>
-  <tabstop>toggle_new_3ds</tabstop>
   <tabstop>edit_username</tabstop>
   <tabstop>combo_birthmonth</tabstop>
   <tabstop>combo_birthday</tabstop>

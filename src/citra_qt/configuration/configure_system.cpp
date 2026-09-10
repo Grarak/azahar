@@ -344,7 +344,6 @@ void ConfigureSystem::SetConfiguration() {
         ui->label_disable_info->hide();
     }
 
-    ui->toggle_new_3ds->setChecked(Settings::values.is_new_3ds.GetValue());
     ui->toggle_lle_applets->setChecked(Settings::values.lle_applets.GetValue());
     ui->enable_required_online_lle_modules->setChecked(
         Settings::values.enable_required_online_lle_modules.GetValue());
@@ -459,8 +458,6 @@ void ConfigureSystem::ApplyConfiguration() {
             cfg->UpdateConfigNANDSavegame();
         }
 
-        ConfigurationShared::ApplyPerGameSetting(&Settings::values.is_new_3ds, ui->toggle_new_3ds,
-                                                 is_new_3ds);
         ConfigurationShared::ApplyPerGameSetting(&Settings::values.lle_applets,
                                                  ui->toggle_lle_applets, lle_applets);
         ConfigurationShared::ApplyPerGameSetting(
@@ -486,7 +483,6 @@ void ConfigureSystem::ApplyConfiguration() {
         }
 
         Settings::values.init_time_offset = time_offset_days + time_offset_time;
-        Settings::values.is_new_3ds = ui->toggle_new_3ds->isChecked();
         Settings::values.lle_applets = ui->toggle_lle_applets->isChecked();
         Settings::values.enable_required_online_lle_modules =
             ui->enable_required_online_lle_modules->isChecked();
@@ -708,7 +704,6 @@ void ConfigureSystem::RetranslateUI() {
 void ConfigureSystem::SetupPerGameUI() {
     // Block the global settings if a game is currently running that overrides them
     if (Settings::IsConfiguringGlobal()) {
-        ui->toggle_new_3ds->setEnabled(Settings::values.is_new_3ds.UsingGlobal());
         ui->toggle_lle_applets->setEnabled(Settings::values.lle_applets.UsingGlobal());
         ui->enable_required_online_lle_modules->setEnabled(
             Settings::values.enable_required_online_lle_modules.UsingGlobal());
@@ -757,8 +752,6 @@ void ConfigureSystem::SetupPerGameUI() {
     ui->allow_plugin_loader->setVisible(false);
     ui->group_real_console_unique_data->setVisible(false);
 
-    ConfigurationShared::SetColoredTristate(ui->toggle_new_3ds, Settings::values.is_new_3ds,
-                                            is_new_3ds);
     ConfigurationShared::SetColoredTristate(ui->toggle_lle_applets, Settings::values.lle_applets,
                                             lle_applets);
     ConfigurationShared::SetColoredTristate(ui->enable_required_online_lle_modules,

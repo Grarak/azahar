@@ -63,7 +63,6 @@ private:
 private:
     std::unique_ptr<Ui::ConfigureSystem> ui;
     Core::System& system;
-    ConfigurationShared::CheckState is_new_3ds;
     ConfigurationShared::CheckState lle_applets;
     ConfigurationShared::CheckState required_online_lle_modules;
     bool enabled = false;

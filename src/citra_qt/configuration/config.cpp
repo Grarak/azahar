@@ -770,7 +770,6 @@ void QtConfig::ReadShortcutValues() {
 void QtConfig::ReadSystemValues() {
     qt_config->beginGroup(QStringLiteral("System"));
 
-    ReadGlobalSetting(Settings::values.is_new_3ds);
     ReadGlobalSetting(Settings::values.lle_applets);
     ReadGlobalSetting(Settings::values.enable_required_online_lle_modules);
     ReadGlobalSetting(Settings::values.region_value);
@@ -1322,7 +1321,6 @@ void QtConfig::SaveShortcutValues() {
 void QtConfig::SaveSystemValues() {
     qt_config->beginGroup(QStringLiteral("System"));
 
-    WriteGlobalSetting(Settings::values.is_new_3ds);
     WriteGlobalSetting(Settings::values.lle_applets);
     WriteGlobalSetting(Settings::values.enable_required_online_lle_modules);
     WriteGlobalSetting(Settings::values.region_value);
