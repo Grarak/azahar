@@ -19,7 +19,7 @@ namespace FileSys {
 namespace {
 
 std::string GetSaveDataContainerPath(const std::string& sdmc_directory) {
-    return fmt::format("{}Nintendo 3DS/{}/{}/title/", sdmc_directory, SYSTEM_ID, SDCARD_ID);
+    return fmt::format("{}title/", GetSDMCLayoutRoot(sdmc_directory));
 }
 
 std::string GetSaveDataPath(const std::string& mount_location, u64 program_id) {

@@ -12,7 +12,8 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/file_util.h"
-#include "common/static_lru_cache.h"
+#include <unordered_map>
+#include "common/host_shared_memory.h"
 #include "core/file_sys/artic_cache.h"
 #include "network/artic_base/artic_base_client.h"
 
@@ -45,7 +46,8 @@ private:
  */
 class DirectRomFSReader : public RomFSReader {
 public:
-    DirectRomFSReader(std::unique_ptr<FileUtil::IOFileBase>&& file) : file(std::move(file)) {}
+    DirectRomFSReader(std::unique_ptr<FileUtil::IOFileBase>&& file)
+        : file(std::move(file)), cache(PickCacheSpec()) {}
 
     ~DirectRomFSReader() override = default;
 
@@ -62,18 +64,57 @@ public:
 private:
     std::unique_ptr<FileUtil::IOFileBase> file;
 
-    // Total cache size: 128KB
-    static constexpr std::size_t cache_line_size = (1 << 13); // About 8KB
-    static constexpr std::size_t cache_line_count = 16;
+    /**
+     * The read cache: whole lines of the file, least recently used out. Sized at
+     * construction, because the console decides the size: its card reads are slow enough per
+     * call that the first reader made - the title's own RomFS - gets 64 KiB lines and 16 MiB
+     * of them, kept in the physically contiguous pool the heap cannot reach; every other
+     * reader (update RomFS, system archives) and every other platform keeps the 16 x 8 KiB
+     * the cache always had - out of the heap, because the pool holds one of these and no
+     * more. A read larger than a line bypasses it, as before.
+     */
+    struct CacheSpec {
+        std::size_t line_size;
+        std::size_t line_count;
+        const char* name;
+        /// Where the lines live. The title's own cache is the one block the Vita's physically
+        /// contiguous pool exists for, and is sized to fit it; nothing else asks.
+        Common::HostSharedMemory::Placement placement =
+            Common::HostSharedMemory::Placement::Heap;
+    };
+    class LineCache {
+    public:
+        explicit LineCache(const CacheSpec& spec);
+        [[nodiscard]] std::size_t LineSize() const {
+            return line_size;
+        }
+        /// The line holding `page`, and whether it was already present. A missing line is
+        /// the least recently used one, handed over for the caller to fill.
+        std::pair<bool, u8*> Request(std::size_t page);
 
-    Common::StaticLRUCache<std::size_t, std::array<u8, cache_line_size>, cache_line_count> cache;
+    private:
+        std::size_t line_size;
+        std::size_t line_count;
+        Common::HostSharedMemory storage;
+        std::vector<std::size_t> line_page; ///< page held by each line (npos: empty)
+        std::vector<u64> line_used;         ///< last use, for eviction
+        std::unordered_map<std::size_t, std::size_t> index; ///< page -> line
+        u64 clock = 0;
+    };
+    LineCache cache;
     // TODO(PabloMK7): Make cache thread safe, read the comment in CacheReady function.
     // std::shared_mutex cache_mutex;
 
-    DirectRomFSReader() = default;
+    [[nodiscard]] std::size_t cache_line_size() const {
+        return cache.LineSize();
+    }
+
+    static CacheSpec PickCacheSpec();
+
+    DirectRomFSReader() : cache(PickCacheSpec()) {}
 
     std::size_t OffsetToPage(std::size_t offset) {
-        return Common::AlignDown<std::size_t>(offset, cache_line_size);
+        return Common::AlignDown<std::size_t>(offset, cache_line_size());
     }
 
     std::vector<std::pair<std::size_t, std::size_t>> BreakupRead(std::size_t offset,

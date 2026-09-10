@@ -104,15 +104,9 @@ ResultVal<std::unique_ptr<FileBackend>> NCCHArchive::OpenFile(const Path& path, 
         }
         file_path = cartridge;
     } else {
-        if (Settings::values.is_new_3ds) {
-            // Try the New 3DS specific variant first.
-            file_path = Service::AM::GetTitleContentPath(media_type, title_id | 0x20000000,
-                                                         openfile_path.content_index);
-        }
-        if (!Settings::values.is_new_3ds || !FileUtil::Exists(file_path)) {
-            file_path =
-                Service::AM::GetTitleContentPath(media_type, title_id, openfile_path.content_index);
-        }
+        // Only the Old 3DS is emulated, so the New 3DS specific variant is never tried.
+        file_path =
+            Service::AM::GetTitleContentPath(media_type, title_id, openfile_path.content_index);
     }
 
     auto ncch_container = NCCHContainer(file_path, 0, openfile_path.content_index);
@@ -294,7 +288,7 @@ ResultVal<std::size_t> NCCHFile::Write(const u64 offset, const std::size_t lengt
                                        const bool update_timestamp, const u8* buffer) {
     LOG_ERROR(Service_FS, "Attempted to write to NCCH file");
     // TODO(shinyquagsire23): Find error code
-    return 0ULL;
+    return std::size_t{0};
 }
 
 u64 NCCHFile::GetSize() const {

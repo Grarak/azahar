@@ -43,7 +43,8 @@ public:
         if (offset > size) {
             return ResultWriteBeyondEnd;
         } else if (offset == size) {
-            return 0ULL;
+            // Not 0ULL: size_t is 32 bits on some targets, and the literal then narrows.
+            return std::size_t{0};
         }
 
         if (offset + length > size) {
@@ -193,7 +194,7 @@ std::string GetExtDataContainerPath(std::string_view mount_point, bool shared) {
     if (shared) {
         return fmt::format("{}data/{}/extdata/", mount_point, SYSTEM_ID);
     }
-    return fmt::format("{}Nintendo 3DS/{}/{}/extdata/", mount_point, SYSTEM_ID, SDCARD_ID);
+    return fmt::format("{}extdata/", GetSDMCLayoutRoot(mount_point));
 }
 
 std::string GetExtDataPathFromId(std::string_view mount_point, u64 extdata_id) {

@@ -27,7 +27,7 @@ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, 
     std::size_t read_progress = 0;
 
     // Skip cache if the read is too big
-    if (segments.size() == 1 && segments[0].second > cache_line_size) {
+    if (segments.size() == 1 && segments[0].second > cache_line_size()) {
         length = file->ReadAtBytes(buffer, length, offset);
         LOG_TRACE(Service_FS, "RomFS Cache SKIP: offset={}, length={}", offset, length);
         return length;
@@ -36,13 +36,13 @@ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, 
     // TODO(PabloMK7): Make cache thread safe, read the comment in CacheReady function.
     // std::unique_lock<std::shared_mutex> read_guard(cache_mutex);
     for (const auto& seg : segments) {
-        std::size_t read_size = cache_line_size;
+        std::size_t read_size = cache_line_size();
         std::size_t page = OffsetToPage(seg.first);
         // Check if segment is in cache
-        auto cache_entry = cache.request(page);
+        auto cache_entry = cache.Request(page);
         if (!cache_entry.first) {
             // If not found, read from disk and cache the data
-            read_size = file->ReadAtBytes(cache_entry.second.data(), read_size, page);
+            read_size = file->ReadAtBytes(cache_entry.second, read_size, page);
             LOG_TRACE(Service_FS, "RomFS Cache MISS: page={}, length={}, into={}", page, seg.second,
                       (seg.first - page));
         } else {
@@ -53,11 +53,50 @@ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, 
             (read_size > (seg.first - page))
                 ? std::min((seg.first - page) + seg.second, read_size) - (seg.first - page)
                 : 0;
-        std::memcpy(buffer + read_progress, cache_entry.second.data() + (seg.first - page),
-                    copy_amount);
+        std::memcpy(buffer + read_progress, cache_entry.second + (seg.first - page), copy_amount);
         read_progress += copy_amount;
     }
     return read_progress;
+}
+
+DirectRomFSReader::LineCache::LineCache(const CacheSpec& spec)
+    : line_size{spec.line_size}, line_count{spec.line_count},
+      storage{spec.line_size * spec.line_count, spec.name, spec.placement},
+      line_page(spec.line_count, static_cast<std::size_t>(-1)), line_used(spec.line_count, 0) {}
+
+std::pair<bool, u8*> DirectRomFSReader::LineCache::Request(std::size_t page) {
+    ++clock;
+    if (const auto it = index.find(page); it != index.end()) {
+        line_used[it->second] = clock;
+        return {true, storage.Data() + it->second * line_size};
+    }
+    std::size_t victim = 0;
+    for (std::size_t i = 1; i < line_count; i++) {
+        if (line_used[i] < line_used[victim]) {
+            victim = i;
+        }
+    }
+    if (line_page[victim] != static_cast<std::size_t>(-1)) {
+        index.erase(line_page[victim]);
+    }
+    line_page[victim] = page;
+    line_used[victim] = clock;
+    index.emplace(page, victim);
+    return {false, storage.Data() + victim * line_size};
+}
+
+DirectRomFSReader::CacheSpec DirectRomFSReader::PickCacheSpec() {
+#ifdef __vita__
+    // The first reader is the title's RomFS. One 16 MiB cache per process: a second of that
+    // size would not fit the pool.
+    static bool big_cache_taken = false;
+    if (!big_cache_taken) {
+        big_cache_taken = true;
+        return {64 * 1024, 256, "azahar-romfs-cache",
+                Common::HostSharedMemory::Placement::PhysicallyContiguous};
+    }
+#endif
+    return {8 * 1024, 16, "azahar-romfs-cache-small"};
 }
 
 bool DirectRomFSReader::AllowsCachedReads() const {
@@ -66,7 +105,7 @@ bool DirectRomFSReader::AllowsCachedReads() const {
 
 bool DirectRomFSReader::CacheReady(std::size_t file_offset, std::size_t length) {
     auto segments = BreakupRead(file_offset, length);
-    if (segments.size() == 1 && segments[0].second > cache_line_size) {
+    if (segments.size() == 1 && segments[0].second > cache_line_size()) {
         return false;
     } else {
         // TODO(PabloMK7): Since the LRU cache is not thread safe, a lock must be used.
@@ -91,14 +130,14 @@ std::vector<std::pair<std::size_t, std::size_t>> DirectRomFSReader::BreakupRead(
     std::vector<std::pair<std::size_t, std::size_t>> ret;
 
     // Reads bigger than the cache line size will probably never hit again
-    if (length > cache_line_size) {
+    if (length > cache_line_size()) {
         ret.push_back(std::make_pair(offset, length));
         return ret;
     }
 
     std::size_t curr_offset = offset;
     while (length) {
-        std::size_t next_page = OffsetToPage(curr_offset + cache_line_size);
+        std::size_t next_page = OffsetToPage(curr_offset + cache_line_size());
         std::size_t curr_page_len = std::min(length, next_page - curr_offset);
         ret.push_back(std::make_pair(curr_offset, curr_page_len));
         curr_offset = next_page;

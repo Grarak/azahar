@@ -9,7 +9,7 @@
 #include "core/file_sys/certificate.h"
 #include "core/file_sys/signature.h"
 #include "cryptopp/eccrypto.h"
-#include "cryptopp/osrng.h"
+#include "common/vita_osrng.h"
 
 namespace FileSys {
 void Certificate::BuildECC(Certificate& parent, const std::array<u8, 0x40> issuer,
