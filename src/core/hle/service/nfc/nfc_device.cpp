@@ -5,7 +5,7 @@
 #include <array>
 #include <chrono>
 #include <boost/crc.hpp>
-#include <cryptopp/osrng.h>
+#include "common/vita_osrng.h"
 
 #include "common/file_util.h"
 #include "common/logging/log.h"

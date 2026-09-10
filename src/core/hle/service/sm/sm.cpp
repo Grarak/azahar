@@ -20,6 +20,16 @@ static Result ValidateServiceName(const std::string& name) {
 
 ServiceManager::ServiceManager(Core::System& system) : system(system) {}
 
+ServiceManager::~ServiceManager() {
+    // Release the ports one at a time, naming each: a service whose destructor blocks (a
+    // savestate load's shutdown stopped in here under Vita3K, 2026-09-07) is then the last
+    // name printed.
+    for (auto it = registered_services.begin(); it != registered_services.end();) {
+        LOG_DEBUG(Service_SRV, "sm: releasing {}", it->first);
+        it = registered_services.erase(it);
+    }
+}
+
 void ServiceManager::InstallInterfaces(Core::System& system) {
     ASSERT(system.ServiceManager().srv_interface.expired());
 

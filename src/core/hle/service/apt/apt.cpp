@@ -1530,13 +1530,8 @@ void Module::APTInterface::IsStandardMemoryLayout(Kernel::HLERequestContext& ctx
     LOG_DEBUG(Service_APT, "called");
 
     bool is_standard;
-    if (Settings::values.is_new_3ds) {
-        // Memory layout is standard if it is not NewDev1 (178MB)
-        is_standard = apt->system.Kernel().GetMemoryMode() != Kernel::MemoryMode::NewDev1;
-    } else {
-        // Memory layout is standard if it is Prod (64MB)
-        is_standard = apt->system.Kernel().GetMemoryMode() == Kernel::MemoryMode::Prod;
-    }
+    // Memory layout is standard if it is Prod (64MB); only the Old 3DS is emulated.
+    is_standard = apt->system.Kernel().GetMemoryMode() == Kernel::MemoryMode::Prod;
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
     rb.Push(ResultSuccess);

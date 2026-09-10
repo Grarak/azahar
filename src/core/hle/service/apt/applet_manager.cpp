@@ -118,10 +118,7 @@ u64 GetTitleIdForApplet(AppletId id, u32 region_value) {
 
     ASSERT_MSG(itr != applet_titleids.end(), "Unknown applet id 0x{:#05X}", id);
 
-    auto n3ds_title_id = itr->n3ds_title_ids[region_value];
-    if (n3ds_title_id != 0 && Settings::values.is_new_3ds.GetValue()) {
-        return n3ds_title_id;
-    }
+    // The New 3DS applet title ids are never used: only the Old 3DS is emulated.
     return itr->title_ids[region_value];
 }
 
@@ -1285,11 +1282,7 @@ ResultVal<Service::FS::MediaType> AppletManager::Unknown54(u32 in_param) {
 }
 
 TargetPlatform AppletManager::GetTargetPlatform() {
-    if (Settings::values.is_new_3ds.GetValue() && !new_3ds_mode_blocked) {
-        return TargetPlatform::New3ds;
-    } else {
-        return TargetPlatform::Old3ds;
-    }
+    return TargetPlatform::Old3ds;
 }
 
 ApplicationRunningMode AppletManager::GetApplicationRunningMode() {
@@ -1563,13 +1556,8 @@ Result AppletManager::PrepareToStartNewestHomeMenu() {
     }
 
     bool is_standard;
-    if (Settings::values.is_new_3ds) {
-        // Memory layout is standard if it is not NewDev1 (178MB)
-        is_standard = system.Kernel().GetMemoryMode() != Kernel::MemoryMode::NewDev1;
-    } else {
-        // Memory layout is standard if it is Prod (64MB)
-        is_standard = system.Kernel().GetMemoryMode() == Kernel::MemoryMode::Prod;
-    }
+    // Memory layout is standard if it is Prod (64MB); only the Old 3DS is emulated.
+    is_standard = system.Kernel().GetMemoryMode() == Kernel::MemoryMode::Prod;
 
     if (is_standard) {
         return Result{ErrorDescription::AlreadyExists, ErrorModule::Applet,

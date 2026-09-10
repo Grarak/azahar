@@ -33,14 +33,16 @@ namespace Service::FS {
 
 bool IsInstalledApplication(std::string_view path) {
     return path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::NANDDir) + "title", 0) == 0 ||
-           path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir) + "Nintendo 3DS", 0) == 0;
+           path.rfind(GetSDMCLayoutRoot(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir)), 0) ==
+               0;
 }
 
 MediaType GetMediaTypeFromPath(std::string_view path) {
     if (path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::NANDDir) + "title", 0) == 0) {
         return MediaType::NAND;
     }
-    if (path.rfind(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir) + "Nintendo 3DS", 0) == 0) {
+    if (path.rfind(GetSDMCLayoutRoot(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir)), 0) ==
+        0) {
         return MediaType::SDMC;
     }
     return MediaType::GameCard;

@@ -6,6 +6,7 @@
 #include "common/common_types.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/file_sys/archive_ncch.h"
 #include "core/hle/ipc_helpers.h"
@@ -588,6 +589,7 @@ void DLP_SRVR::TitleBroadcastCallback(std::uintptr_t user_data, s64 cycles_late)
 }
 
 void DLP_SRVR::ServerConnectionManager() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     auto uds = GetUDS();
     auto aes = GenDLPChecksumKey(host_mac_address);
 

@@ -7,7 +7,6 @@
 #include <array>
 #include <atomic>
 #include <functional>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -17,6 +16,7 @@
 #include "common/common_types.h"
 #include "common/construct.h"
 #include "common/swap.h"
+#include "common/thread_worker.h"
 #include "core/file_sys/cia_container.h"
 #include "core/file_sys/file_backend.h"
 #include "core/file_sys/ncch_container.h"
@@ -1127,9 +1127,12 @@ private:
     bool force_new_device_id = false;
 
     std::atomic<bool> stop_scan_flag = false;
-    std::future<void> scan_tickets_future;
-    std::future<void> scan_titles_future;
-    std::future<void> scan_all_future;
+    /// The ticket and title scans run here, one at a time in the order they were asked for.
+    /// They were std::async futures; on the Vita a finished async future's wait() joins a
+    /// thread that has already exited and never returns (the AM module's destructor hung a
+    /// savestate load there, 2026-09-07). A worker thread that is joined while alive is the
+    /// pattern the FS service drains without trouble.
+    std::unique_ptr<Common::ThreadWorker> scan_worker;
     std::mutex am_lists_mutex;
     std::array<std::vector<u64_le>, 3> am_title_list;
     std::multimap<u64, u64> am_ticket_list;

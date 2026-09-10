@@ -1340,9 +1340,8 @@ std::string GetMediaTitlePath(Service::FS::MediaType media_type) {
                            SYSTEM_ID);
 
     if (media_type == Service::FS::MediaType::SDMC)
-        return fmt::format("{}Nintendo 3DS/{}/{}/title/",
-                           FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir), SYSTEM_ID,
-                           SDCARD_ID);
+        return fmt::format("{}title/",
+                           GetSDMCLayoutRoot(FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir)));
 
     if (media_type == Service::FS::MediaType::GameCard) {
         // TODO(B3N30): check if TID matchess
@@ -1359,7 +1358,7 @@ void Module::ScanForTickets() {
     if (Settings::values.deterministic_async_operations) {
         ScanForTicketsImpl();
     } else {
-        scan_tickets_future = std::async([this]() {
+        scan_worker->QueueWork([this]() {
             std::scoped_lock lock(am_lists_mutex);
             ScanForTicketsImpl();
         });
@@ -1400,7 +1399,7 @@ void Module::ScanForTitles(Service::FS::MediaType media_type) {
     if (Settings::values.deterministic_async_operations) {
         ScanForTitlesImpl(media_type);
     } else {
-        scan_titles_future = std::async([this, media_type]() {
+        scan_worker->QueueWork([this, media_type]() {
             std::scoped_lock lock(am_lists_mutex);
             ScanForTitlesImpl(media_type);
         });
@@ -1468,7 +1467,7 @@ void Module::ScanForAllTitles() {
         ScanForTitlesImpl(Service::FS::MediaType::SDMC);
         ScanForTitlesImpl(Service::FS::MediaType::GameCard);
     } else {
-        scan_all_future = std::async([this]() {
+        scan_worker->QueueWork([this]() {
             std::scoped_lock lock(am_lists_mutex);
             ScanForTicketsImpl();
             if (!stop_scan_flag) {
@@ -1487,7 +1486,9 @@ void Module::ScanForAllTitles() {
 Module::Interface::Interface(std::shared_ptr<Module> am, const char* name, u32 max_session)
     : ServiceFramework(name, max_session), am(std::move(am)) {}
 
-Module::Interface::~Interface() = default;
+Module::Interface::~Interface() {
+    LOG_DEBUG(Service_AM, "am: interface {} down", GetServiceName());
+}
 
 void Module::Interface::GetNumPrograms(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
@@ -4985,6 +4986,7 @@ void Module::Interface::ExportTicketWrapped(Kernel::HLERequestContext& ctx) {
 }
 
 Module::Module(Core::System& _system) : system(_system) {
+    scan_worker = std::make_unique<Common::ThreadWorker>(1, "AM_Scan");
     FileUtil::CreateFullPath(GetTicketDirectory());
     ScanForAllTitles();
     system_updater_mutex = system.Kernel().CreateMutex(false, "AM::SystemUpdaterMutex");
@@ -4992,6 +4994,11 @@ Module::Module(Core::System& _system) : system(_system) {
 
 Module::~Module() {
     stop_scan_flag = true;
+    LOG_DEBUG(Service_AM, "am: module teardown, draining the scan worker");
+    scan_worker->WaitForRequests();
+    LOG_DEBUG(Service_AM, "am: scan worker drained");
+    scan_worker.reset();
+    LOG_DEBUG(Service_AM, "am: scan worker joined");
 }
 
 std::shared_ptr<Module> GetModule(Core::System& system) {

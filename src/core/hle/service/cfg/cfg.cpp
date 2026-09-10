@@ -7,7 +7,7 @@
 #include <tuple>
 #include <boost/serialization/array.hpp>
 #include <boost/serialization/unique_ptr.hpp>
-#include <cryptopp/osrng.h>
+#include "common/vita_osrng.h"
 #include <cryptopp/sha.h>
 #include <fmt/ranges.h>
 #include "common/archives.h"
@@ -578,13 +578,10 @@ void Module::Interface::GetSystemModel(Kernel::HLERequestContext& ctx) {
                                 reinterpret_cast<u8*>(&data)));
     ConsoleModelInfo model;
     std::memcpy(&model, &data, 4);
-    if ((model.model == NINTENDO_3DS || model.model == NINTENDO_3DS_XL ||
-         model.model == NINTENDO_2DS) &&
-        Settings::values.is_new_3ds) {
-        model.model = NEW_NINTENDO_3DS_XL;
-    } else if ((model.model == NEW_NINTENDO_3DS || model.model == NEW_NINTENDO_3DS_XL ||
-                model.model == NEW_NINTENDO_2DS_XL) &&
-               !Settings::values.is_new_3ds) {
+    // Only the Old 3DS is emulated, so a New 3DS model in the config block is reported as its
+    // Old 3DS equivalent.
+    if (model.model == NEW_NINTENDO_3DS || model.model == NEW_NINTENDO_3DS_XL ||
+        model.model == NEW_NINTENDO_2DS_XL) {
         model.model = NINTENDO_3DS_XL;
     }
     std::memcpy(&data, &model, 4);
@@ -1363,14 +1360,29 @@ std::array<u8, 6> GetConsoleMacAddress(Core::System& system) {
 }
 
 std::array<u8, 6> MacToArray(const std::string& mac) {
-    std::array<u8, 6> ret;
-    int last = -1;
-    int rc = sscanf(mac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx%n", ret.data() + 0, ret.data() + 1,
-                    ret.data() + 2, ret.data() + 3, ret.data() + 4, ret.data() + 5, &last);
-    if (rc != 6 || static_cast<int>(mac.size()) != last) {
-        return MacToArray(GenerateRandomMAC());
+    // Plain %x with a width, not %hhx: the hh modifier is C99, and newlib - the PS Vita's libc -
+    // is built without C99 format support, so %hhx matches nothing there and every MAC string,
+    // valid ones included, failed this parse. The retry is a loop rather than a recursive call
+    // for the same reason: with the parse refusing everything, the old
+    // MacToArray(GenerateRandomMAC()) re-entered itself once per generated address until the
+    // thread ran out of stack.
+    for (std::string current = mac;;) {
+        std::array<unsigned int, 6> b;
+        int last = -1;
+        const int rc = sscanf(current.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x%n", &b[0], &b[1], &b[2],
+                              &b[3], &b[4], &b[5], &last);
+        if (rc == 6 && static_cast<int>(current.size()) == last) {
+            return {static_cast<u8>(b[0]), static_cast<u8>(b[1]), static_cast<u8>(b[2]),
+                    static_cast<u8>(b[3]), static_cast<u8>(b[4]), static_cast<u8>(b[5])};
+        }
+        if (current != mac) {
+            // A generated address is well-formed by construction, so failing to parse one means
+            // the parser itself is broken - keep the failure visible instead of looping on it.
+            LOG_ERROR(Service_CFG, "could not parse a generated MAC address '{}'", current);
+            return {};
+        }
+        current = GenerateRandomMAC();
     }
-    return ret;
 }
 
 std::string MacToString(u64 mac) {

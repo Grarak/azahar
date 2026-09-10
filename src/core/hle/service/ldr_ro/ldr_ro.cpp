@@ -440,6 +440,12 @@ void RO::LinkCRO(Kernel::HLERequestContext& ctx) {
         LOG_ERROR(Service_LDR, "Error linking CRO {:08X}", result.raw);
     }
 
+    // Linking rewrites guest code: it patches this module's relocations and the call sites of
+    // every module importing from it. LoadCRO and UnloadCRO already invalidate; these two did not,
+    // which is harmless when guest code is interpreted and re-read each time, and not harmless at
+    // all when it executes natively out of the host's instruction cache.
+    system.ClearInstructionCache();
+
     rb.Push(result);
 }
 
@@ -479,6 +485,9 @@ void RO::UnlinkCRO(Kernel::HLERequestContext& ctx) {
     if (result.IsError()) {
         LOG_ERROR(Service_LDR, "Error unlinking CRO {:08X}", result.raw);
     }
+
+    // As in LinkCRO: unlinking reverts those same relocations.
+    system.ClearInstructionCache();
 
     rb.Push(result);
 }

@@ -50,6 +50,7 @@ public:
     static void InstallInterfaces(Core::System& system);
 
     explicit ServiceManager(Core::System& system);
+    ~ServiceManager();
 
     Result RegisterService(std::shared_ptr<Kernel::ServerPort>* out_server_port, std::string name,
                            u32 max_sessions);

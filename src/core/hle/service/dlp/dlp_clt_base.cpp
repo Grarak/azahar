@@ -6,6 +6,7 @@
 
 #include "common/alignment.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 #include "common/timer.h"
 #include "core/hle/ipc_helpers.h"
 #include "core/hle/service/am/am.h"
@@ -653,6 +654,7 @@ DLPServerInfo DLP_Clt_Base::GetDLPServerInfoFromRawBeacon(Network::WifiPacket& b
 }
 
 void DLP_Clt_Base::ClientConnectionManager() {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     auto uds = GetUDS();
 
     auto [ret, data_available_event] = uds->BindHLE(

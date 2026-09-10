@@ -130,7 +130,11 @@ ServiceFrameworkBase::ServiceFrameworkBase(const char* service_name, u32 max_ses
                                            InvokerFn* handler_invoker)
     : service_name(service_name), max_sessions(max_sessions), handler_invoker(handler_invoker) {}
 
-ServiceFrameworkBase::~ServiceFrameworkBase() = default;
+ServiceFrameworkBase::~ServiceFrameworkBase() {
+    // One line per service at teardown: a load's shutdown that stops without an error needs
+    // to say which service it was destroying (Vita3K, 2026-09-07).
+    LOG_DEBUG(Service, "service {} destroyed", service_name);
+}
 
 void ServiceFrameworkBase::InstallAsService(SM::ServiceManager& service_manager) {
     std::shared_ptr<Kernel::ServerPort> port;

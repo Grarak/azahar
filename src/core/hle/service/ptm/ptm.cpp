@@ -119,7 +119,7 @@ void Module::Interface::GetSoftwareClosedFlag(Kernel::HLERequestContext& ctx) {
 }
 
 void CheckNew3DS(IPC::RequestBuilder& rb) {
-    const bool is_new_3ds = Settings::values.is_new_3ds.GetValue();
+    const bool is_new_3ds = false; // only the Old 3DS is emulated
 
     rb.Push(ResultSuccess);
     rb.Push(is_new_3ds);

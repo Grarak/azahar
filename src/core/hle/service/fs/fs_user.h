@@ -50,7 +50,9 @@ class FS_USER final : public ServiceFramework<FS_USER, ClientSlot> {
 public:
     explicit FS_USER(Core::System& system);
     ~FS_USER() {
+        LOG_DEBUG(Service_FS, "fs: draining the async worker");
         fs_async_worker.WaitForRequests();
+        LOG_DEBUG(Service_FS, "fs: worker drained");
     }
 
     // On real HW this is part of FSReg (FSReg:Register). But since that module is only used by

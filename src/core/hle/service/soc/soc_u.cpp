@@ -2254,8 +2254,10 @@ SOC_U::SOC_U() : ServiceFramework("soc:U", 18) {
 }
 
 SOC_U::~SOC_U() {
+    LOG_DEBUG(Service_SOC, "soc: closing sockets");
     CloseAndDeleteAllSockets();
     Network::SocketManager::DisableSockets();
+    LOG_DEBUG(Service_SOC, "soc: closed");
 }
 
 std::optional<SOC_U::InterfaceInfo> SOC_U::GetDefaultInterfaceInfo() {

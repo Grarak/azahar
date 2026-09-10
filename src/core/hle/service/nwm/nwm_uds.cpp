@@ -6,7 +6,7 @@
 #include <cstring>
 #include <boost/serialization/list.hpp>
 #include <boost/serialization/map.hpp>
-#include <cryptopp/osrng.h>
+#include "common/vita_osrng.h"
 #include "common/archives.h"
 #include "common/common_types.h"
 #include "common/hacks/hack_manager.h"
@@ -78,7 +78,8 @@ std::list<Network::WifiPacket> NWM_UDS::GetReceivedBeacons(const MacAddress& sen
 }
 
 /// Sends a WifiPacket to the room we're currently connected to.
-void SendPacket(Network::WifiPacket& packet) {
+void SendPacket([[maybe_unused]] Network::WifiPacket& packet) {
+#ifdef ENABLE_ROOM
     if (auto room_member = Network::GetRoomMember().lock()) {
         if (room_member->GetState() == Network::RoomMember::State::Joined ||
             room_member->GetState() == Network::RoomMember::State::Moderator) {
@@ -87,6 +88,7 @@ void SendPacket(Network::WifiPacket& packet) {
             room_member->SendWifiPacket(packet);
         }
     }
+#endif
 }
 
 u16 NWM_UDS::GetNextAvailableNodeId() {
@@ -1644,6 +1646,7 @@ void NWM_UDS::BeaconBroadcastCallback(std::uintptr_t user_data, s64 cycles_late)
 Network::MacAddress NWM_UDS::GetMacAddress() {
     MacAddress mac;
 
+#ifdef ENABLE_ROOM
     if (auto room_member = Network::GetRoomMember().lock();
         room_member && room_member->IsConnected()) {
         mac = room_member->GetMacAddress();
@@ -1651,7 +1654,9 @@ Network::MacAddress NWM_UDS::GetMacAddress() {
             LOG_WARNING(Service_NWM, "Room member mac address is different from the console mac "
                                      "address. Using room member mac address.");
         }
-    } else {
+    } else
+#endif
+    {
         // if we are not connected to the room, we can
         // use the system mac address. In hopefully all cases
         // this will match the room member mac addr anyways
@@ -1706,17 +1711,21 @@ NWM_UDS::NWM_UDS(Core::System& system) : ServiceFramework("nwm::UDS"), system(sy
 
     system.Kernel().GetSharedPageHandler().SetMacAddress(GetMacAddress());
 
+#ifdef ENABLE_ROOM
     if (auto room_member = Network::GetRoomMember().lock()) {
         wifi_packet_received = room_member->BindOnWifiPacketReceived(
             [this](const Network::WifiPacket& packet) { OnWifiPacketReceived(packet); });
     } else {
         LOG_ERROR(Service_NWM, "Network isn't initalized");
     }
+#endif
 }
 
 NWM_UDS::~NWM_UDS() {
+#ifdef ENABLE_ROOM
     if (auto room_member = Network::GetRoomMember().lock())
         room_member->Unbind(wifi_packet_received);
+#endif
 
     system.CoreTiming().UnscheduleEvent(beacon_broadcast_event, 0);
 }

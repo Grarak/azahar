@@ -23,6 +23,19 @@ static constexpr char SYSTEM_ID[]{"00000000000000000000000000000000"};
 /// The scrambled SD card CID, also known as ID1
 static constexpr char SDCARD_ID[]{"00000000000000000000000000000000"};
 
+/// Where a console's SD card keeps its titles and extdata: `<sdmc>/Nintendo 3DS/<ID0>/<ID1>/`.
+/// The Vita build drops that segment: its kernel refuses to create a directory more than ten
+/// levels below the device root (measured 2026-09-01, sceIoMkdir -> SCE_ERROR_ERRNO_EINVAL at
+/// level 11, any name length), and `<sdmc>/Nintendo 3DS/<ID0>/<ID1>/title/<hi>/<lo>/data/<id>`
+/// is level 11 under `ux0:/data/azahar/sdmc`. Host layout only; the guest never sees it.
+inline std::string GetSDMCLayoutRoot(std::string_view sdmc_directory) {
+#ifdef __vita__
+    return std::string(sdmc_directory);
+#else
+    return fmt::format("{}Nintendo 3DS/{}/{}/", sdmc_directory, SYSTEM_ID, SDCARD_ID);
+#endif
+}
+
 namespace Loader {
 class AppLoader;
 }
