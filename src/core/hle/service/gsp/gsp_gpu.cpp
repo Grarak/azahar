@@ -17,6 +17,8 @@
 #include "core/hle/kernel/shared_memory.h"
 #include "core/hle/kernel/shared_page.h"
 #include "core/hle/result.h"
+#include <atomic>
+#include <cstdlib>
 #include "core/hle/service/gsp/gsp_gpu.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
@@ -322,32 +324,76 @@ void GSP_GPU::SetBufferSwap(Kernel::HLERequestContext& ctx) {
 
 void GSP_GPU::FlushDataCache(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
-    [[maybe_unused]] u32 address = rp.Pop<u32>();
-    [[maybe_unused]] u32 size = rp.Pop<u32>();
+    const u32 address = rp.Pop<u32>();
+    const u32 size = rp.Pop<u32>();
     [[maybe_unused]] auto process = rp.PopObject<Kernel::Process>();
 
-    // TODO(purpasmart96): Verify return header on HW
+    // The guest cleaned its CPU data cache over this range: it has written the memory and the
+    // GPU is expected to read those bytes from now on. The emulator-side equivalent of "the GPU
+    // reads RAM" is dropping every cached copy of the range, so the next use reloads it. This
+    // used to be a stub, which upstream gets away with because CPU writes are caught by page
+    // marking; under native execution a guest store traps nothing, and this call is the only
+    // signal that CPU-composed data (textures written with the CPU rather than a GX transfer)
+    // has changed. Without it the GL texture cache serves stale planes forever.
+    //
+    // A surface holding rendered-but-unflushed output inside the range loses that content - the
+    // real GPU would have written it to RAM long ago, this side never did, and the guest's own
+    // writes have already landed, so writing it back now would clobber them. Titles do not
+    // CPU-write into render targets they still expect pixels from without reading them back
+    // first, which takes the InvalidateDataCache path below.
+    // Sizes that run past the end of the address space are the guest's "everything" sentinel
+    // (measured on Smash: a fraction of a percent of calls, but ~4 GB each). Dropping every
+    // cached surface for those would thrash the caches for data the exact-size flushes already
+    // cover, and the range arithmetic below would wrap anyway - so only bounded ranges are
+    // honoured. The same virtual-to-physical mapping RasterizerFlushVirtualRegion applies, but
+    // through GPU::InvalidateOnGuestFlush, which keeps its hands off ranges holding unflushed
+    // GL-rendered content.
+    if (size < 0xFFFFFFFFu - address) {
+        const VAddr start = address;
+        const VAddr end = address + size;
+        const auto check_region = [&](VAddr region_start, VAddr region_end, PAddr paddr_start) {
+            if (start >= region_end || end <= region_start) {
+                return;
+            }
+            const VAddr overlap_start = std::max(start, region_start);
+            const VAddr overlap_end = std::min(end, region_end);
+            system.GPU().InvalidateOnGuestFlush(paddr_start + (overlap_start - region_start),
+                                                overlap_end - overlap_start);
+        };
+        check_region(Memory::LINEAR_HEAP_VADDR, Memory::LINEAR_HEAP_VADDR_END,
+                     Memory::FCRAM_PADDR);
+        check_region(Memory::NEW_LINEAR_HEAP_VADDR, Memory::NEW_LINEAR_HEAP_VADDR_END,
+                     Memory::FCRAM_PADDR);
+        check_region(Memory::VRAM_VADDR, Memory::VRAM_VADDR_END, Memory::VRAM_PADDR);
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
 
-    LOG_TRACE(Service_GSP, "(STUBBED) called address=0x{:08X}, size=0x{:08X}, process={}", address,
-              size, process->process_id);
+    LOG_TRACE(Service_GSP, "called address=0x{:08X}, size=0x{:08X}, process={}", address, size,
+              process->process_id);
 }
 
 void GSP_GPU::InvalidateDataCache(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
-    [[maybe_unused]] u32 address = rp.Pop<u32>();
-    [[maybe_unused]] u32 size = rp.Pop<u32>();
+    const u32 address = rp.Pop<u32>();
+    const u32 size = rp.Pop<u32>();
     [[maybe_unused]] auto process = rp.PopObject<Kernel::Process>();
 
-    // TODO(purpasmart96): Verify return header on HW
+    // The counterpart: the guest discarded its CPU data cache over this range because it is
+    // about to read what the GPU produced. Hand rendered content back to guest memory so those
+    // reads see it. Cheap when nothing rendered overlaps - the GL path proves a no-op flush
+    // from its written-pages map without touching the render thread. Same sentinel guard as
+    // FlushDataCache.
+    if (size < 0xFFFFFFFFu - address) {
+        system.Memory().RasterizerFlushVirtualRegion(address, size, Memory::FlushMode::Flush);
+    }
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);
 
-    LOG_TRACE(Service_GSP, "(STUBBED) called address=0x{:08X}, size=0x{:08X}, process={}", address,
-              size, process->process_id);
+    LOG_TRACE(Service_GSP, "called address=0x{:08X}, size=0x{:08X}, process={}", address, size,
+              process->process_id);
 }
 
 void GSP_GPU::SetAxiConfigQoSMode(Kernel::HLERequestContext& ctx) {
@@ -538,14 +584,26 @@ void Service::GSP::GSP_GPU::ProcessPendingInterrupt(size_t pending_interrupt_id)
     ProcessPendingInterruptImpl(interrupt_id, thread_id);
 }
 
+// Submitted command lists, surfaced in the status line. When this stops rising while presents
+// continue, the guest has stopped feeding the GPU - the signature of the software-renderer wedge.
+std::atomic<u64> g_gx_cmdlists{};
+
+// Delivery-path counters for the interrupt relay, read at a wedge through the debug port:
+// which branch of ProcessPendingInterruptImpl each signal takes, kept per call not per thread.
+// [0] pdc calls  [1] pdc dropped by ignore_pdc  [2] pdc queued  [3] pdc missed past threshold
+// [4] non-pdc queued  [5] no registered session  [6] no interrupt event  [7] relay queue full
+std::array<std::atomic<u64>, 8> g_gsp_probe{};
+
 void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id, u32 thread_id) {
     SessionData* session_data = FindRegisteredThreadData(thread_id);
     if (!session_data) {
+        g_gsp_probe[5].fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     auto interrupt_event = session_data->interrupt_event;
     if (interrupt_event == nullptr) {
+        g_gsp_probe[6].fetch_add(1, std::memory_order_relaxed);
         LOG_WARNING(Service_GSP, "cannot synchronize until GSP event has been created!");
         return;
     }
@@ -555,8 +613,10 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
 
     auto queue_interrupt = [&]() {
         if (interrupt_relay_queue->number_interrupts >= InterruptRelayQueue::max_slots) {
+            g_gsp_probe[7].fetch_add(1, std::memory_order_relaxed);
             interrupt_relay_queue->error_code = InterruptRelayQueue::queue_full_error;
         } else {
+            g_gsp_probe[is_pdc ? 2 : 4].fetch_add(1, std::memory_order_relaxed);
             u8 next = interrupt_relay_queue->index;
             next += interrupt_relay_queue->number_interrupts;
             next %= InterruptRelayQueue::max_slots;
@@ -570,10 +630,12 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
     };
 
     if (is_pdc) {
+        g_gsp_probe[0].fetch_add(1, std::memory_order_relaxed);
         if (!interrupt_relay_queue->ignore_pdc.Value()) {
 
             if (interrupt_relay_queue->number_interrupts >=
                 InterruptRelayQueue::stop_queuing_pdc_threeshold) {
+                g_gsp_probe[3].fetch_add(1, std::memory_order_relaxed);
                 if (interrupt_id == InterruptId::PDC0) {
                     interrupt_relay_queue->missed_PDC0++;
                 } else {
@@ -582,6 +644,8 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
             } else {
                 queue_interrupt();
             }
+        } else {
+            g_gsp_probe[1].fetch_add(1, std::memory_order_relaxed);
         }
 
         // Update framebuffer information if requested
@@ -606,6 +670,15 @@ void Service::GSP::GSP_GPU::ProcessPendingInterruptImpl(InterruptId interrupt_id
 }
 
 void GSP_GPU::SignalInterrupt(InterruptId interrupt_id, u64 wait_delay_ns) {
+#ifdef CITRA_TRACE_PROBES
+    static const bool gx_trace = std::getenv("AZAHAR_GX_TRACE") != nullptr;
+    if (gx_trace && interrupt_id != InterruptId::PDC0 && interrupt_id != InterruptId::PDC1) {
+        static std::atomic<u32> intr_trace_count{0};
+        if (intr_trace_count.fetch_add(1) < 3000) {
+            LOG_INFO(Service_GSP, "GXTRACE intr id={}", static_cast<u32>(interrupt_id));
+        }
+    }
+#endif // CITRA_TRACE_PROBES
     if (nullptr == shared_memory) {
         LOG_WARNING(Service_GSP, "cannot synchronize until GSP shared memory has been created!");
         return;
@@ -643,6 +716,16 @@ void GSP_GPU::SetLcdForceBlack(Kernel::HLERequestContext& ctx) {
 
 void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
+#ifdef CITRA_TRACE_PROBES
+    static const bool gx_trace = std::getenv("AZAHAR_GX_TRACE") != nullptr;
+    static std::atomic<u32> trig_trace_count{0};
+    if (gx_trace && trig_trace_count.fetch_add(1) < 20000) {
+        auto* cb = GetCommandBuffer(thread_id_with_rights);
+        LOG_INFO(Service_GSP, "GXTRACE trigger ncmds={} index={} status={}",
+                 cb ? cb->number_commands.Value() : 0xFFFF, cb ? cb->index.Value() : 0xFFFF,
+                 cb ? static_cast<u32>(cb->status.Value()) : 0xFFFF);
+    }
+#endif // CITRA_TRACE_PROBES
 
     if (thread_id_with_rights == std::numeric_limits<u32>::max()) {
         // Even if the active thread ID is not set,
@@ -675,6 +758,9 @@ void GSP_GPU::TriggerCmdReqQueue(Kernel::HLERequestContext& ctx) {
         command_buffer->number_commands.Assign(command_buffer->number_commands - 1);
         command_buffer->index.Assign((command_buffer->index + 1) % 0xF);
 
+        if (command.id == CommandId::SubmitCmdList) {
+            ++g_gx_cmdlists;
+        }
         gpu.Debugger().GXCommandProcessed(command);
 
         // Decode and execute command
@@ -942,7 +1028,7 @@ Result GSP_GPU::AcquireGpuRight(const Kernel::HLERequestContext& ctx,
                 ErrorLevel::Success};
     }
 
-    gpu.Renderer().Rasterizer()->SwitchDiskResources(process->codeset->program_id);
+    gpu.SwitchDiskResources(process->codeset->program_id);
 
     if (blocking) {
         // TODO: The thread should be put to sleep until acquired.
