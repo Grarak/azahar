@@ -23,6 +23,7 @@ enum class GraphicsAPI {
     Software = 0,
     OpenGL = 1,
     Vulkan = 2,
+    Gxm = 3, ///< the PS Vita's libgxm
 };
 
 enum class InitClock : u32 {
@@ -485,7 +486,6 @@ struct Values {
     // Core
     Setting<bool> use_cpu_jit{true, Keys::use_cpu_jit};
     SwitchableSetting<s32, true> cpu_clock_percentage{100, 5, 400, Keys::cpu_clock_percentage};
-    SwitchableSetting<bool> is_new_3ds{true, Keys::is_new_3ds};
     SwitchableSetting<bool> lle_applets{true, Keys::lle_applets};
     SwitchableSetting<bool> deterministic_async_operations{false,
                                                            Keys::deterministic_async_operations};
@@ -519,13 +519,15 @@ struct Values {
         GraphicsAPI::OpenGL,
 #elif defined(ENABLE_VULKAN)
         GraphicsAPI::Vulkan,
+#elif defined(ENABLE_GXM)
+        GraphicsAPI::Gxm,
 #elif defined(ENABLE_SOFTWARE_RENDERER)
         GraphicsAPI::Software,
 #else
 // TODO: Add a null renderer backend for this, perhaps.
 #error "At least one renderer must be enabled."
 #endif
-        GraphicsAPI::Software, GraphicsAPI::Vulkan, Keys::graphics_api};
+        GraphicsAPI::Software, GraphicsAPI::Gxm, Keys::graphics_api};
     // clang-format on
     SwitchableSetting<u32> physical_device{0, Keys::physical_device};
     Setting<bool> use_gles{false, Keys::use_gles};

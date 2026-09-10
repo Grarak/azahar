@@ -36,6 +36,8 @@ std::string_view GetGraphicsAPIName(GraphicsAPI api) {
         return "OpenGL";
     case GraphicsAPI::Vulkan:
         return "Vulkan";
+    case GraphicsAPI::Gxm:
+        return "GXM";
     default:
         return "Invalid";
     }
@@ -159,7 +161,6 @@ void LogSettings() {
         log_setting("DataStorage_SdmcDir", FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir));
         log_setting("DataStorage_NandDir", FileUtil::GetUserPath(FileUtil::UserPath::NANDDir));
     }
-    log_setting("System_IsNew3ds", values.is_new_3ds.GetValue());
     log_setting("System_LLEApplets", values.lle_applets.GetValue());
     log_setting("System_RegionValue", values.region_value.GetValue());
     log_setting("System_PluginLoader", values.plugin_loader_enabled.GetValue());
@@ -204,7 +205,6 @@ void RestoreGlobalState(bool is_powered_on) {
 
     // Core
     values.cpu_clock_percentage.SetGlobal(true);
-    values.is_new_3ds.SetGlobal(true);
     values.lle_applets.SetGlobal(true);
 
     // Renderer

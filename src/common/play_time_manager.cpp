@@ -99,7 +99,8 @@ void PlayTimeManager::SetProgramId(u64 program_id) {
 }
 
 void PlayTimeManager::Start() {
-    play_time_thread = std::jthread([&](std::stop_token stop_token) { AutoTimestamp(stop_token); });
+    play_time_thread = Common::NamedThread(
+        Common::ThreadCfg{"play time"}, [&](std::stop_token stop_token) { AutoTimestamp(stop_token); });
 }
 
 void PlayTimeManager::Stop() {
@@ -107,6 +108,7 @@ void PlayTimeManager::Stop() {
 }
 
 void PlayTimeManager::AutoTimestamp(std::stop_token stop_token) {
+    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     Common::SetCurrentThreadName("PlayTimeReport");
 
     using namespace std::literals::chrono_literals;

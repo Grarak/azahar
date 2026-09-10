@@ -43,7 +43,6 @@ static constexpr const char* cpu_clock_percentage = citra_setting(BaseKeys::cpu_
 } // namespace cpu
 
 namespace system {
-static constexpr const char* is_new_3ds = citra_setting(BaseKeys::is_new_3ds);
 static constexpr const char* region_value = citra_setting(BaseKeys::region_value);
 static constexpr const char* language_value = citra_setting(BaseKeys::language_value);
 } // namespace system
@@ -179,20 +178,6 @@ static constexpr retro_core_option_v2_definition option_definitions[] = {
     },
 
     // System Category
-    {
-        config::system::is_new_3ds,
-        "3DS System Model",
-        "System Model",
-        "Select whether to emulate the original 3DS or New 3DS. "
-        "New 3DS has additional CPU power and memory, required for some games. "
-        "Restart required.",
-        nullptr,
-        config::category::system,
-        {
-            { "New 3DS", "New 3DS" },
-            { "Old 3DS", "Original 3DS" },
-            { nullptr, nullptr }
-        },
         "New 3DS"
     },
     {
@@ -879,9 +864,6 @@ static Service::CFG::SystemLanguage GetLanguageValue(const std::string& name) {
 }
 
 static void ParseSystemOptions(void) {
-    Settings::values.is_new_3ds =
-        LibRetro::FetchVariable(config::system::is_new_3ds, "New 3DS") == "New 3DS";
-
     Settings::values.region_value =
         GetRegionValue(LibRetro::FetchVariable(config::system::region_value, "Auto"));
 

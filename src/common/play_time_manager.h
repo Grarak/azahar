@@ -8,6 +8,7 @@
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "common/named_thread.h"
 #include "common/polyfill_thread.h"
 
 namespace PlayTime {
@@ -36,7 +37,7 @@ private:
 
     PlayTimeDatabase database;
     u64 running_program_id;
-    std::jthread play_time_thread;
+    Common::NamedThread play_time_thread;
 };
 
 } // namespace PlayTime

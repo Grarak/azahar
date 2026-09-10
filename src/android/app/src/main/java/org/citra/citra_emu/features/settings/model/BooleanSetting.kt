@@ -78,7 +78,6 @@ enum class BooleanSetting(
         false
     ),
     LLE_APPLETS(SettingKeys.lle_applets(), Settings.SECTION_SYSTEM, false),
-    NEW_3DS(SettingKeys.is_new_3ds(), Settings.SECTION_SYSTEM, true),
     LINEAR_FILTERING(SettingKeys.filter_mode(), Settings.SECTION_RENDERER, true),
     SHADERS_ACCURATE_MUL(SettingKeys.shaders_accurate_mul(), Settings.SECTION_RENDERER, false),
     DISK_SHADER_CACHE(SettingKeys.use_disk_shader_cache(), Settings.SECTION_RENDERER, true),
@@ -155,7 +154,6 @@ enum class BooleanSetting(
             DELAY_START_LLE_MODULES,
             DETERMINISTIC_ASYNC_OPERATIONS,
             REQUIRED_ONLINE_LLE_MODULES,
-            NEW_3DS,
             LLE_APPLETS,
             TOGGLE_UNIQUE_DATA_CONSOLE_TYPE,
             VSYNC,

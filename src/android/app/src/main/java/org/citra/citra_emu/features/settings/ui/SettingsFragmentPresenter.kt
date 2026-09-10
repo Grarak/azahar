@@ -355,15 +355,6 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView) 
             add(HeaderSetting(R.string.emulation_settings))
             add(
                 SwitchSetting(
-                    BooleanSetting.NEW_3DS,
-                    R.string.new_3ds,
-                    0,
-                    BooleanSetting.NEW_3DS.key,
-                    BooleanSetting.NEW_3DS.defaultValue
-                )
-            )
-            add(
-                SwitchSetting(
                     BooleanSetting.LLE_APPLETS,
                     R.string.lle_applets,
                     0,

@@ -12,7 +12,6 @@ object SettingKeys {
     external fun use_artic_base_controller(): String
     external fun use_cpu_jit(): String
     external fun cpu_clock_percentage(): String
-    external fun is_new_3ds(): String
     external fun lle_applets(): String
     external fun deterministic_async_operations(): String
     external fun enable_required_online_lle_modules(): String
