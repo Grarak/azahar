@@ -105,6 +105,61 @@ else()
     set(DEFAULT_ENABLE_OPENGL ON)
 endif()
 
+# The PS Vita is a fixed four-core ARMv7 console with no window system, no OpenGL driver worth
+# using, and no desktop audio stack; everything below is either absent on it or replaced by the
+# Vita frontend's own implementation. VITA is set by the vitasdk toolchain file.
+if (VITA)
+    set(_VITA_UNSUPPORTED_OPTIONS
+        ENABLE_SDL2 ENABLE_QT ENABLE_WEB_SERVICE ENABLE_SCRIPTING ENABLE_GDBSTUB
+        ENABLE_OPENAL ENABLE_ROOM ENABLE_ROOM_STANDALONE ENABLE_CUBEB ENABLE_LIBUSB
+        ENABLE_OPENGL ENABLE_VULKAN ENABLE_TESTS ENABLE_LIBRETRO ENABLE_DISCORD_RPC
+        ENABLE_QT_TRANSLATION ENABLE_QT_UPDATE_CHECKER ENABLE_DSP_LLE ENABLE_ARTIC)
+    foreach(_opt IN LISTS _VITA_UNSUPPORTED_OPTIONS)
+        set(${_opt} OFF CACHE BOOL "Unsupported on the PS Vita" FORCE)
+    endforeach()
+    # The Vita renders through GXM and nothing else (GXM_PLAN.md). The software renderer is
+    # too slow on a 444 MHz A9 to be worth carrying, so it is not built; ENABLE_GXM is not an
+    # option because no other platform can use it - it is a fact of the target.
+    set(ENABLE_SOFTWARE_RENDERER OFF CACHE BOOL "Not built for the Vita: GXM is the renderer" FORCE)
+    set(ENABLE_GXM ON)
+    set(DEFAULT_ENABLE_OPENGL OFF)
+    # newlib hides asprintf and friends behind __GNU_VISIBLE, and several vendored libraries
+    # written against glibc expect them without asking. SOMAXCONN is simply absent from the
+    # console's socket headers; it is only ever the "you choose" listen backlog, and nothing in
+    # this build listens on a socket.
+    # SSIZE_MAX is likewise missing; on a 32-bit target it is LONG_MAX.
+    add_compile_definitions(_GNU_SOURCE SOMAXCONN=128 SSIZE_MAX=0x7FFFFFFFL)
+    # The ARM EABI packs an enum into the smallest type that holds it. The PICA register
+    # definitions are unions of a u32 with BitFields over it, and a BitField's storage is sized
+    # from its value type - so a packed enum makes a 32-bit register one byte wide and every
+    # field past bit 7 fails to compile. The guest's registers are 32 bits whatever the host
+    # would prefer.
+    add_compile_options(-fno-short-enums)
+    # The compile options a vendored project cannot lose. add_compile_options is a directory
+    # property rather than part of CMAKE_<LANG>_FLAGS, so it survives a subproject that assigns
+    # to the flags variable instead of appending to it - which is exactly how the software
+    # renderer's NEON came to be compiled without NEON on the first clang build.
+    add_compile_options(-D__vita__=1 -mcpu=cortex-a9 -mfpu=neon -fno-pic -fno-pie)
+    # A handful of POSIX headers the console's newlib does not ship, supplied here rather than
+    # by patching every library that includes them. See src/vita_compat/ for what each is for.
+    include_directories(BEFORE SYSTEM ${CMAKE_CURRENT_SOURCE_DIR}/src/vita_compat)
+    # libressl ships its own compat/endian.h, which forwards to a real one when told there is
+    # one. Left alone it takes the machine/endian.h branch, which has the byte order macros but
+    # not the htobe family its digest code calls.
+    add_compile_definitions(HAVE_ENDIAN_H)
+    # Boost.Asio's umbrella header pulls in serial port support, which wants termios; this
+    # console has no terminal and no serial port, and its newlib's termios.h is broken anyway
+    # (it includes a <sys/termios.h> the sysroot does not ship). Asio has a switch for exactly
+    # this rather than needing a terminal API invented for it.
+    add_compile_definitions(BOOST_ASIO_DISABLE_SERIAL_PORT)
+else()
+    # ENABLE_GXM_STUB: build the GXM renderer against a libgxm with no GPU behind it
+    # (renderer_gxm/gxm_stub), so its CPU work can be profiled on a Linux host with symbols.
+    # Needs the vitasdk headers (VITASDK, default /usr/local/vitasdk). Nothing is presented.
+    option(ENABLE_GXM_STUB "GXM renderer on a stub libgxm, for profiling off the console" OFF)
+    set(ENABLE_GXM ${ENABLE_GXM_STUB})
+endif()
+
 # Track which options were explicitly set by the user (for libretro conflict detection)
 set(_LIBRETRO_INCOMPATIBLE_OPTIONS
     ENABLE_SDL2 ENABLE_QT ENABLE_WEB_SERVICE ENABLE_SCRIPTING ENABLE_GDBSTUB
@@ -126,6 +181,14 @@ option(ENABLE_QT_UPDATE_CHECKER "Enable built-in update checker for the Qt front
 
 CMAKE_DEPENDENT_OPTION(ENABLE_TESTS "Enable generating tests executable" ON "NOT IOS" OFF)
 CMAKE_DEPENDENT_OPTION(ENABLE_ROOM "Enable dedicated room functionality" ON "NOT ANDROID AND NOT IOS" OFF)
+# The LLE DSP is a full Teak interpreter running beside the ARM cores. It is a correctness
+# reference, not a way to play anything, and on a 444 MHz console it is unusable - so the Vita
+# build takes the HLE DSP only and leaves teakra out of the link entirely.
+option(ENABLE_DSP_LLE "Enable the LLE (teakra) DSP backend" ON)
+# Artic Base loads a title off a real console over the network, reached only by passing an
+# articbase:// path. The Vita frontend has no text entry to type one with, so the whole client
+# is unreachable there and the loader that constructs it is left out.
+option(ENABLE_ARTIC "Enable the Artic Base client (load titles from a real console)" ON)
 CMAKE_DEPENDENT_OPTION(ENABLE_ROOM_STANDALONE "Enable generating a standalone dedicated room executable" ON "ENABLE_ROOM" OFF)
 
 option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
@@ -150,6 +213,15 @@ option(ENABLE_SSE42 "Enable SSE4.2 optimizations on x86_64" ON)
 
 option(ENABLE_DEVELOPER_OPTIONS "Enable functionality targeted at emulator developers" OFF)
 
+# The render thread's phase breadcrumb (common/pipeline_stats.h, GXM_PHASE): where the thread
+# is, so a hang that prints nothing can still be located. Declared here rather than beside the
+# frontend because video_core has to honour it too - the render thread spends most of its life
+# inside the GXM renderer, which is compiled there.
+# On by default since 2026-09-08: two console freezes in a row came from a plain build, whose
+# log could not say where the render thread was. The cost is a few relaxed stores per queued
+# op, scene and present, and none per draw.
+option(VITA_RENDER_TRACE "Record where the Vita render thread is, for locating a hang" ON)
+
 option(ENABLE_BUILTIN_KEYBLOB "Enable the inclusion of the default crypto keys blob" ON)
 
 # Compile options
@@ -159,6 +231,10 @@ option(ENABLE_NATIVE_OPTIMIZATION "Enables processor-specific optimizations via 
 option(CITRA_USE_PRECOMPILED_HEADERS "Use precompiled headers" ON)
 option(CITRA_WARNINGS_AS_ERRORS "Enable warnings as errors" ON)
 option(CITRA_ADDRESS_SANITIZE "Enable address sanitizer" OFF)
+option(CITRA_TRACE_PROBES "Compile in env-gated diagnostic trace probes (see TRACE_PROBES.md; never for release)" OFF)
+if (CITRA_TRACE_PROBES)
+    add_compile_definitions(CITRA_TRACE_PROBES)
+endif()
 
 # Handle incompatible options for libretro builds
 if(ENABLE_LIBRETRO)

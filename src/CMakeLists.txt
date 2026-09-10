@@ -171,6 +171,9 @@ else()
     endif()
 endif()
 
+if(ENABLE_GXM)
+    add_compile_definitions(ENABLE_GXM)
+endif()
 if(ENABLE_SOFTWARE_RENDERER)
     add_compile_definitions(ENABLE_SOFTWARE_RENDERER)
 endif()
@@ -207,8 +210,16 @@ if (ENABLE_QT) # Or any other hypothetical future frontends
     add_subdirectory(citra_meta)
 endif()
 
+if (ENABLE_SDL2 AND NOT ENABLE_LIBRETRO)
+    add_subdirectory(citra_sdl)
+endif()
+
 if (ENABLE_LIBRETRO)
     add_subdirectory(citra_libretro)
+endif()
+
+if (VITA)
+    add_subdirectory(citra_vita)
 endif()
 
 if (ENABLE_ROOM)
