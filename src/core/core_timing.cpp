@@ -77,14 +77,13 @@ void Timing::ScheduleEvent(s64 cycles_into_future, const TimingEventType* event_
     }
 
     if (thread_safe_mode) {
-        // Events scheduled in thread safe mode come after blocking operations with
-        // unpredictable timings in the host machine, so there is no need to be cycle accurate.
-        // To prevent the event from scheduling before the next advance(), we set a minimum time
-        // of MAX_SLICE_LENGTH * 2 cycles into the future.
-        cycles_into_future = std::max(static_cast<s64>(MAX_SLICE_LENGTH * 2), cycles_into_future);
-
-        timer->ts_queue.Push(Event{static_cast<s64>(timer->GetTicks() + cycles_into_future), 0,
-                                   user_data, event_type});
+        // The tick count of another thread's timer cannot be read here, so the delay travels with
+        // the event and MoveEvents() turns it into an absolute time on the owning thread. That is
+        // what lets it be honoured as written: this used to be floored at MAX_SLICE_LENGTH * 2
+        // cycles, 8.55 ms of emulated time, so that an absolute time computed from a racily read
+        // tick count could not land in the past.
+        timer->ts_queue.Push(
+            Event{std::max<s64>(0, cycles_into_future), 0, user_data, event_type, true});
     } else {
         s64 timeout = timer->GetTicks() + cycles_into_future;
         if (current_timer == timer) {
@@ -193,6 +192,11 @@ void Timing::Timer::ForceExceptionCheck(s64 cycles) {
 
 void Timing::Timer::MoveEvents() {
     for (Event ev; ts_queue.Pop(ev);) {
+        if (ev.relative) {
+            // Safe here: this runs on the thread that owns the timer.
+            ev.time += static_cast<s64>(GetTicks());
+            ev.relative = false;
+        }
         ev.fifo_order = event_fifo_id++;
         event_queue.emplace_back(std::move(ev));
         std::push_heap(event_queue.begin(), event_queue.end(), std::greater<>());

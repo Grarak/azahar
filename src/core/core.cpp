@@ -7,7 +7,9 @@
 #include <boost/serialization/array.hpp>
 #include "audio_core/dsp_interface.h"
 #include "audio_core/hle/hle.h"
+#ifdef ENABLE_DSP_LLE
 #include "audio_core/lle/lle.h"
+#endif
 #include "common/arch.h"
 #include "common/logging/log.h"
 #include "common/settings.h"
@@ -20,10 +22,17 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #endif
 #include "core/arm/dyncom/arm_dyncom.h"
+#ifdef CITRA_HAS_NATIVE_ARM
+#include "core/arm/native/arm_native.h"
+#endif
+#ifdef CITRA_HAS_VITA_NATIVE
+#include "core/arm/vita/arm_vita_native.h"
+#endif
 #include "core/cheats/cheats.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/dumping/backend.h"
+#include "core/frontend/emu_window.h"
 #include "core/file_sys/ncch_container.h"
 #include "core/frontend/image_interface.h"
 #ifdef ENABLE_GDBSTUB
@@ -80,6 +89,54 @@ System::System() : movie{*this}, cheat_engine{*this} {}
 
 System::~System() = default;
 
+namespace {
+
+/**
+ * Holds the GL context on the calling thread for the duration of a serialization.
+ *
+ * Serializing touches the renderer on both sides: a load rebuilds the whole System, and with it
+ * the renderer, whose constructor queries the driver strings; a save flushes every cached
+ * surface back to guest RAM, which reads them back off the GPU. The render thread owns the
+ * context, so unless it is stopped and the context taken here, those calls run with no context
+ * current - the queries return null and crash, and the readbacks return uninitialized memory
+ * that lands in guest RAM. No-op under the software renderer, which has no context.
+ *
+ * The debug port's syncsave/syncload do the same handover for the same reason.
+ */
+class ScopedRenderContext {
+public:
+    explicit ScopedRenderContext(VideoCore::GPU& gpu_, Frontend::EmuWindow* window_)
+        : gpu{gpu_}, window{window_}, was_running{gpu_.RenderThreadRunning()} {
+        // Take the context unconditionally. The render thread owning it is only one of the
+        // ways it can be absent here: with the render thread stopped nobody holds it at all,
+        // which is just as fatal, and is the case --loadstate hits before the thread starts.
+        if (was_running) {
+            gpu.StopRenderThread();
+        }
+        if (window != nullptr) {
+            window->MakeCurrent();
+        }
+    }
+
+    ~ScopedRenderContext() {
+        // Only give it back if it was taken from the render thread; otherwise the calling
+        // thread is its natural owner and releasing it would strand the next caller.
+        if (was_running) {
+            if (window != nullptr) {
+                window->DoneCurrent();
+            }
+            gpu.StartRenderThread();
+        }
+    }
+
+private:
+    VideoCore::GPU& gpu;
+    Frontend::EmuWindow* window;
+    bool was_running;
+};
+
+} // namespace
+
 System::ResultStatus System::RunLoop(bool tight_loop) {
     status = ResultStatus::Success;
     if (!IsPoweredOn()) {
@@ -120,6 +177,11 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
     case Signal::Shutdown:
         return ResultStatus::ShutdownRequested;
     case Signal::Load: {
+        if (gpu != nullptr && gpu->RenderThreadRunning()) {
+            LOG_ERROR(Core, "Save states are not supported while the GPU render thread is active");
+            status_details = "Save states are unavailable with the GPU thread";
+            return ResultStatus::ErrorSavestate;
+        }
         if (save_state_request_status != SaveStateStatus::NONE) {
             LOG_ERROR(Core, "A pending save state operation has not finished yet");
             status_details = "A pending save state operation has not finished yet";
@@ -135,7 +197,8 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
             status_details = "Failed to load savestate";
             return ResultStatus::ErrorSavestate;
         }
-        if (info.status == Core::SaveStateInfo::ValidationStatus::BuildMismatch) {
+        if (!load_state_any_build &&
+            info.status == Core::SaveStateInfo::ValidationStatus::BuildMismatch) {
             status_details = info.build_name;
             return ResultStatus::ErrorSavestateBuildMismatch;
         }
@@ -145,6 +208,11 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         break;
     }
     case Signal::Save: {
+        if (gpu != nullptr && gpu->RenderThreadRunning()) {
+            LOG_ERROR(Core, "Save states are not supported while the GPU render thread is active");
+            status_details = "Save states are unavailable with the GPU thread";
+            return ResultStatus::ErrorSavestate;
+        }
         if (save_state_request_status != SaveStateStatus::NONE) {
             LOG_ERROR(Core, "A pending save state operation has not finished yet");
             status_details = "A pending save state operation has not finished yet";
@@ -165,6 +233,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         save_state_request_status = SaveStateStatus::NONE;
         LOG_INFO(Core, "Begin load of slot {}", slot);
         try {
+            // Loading destroys and rebuilds the renderer, so GPU() names a different object
+            // afterwards; the guard restarts the render thread on whichever one is current.
+            ScopedRenderContext context{GPU(), m_emu_window};
             System::LoadState(slot);
             LOG_INFO(Core, "Load completed");
         } catch (const std::exception& e) {
@@ -180,6 +251,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
         const u32 slot = save_state_slot;
         LOG_INFO(Core, "Begin save to slot {}", slot);
         try {
+            ScopedRenderContext context{GPU(), m_emu_window};
             System::SaveState(slot);
             LOG_INFO(Core, "Save completed");
         } catch (const std::exception& e) {
@@ -338,9 +410,8 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
         system_mem_mode = static_cast<Kernel::MemoryMode>(m_mem_mode.value());
         m_mem_mode = {};
     } else {
-        // Use default memory mode based on the n3ds setting
-        system_mem_mode = Settings::values.is_new_3ds.GetValue() ? Kernel::MemoryMode::NewProd
-                                                                 : Kernel::MemoryMode::Prod;
+        // Only the Old 3DS is emulated.
+        system_mem_mode = Kernel::MemoryMode::Prod;
         used_default_mem_mode = true;
     }
 
@@ -372,7 +443,7 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     ASSERT(n3ds_hw_caps.first);
     app_n3ds_hw_capabilities = n3ds_hw_caps.first.value();
 
-    if (!Settings::values.is_new_3ds.GetValue() && app_loader->IsN3DSExclusive()) {
+    if (app_loader->IsN3DSExclusive()) {
         return ResultStatus::ErrorN3DSApplication;
     }
 
@@ -398,10 +469,8 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
         }
     }
 
-    u32 num_cores = 2;
-    if (Settings::values.is_new_3ds) {
-        num_cores = 4;
-    }
+    // The Old 3DS has two application cores; the New 3DS's four are not emulated.
+    const u32 num_cores = 2;
     ResultStatus init_result{Init(emu_window, secondary_window, system_mem_mode, num_cores)};
     if (init_result != ResultStatus::Success) {
         LOG_CRITICAL(Core, "Failed to initialize system (Error {})!",
@@ -466,8 +535,15 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
                   static_cast<u32>(load_result));
     }
 
+#if defined(__vita__)
+    // Cheats are off on the Vita build: every cheat write goes through
+    // InvalidateCacheRange, which on the native core is a kernel round trip that cleans the
+    // page and drops core 2's icache, once a frame per cheat line (2026-09-05).
+    LOG_INFO(Core, "cheats are disabled on this build");
+#else
     cheat_engine.LoadCheatFile(title_id);
     cheat_engine.Connect(process->process_id);
+#endif
 
     perf_stats = std::make_unique<PerfStats>(title_id);
 
@@ -532,6 +608,46 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
 
     exclusive_monitor = MakeExclusiveMonitor(*memory, num_cores);
     cpu_cores.reserve(num_cores);
+
+#ifdef CITRA_HAS_NATIVE_ARM
+    // On a 32-bit ARM host the guest's own instructions are host instructions, so they are executed
+    // directly rather than interpreted or recompiled. Both emulated cores share one address space
+    // and one host thread, so both can run this way against a single address space mirror.
+    // Turning the JIT setting off asks for the interpreter here as it does everywhere else, which
+    // is how a picture drawn over native execution is compared against one drawn over the
+    // interpreter on the same host.
+    if (auto mirror = Settings::values.use_cpu_jit ? ARM_Native::CreateMirror(*memory) : nullptr) {
+        for (u32 i = 0; i < num_cores; ++i) {
+            cpu_cores.push_back(
+                std::make_shared<ARM_Native>(*this, *memory, i, timing->GetTimer(i), mirror));
+        }
+        LOG_INFO(Core, "Executing guest code natively on {} core(s)", num_cores);
+    } else {
+        LOG_WARNING(Core, "Native execution unavailable; falling back to interpretation");
+    }
+#endif
+
+#ifdef CITRA_HAS_VITA_NATIVE
+    // The PS Vita: guest code on a core taken from the Vita's kernel, through the azahar-native module.
+    // This is the backend on hardware — interpreting a 3DS on a 444 MHz A9 is unusable. It needs
+    // the module, so it is exactly what is missing under the Vita3K emulator, where the graphics
+    // work is debugged; there the interpreter runs instead, slowly but on a host with cores to
+    // spare. On hardware a missing module means the user did not install it, so say so loudly.
+    if (auto map = ARM_VitaNative::CreateMap(*memory)) {
+        for (u32 i = 0; i < num_cores; ++i) {
+            cpu_cores.push_back(std::make_shared<ARM_VitaNative>(*this, *memory, i,
+                                                                 timing->GetTimer(i), map));
+        }
+        LOG_INFO(Core, "Executing guest code natively on the taken Vita core ({} guest core(s))",
+                 num_cores);
+    } else {
+        LOG_CRITICAL(Core, "Vita native execution unavailable: the azahar-native kernel module is not "
+                           "loaded, or core {} could not be taken - interpreting instead, which "
+                           "is only usable under an emulated Vita", 2);
+    }
+#endif
+    if (cpu_cores.empty()) {
+#ifndef CITRA_HAS_VITA_NATIVE
     if (Settings::values.use_cpu_jit) {
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
         for (u32 i = 0; i < num_cores; ++i) {
@@ -551,18 +667,34 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
                 std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i, timing->GetTimer(i)));
         }
     }
+#else
+        for (u32 i = 0; i < num_cores; ++i) {
+            cpu_cores.push_back(
+                std::make_shared<ARM_DynCom>(*this, *memory, USER32MODE, i, timing->GetTimer(i)));
+        }
+#endif // CITRA_HAS_VITA_NATIVE
+    }
     running_core = cpu_cores[0].get();
 
     kernel->SetCPUs(cpu_cores);
     kernel->SetRunningCPU(cpu_cores[0].get());
 
     const auto audio_emulation = Settings::values.audio_emulation.GetValue();
+#ifdef ENABLE_DSP_LLE
     if (audio_emulation == Settings::AudioEmulation::HLE) {
         dsp_core = std::make_unique<AudioCore::DspHle>(*this);
     } else {
         const bool multithread = audio_emulation == Settings::AudioEmulation::LLEMultithreaded;
         dsp_core = std::make_unique<AudioCore::DspLle>(*this, multithread);
     }
+#else
+    // Built without the LLE backend (see ENABLE_DSP_LLE): the setting still exists in saved
+    // configurations, so honour it by falling back rather than failing to boot.
+    if (audio_emulation != Settings::AudioEmulation::HLE) {
+        LOG_WARNING(Core, "This build has no LLE DSP; using the HLE DSP instead");
+    }
+    dsp_core = std::make_unique<AudioCore::DspHle>(*this);
+#endif
 
     dsp_core->SetSink(Settings::values.output_type.GetValue(),
                       Settings::values.output_device.GetValue());
@@ -592,6 +724,11 @@ System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,
     custom_tex_manager = std::make_unique<VideoCore::CustomTexManager>(*this);
 
     auto gsp = service_manager->GetService<Service::GSP::GSP_GPU>("gsp::Gpu");
+    // Free the old one first. Assigning over it constructs the replacement while it is still
+    // alive, so both renderers hold their GL resources at once - two vertex rings, two texture
+    // caches - and on a modest GPU the second allocation simply fails. That is what a state
+    // load, which re-enters Init, used to hit.
+    gpu.reset();
     gpu = std::make_unique<VideoCore::GPU>(*this, emu_window, secondary_window);
     gpu->SetInterruptHandler([gsp](Service::GSP::InterruptId interrupt_id, u64 wait_delay_ns) {
         gsp->SignalInterrupt(interrupt_id, wait_delay_ns);
@@ -700,12 +837,21 @@ void System::RegisterImageInterface(std::shared_ptr<Frontend::ImageInterface> im
     registered_image_interface = std::move(image_interface);
 }
 
+// Milestones of a state load, printed at info level: a load that stops without an error
+// (Vita3K, 2026-09-07) needs to say where. Cheap: one line per section.
+static void SavestateTrace(const char* what) {
+    LOG_INFO(Core, "savestate: {}", what);
+}
+
 void System::Shutdown(bool is_deserializing) {
 
     // Shutdown emulation session
     is_powered_on = false;
 
     gpu.reset();
+    if (is_deserializing) {
+        SavestateTrace("gpu down");
+    }
     if (!is_deserializing) {
         lle_modules.clear();
 #ifdef ENABLE_GDBSTUB
@@ -715,27 +861,53 @@ void System::Shutdown(bool is_deserializing) {
         app_loader.reset();
     }
     custom_tex_manager.reset();
+    if (is_deserializing) {
+        SavestateTrace("custom textures down");
+    }
 #ifdef ENABLE_SCRIPTING
     rpc_server.reset();
 #endif
     archive_manager.reset();
+    if (is_deserializing) {
+        SavestateTrace("archives down");
+    }
     service_manager.reset();
+    if (is_deserializing) {
+        SavestateTrace("services down");
+    }
     dsp_core.reset();
+    if (is_deserializing) {
+        SavestateTrace("dsp down");
+    }
     kernel.reset();
+    if (is_deserializing) {
+        SavestateTrace("kernel down");
+    }
     cpu_cores.clear();
+    if (is_deserializing) {
+        SavestateTrace("cpu cores down");
+    }
     exclusive_monitor.reset();
     timing.reset();
+    if (is_deserializing) {
+        SavestateTrace("timing down");
+    }
 
     if (video_dumper && video_dumper->IsDumping()) {
         video_dumper->StopDumping();
     }
 
+#ifdef ENABLE_ROOM
     if (auto room_member = Network::GetRoomMember().lock()) {
         Network::GameInfo game_info{};
         room_member->SendGameInfo(game_info);
     }
+#endif
 
     memory.reset();
+    if (is_deserializing) {
+        SavestateTrace("memory down");
+    }
 
     SetInfoLEDColor({});
 
@@ -893,21 +1065,34 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     if (Archive::is_loading::value) {
         // When loading, we want to make sure any lingering state gets cleared out before we begin.
         // Shutdown, but persist a few things between loads...
+        SavestateTrace("shutting down for the load");
         Shutdown(true);
+        SavestateTrace("re-initialising");
 
         [[maybe_unused]] const System::ResultStatus result =
             Init(*m_emu_window, m_secondary_window, mem_mode, num_cores);
+        SavestateTrace("re-initialised");
     }
 
-    // Flush on save, don't flush on load
-    const bool should_flush = !Archive::is_loading::value;
+    // Flush on save, don't flush on load - but only where the cache knows what the guest has
+    // written since. With page marking off (the render thread runs; the native CPU traps no
+    // stores) a dirty region can be a render target the guest has long since reused for its
+    // own data, and writing those pixels back over it crashed Smash the instant after "Save
+    // completed" (a null pointer read out of a written-back surface, 2026-09-07). The state
+    // then holds what guest memory holds; GPU-only content is redrawn or reloaded after a
+    // load, as it is after any invalidation.
+    const bool should_flush = !Archive::is_loading::value && memory->RasterizerCacheMarkingEnabled();
     gpu->ClearAll(should_flush);
+    SavestateTrace("cleared");
     ar&* timing.get();
+    SavestateTrace("timing");
     for (u32 i = 0; i < num_cores; i++) {
         ar&* cpu_cores[i].get();
     }
     ar&* service_manager.get();
+    SavestateTrace("services");
     ar&* archive_manager.get();
+    SavestateTrace("archives");
 
     // NOTE: DSP doesn't like being destroyed and recreated. So instead we do an inline
     // serialization; this means that the DSP Settings need to match for loading to work.
@@ -919,9 +1104,13 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
     }
 
     ar&* memory.get();
+    SavestateTrace("memory");
     ar&* kernel.get();
+    SavestateTrace("kernel");
     ar&* gpu.get();
+    SavestateTrace("gpu");
     ar & movie;
+    SavestateTrace("movie");
 
     // This needs to be set from somewhere - might as well be here!
     if (Archive::is_loading::value) {
@@ -951,7 +1140,7 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
                 const std::shared_ptr<Kernel::Process> process = thread->owner_process.lock();
                 if (process) {
                     gpu->ApplyPerProgramSettings(process->codeset->program_id);
-                    gpu->Renderer().Rasterizer()->SwitchDiskResources(process->codeset->program_id);
+                    gpu->SwitchDiskResources(process->codeset->program_id);
                 }
             }
         }

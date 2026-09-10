@@ -147,6 +147,18 @@ public:
         u64 fifo_order;
         std::uintptr_t user_data;
         const TimingEventType* type;
+        /**
+         * When set, `time` is a delay from whenever the owning timer next picks the event up
+         * rather than an absolute tick.
+         *
+         * Only the owning thread can read a timer's tick count safely, so a thread scheduling an
+         * event from elsewhere used to be given a fixed floor of MAX_SLICE_LENGTH * 2 cycles -
+         * 8.55 ms of emulated time - purely so its absolute time could not land in the past. That
+         * floor is paid by whatever the event represents, which for the software renderer's
+         * completion interrupts is more than half a 60 Hz frame on every single one. Deferring
+         * the conversion to MoveEvents(), which runs on the owning thread, needs no floor.
+         */
+        bool relative = false;
 
         bool operator>(const Event& right) const;
         bool operator<(const Event& right) const;

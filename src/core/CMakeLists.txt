@@ -1,17 +1,6 @@
 add_library(citra_core STATIC EXCLUDE_FROM_ALL
     3ds.h
     arm/arm_interface.h
-    arm/dyncom/arm_dyncom.cpp
-    arm/dyncom/arm_dyncom.h
-    arm/dyncom/arm_dyncom_dec.cpp
-    arm/dyncom/arm_dyncom_dec.h
-    arm/dyncom/arm_dyncom_interpreter.cpp
-    arm/dyncom/arm_dyncom_interpreter.h
-    arm/dyncom/arm_dyncom_run.h
-    arm/dyncom/arm_dyncom_thumb.cpp
-    arm/dyncom/arm_dyncom_thumb.h
-    arm/dyncom/arm_dyncom_trans.cpp
-    arm/dyncom/arm_dyncom_trans.h
     arm/exclusive_monitor.cpp
     arm/exclusive_monitor.h
     arm/skyeye_common/arm_regformat.h
@@ -468,8 +457,7 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     hw/y2r.h
     loader/3dsx.cpp
     loader/3dsx.h
-    loader/artic.cpp
-    loader/artic.h
+    $<$<BOOL:${ENABLE_ARTIC}>:loader/artic.cpp loader/artic.h>
     loader/elf.cpp
     loader/elf.h
     loader/loader.cpp
@@ -480,6 +468,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     loader/smdh.h
     memory.cpp
     memory.h
+    guest_write_tracker.cpp
+    guest_write_tracker.h
     movie.cpp
     movie.h
     nus_download.cpp
@@ -503,7 +493,13 @@ endif()
 create_target_directory_groups(citra_core)
 
 target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core)
-target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib)
+if (ENABLE_ARTIC)
+    target_compile_definitions(citra_core PUBLIC ENABLE_ARTIC)
+endif()
+if (ENABLE_ROOM)
+    target_compile_definitions(citra_core PUBLIC ENABLE_ROOM)
+endif()
+target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib zstd)
 target_link_libraries(citra_core PUBLIC dds-ktx PRIVATE cryptopp fmt lodepng open_source_archives)
 
 if (ENABLE_WEB_SERVICE)
@@ -532,6 +528,104 @@ if (ENABLE_GDBSTUB)
         gdbstub/hio.cpp
         gdbstub/hio.h
     )
+endif()
+
+# Native execution of guest ARM code, for 32-bit ARM hosts where guest instructions are host
+# instructions. No recompiler and no interpreter: see arm/native/arm_native.h.
+if ("arm" IN_LIST ARCHITECTURE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(citra_core PRIVATE
+        arm/native/arm_native.cpp
+        arm/native/arm_native.h
+        arm/native/native_entry.S
+        arm/native/native_executor.cpp
+        arm/native/native_executor.h
+        arm/native/native_mirror.cpp
+        arm/native/native_mirror.h
+    )
+    target_compile_definitions(citra_core PUBLIC -DCITRA_HAS_NATIVE_ARM)
+    set(CITRA_HAS_NATIVE_ARM ON PARENT_SCOPE)
+    set_source_files_properties(arm/native/native_entry.S PROPERTIES LANGUAGE ASM)
+    target_link_libraries(citra_core PRIVATE rt)
+endif()
+
+# The dyncom interpreter is the universal fallback CPU. On the PS Vita the native backend is
+# the whole point and interpreting a 3DS on a 444 MHz A9 is unusable, so it is never chosen on
+# hardware — but it is built there anyway, because it is the only backend that runs under the
+# Vita3K emulator, which cannot host the azahar-native kernel module (nor any self-modifying code).
+target_sources(citra_core PRIVATE
+        arm/dyncom/arm_dyncom.cpp
+        arm/dyncom/arm_dyncom.h
+        arm/dyncom/arm_dyncom_dec.cpp
+        arm/dyncom/arm_dyncom_dec.h
+        arm/dyncom/arm_dyncom_interpreter.cpp
+        arm/dyncom/arm_dyncom_interpreter.h
+        arm/dyncom/arm_dyncom_run.h
+        arm/dyncom/arm_dyncom_thumb.cpp
+        arm/dyncom/arm_dyncom_thumb.h
+        arm/dyncom/arm_dyncom_trans.cpp
+        arm/dyncom/arm_dyncom_trans.h
+)
+
+include(ExternalProject)
+
+# Native execution on the PS Vita: guest code on a core taken from the Vita's kernel, through
+# the kernel module in vita_native/. See arm/vita/arm_vita_native.h and DEVELOPMENT.md.
+if (VITA)
+    target_sources(citra_core PRIVATE
+        arm/vita/arm_vita_native.cpp
+        arm/vita/arm_vita_native.h
+    )
+    target_compile_definitions(citra_core PUBLIC -DCITRA_HAS_VITA_NATIVE)
+    # The module's ABI header, included from the module rather than copied here: the two halves
+    # of one interface, and a copy is a thing that drifts.
+    target_include_directories(citra_core PUBLIC "${CMAKE_SOURCE_DIR}/vita_native/src")
+
+    # The module cannot be a subdirectory of this build: it is a kernel plugin and needs
+    # vitasdk's own gcc toolchain, where the emulator is built with clang against a different
+    # sysroot. So it is a sub-build, driven from here so that a checkout produces both halves
+    # without being told to, and so that editing the module relinks the emulator.
+    #
+    # BUILD_ALWAYS is on because ExternalProject otherwise stamps its build step and never
+    # notices a source change; the sub-build is four files and its own no-op costs a second.
+    # BUILD_BYPRODUCTS is what tells Ninja which file the step produces, without which the
+    # link below has no rule to make it and the build stops on a bare missing-file error.
+    if (NOT VITA_NATIVE_STUB_DIR)
+        if (NOT DEFINED ENV{VITASDK})
+            message(FATAL_ERROR
+                "VITASDK is not set, so the kernel module in vita_native/ cannot be built. "
+                "Set it, or point VITA_NATIVE_STUB_DIR at a directory that already holds "
+                "libazaharnative_stub.a.")
+        endif()
+        set(VITA_NATIVE_BINARY_DIR "${CMAKE_BINARY_DIR}/vita_native")
+        set(VITA_NATIVE_STUB_DIR "${VITA_NATIVE_BINARY_DIR}/stubs")
+        ExternalProject_Add(vita_native_module
+            SOURCE_DIR "${CMAKE_SOURCE_DIR}/vita_native"
+            BINARY_DIR "${VITA_NATIVE_BINARY_DIR}"
+            CMAKE_ARGS
+                "-DCMAKE_TOOLCHAIN_FILE=$ENV{VITASDK}/share/vita.toolchain.cmake"
+                "-DCMAKE_BUILD_TYPE=Release"
+            BUILD_ALWAYS 1
+            INSTALL_COMMAND ""
+            BUILD_BYPRODUCTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a"
+        )
+        add_dependencies(citra_core vita_native_module)
+    endif()
+    # A build directory configured before the module moved into the tree has the old path
+    # cached, and the cache wins, so it would quietly go on pointing at a stub that is no
+    # longer there - or worse, one that is. Say so rather than failing at link time.
+    if (NOT EXISTS "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a"
+        AND NOT TARGET vita_native_module)
+        message(FATAL_ERROR
+            "VITA_NATIVE_STUB_DIR is set to ${VITA_NATIVE_STUB_DIR}, which holds no "
+            "libazaharnative_stub.a. If this is a build directory from before the module "
+            "moved into vita_native/, clear the entry to build it from the tree:\n"
+            "  cmake -U VITA_NATIVE_STUB_DIR -B <build dir>")
+    endif()
+    # An imported target rather than a bare path, so the dependency travels with the link.
+    add_library(azaharnative_stub STATIC IMPORTED GLOBAL)
+    set_target_properties(azaharnative_stub PROPERTIES
+        IMPORTED_LOCATION "${VITA_NATIVE_STUB_DIR}/libazaharnative_stub.a")
+    target_link_libraries(citra_core PUBLIC azaharnative_stub)
 endif()
 
 if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)

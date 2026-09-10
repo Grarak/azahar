@@ -228,6 +228,15 @@ public:
         }
     }
 
+    /// Drops every core's instruction cache. Needed when guest code has been rewritten somewhere
+    /// this side cannot name a range for - CRO linking patches call sites across every module that
+    /// imports from the one being linked, not just the module itself.
+    void ClearInstructionCache() {
+        for (const auto& cpu : cpu_cores) {
+            cpu->ClearInstructionCache();
+        }
+    }
+
     /**
      * Gets a reference to the emulated DSP.
      * @returns A reference to the emulated DSP.
@@ -364,9 +373,24 @@ public:
         return save_state_status;
     }
 
+    /// A save or load signalled but not yet run: RunLoop performs it once the kernel has no
+    /// asynchronous operation pending, which can take many iterations early in a boot.
+    bool IsSaveStateRequestPending() const {
+        return save_state_request_status != SaveStateStatus::NONE;
+    }
+
+    /// Accept a state saved by another build of the same serialization layout (the Vita
+    /// autoload restores states the pi5 harness saved; every commit changes the revision).
+    void SetLoadStateAnyBuild(bool accept) {
+        load_state_any_build = accept;
+    }
+
     void SaveState(u32 slot) const;
 
     void LoadState(u32 slot);
+
+    /// Restores what deserializing a save state cannot; see the definition.
+    void AfterStateLoaded();
 
     std::vector<u8> SaveStateBuffer() const;
 
@@ -504,6 +528,7 @@ private:
 
     SaveStateStatus save_state_status = SaveStateStatus::NONE;
     SaveStateStatus save_state_request_status = SaveStateStatus::NONE;
+    bool load_state_any_build = false;
     u32 save_state_slot = 0;
     std::chrono::steady_clock::time_point save_state_request_time{};
 
