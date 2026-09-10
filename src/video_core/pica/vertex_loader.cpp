@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstring>
+#include <algorithm>
 #include "common/alignment.h"
 #include "common/logging/log.h"
 #include "video_core/pica/vertex_loader.h"
@@ -41,6 +43,10 @@ VertexLoader::VertexLoader(Memory::MemorySystem& memory_, const PipelineRegs& re
                 vertex_attribute_sources[attribute_index] = loader_config.data_offset + offset;
                 vertex_attribute_strides[attribute_index] =
                     static_cast<u32>(loader_config.byte_count);
+                vertex_attribute_loader[attribute_index] = static_cast<u8>(loader);
+                loader_data_offset[loader] = loader_config.data_offset;
+                loader_byte_count[loader] = static_cast<u32>(loader_config.byte_count);
+                loader_used[loader] = true;
                 vertex_attribute_formats[attribute_index] =
                     attribute_config.GetFormat(attribute_index);
                 vertex_attribute_elements[attribute_index] =
@@ -61,7 +67,122 @@ VertexLoader::VertexLoader(Memory::MemorySystem& memory_, const PipelineRegs& re
 
 VertexLoader::~VertexLoader() = default;
 
-void VertexLoader::LoadVertex(PAddr base_address, u32 index, u32 vertex, AttributeBuffer& input,
+DrawArenaLayout VertexLoader::ComputeArenaLayout(u32 min_vertex, u32 max_vertex,
+                                                 u32 index_bytes, bool ring) const {
+    // A loader with byte_count 0 is a constant stream: every vertex reads the same bytes, so it
+    // occupies one fixed-size cell. Must match CopyIntoArena's layout exactly.
+    constexpr u32 ZERO_STRIDE_BYTES = 64;
+    DrawArenaLayout layout;
+    layout.ring = ring;
+    for (u32 loader = 0; loader < 12; ++loader) {
+        if (!loader_used[loader]) {
+            continue;
+        }
+        layout.used_mask |= static_cast<u16>(1u << loader);
+        if (loader_byte_count[loader] == 0) {
+            layout.zero_stride = true;
+        }
+        if (ring) {
+            layout.total = Common::AlignUp(layout.total, 16u);
+        }
+        layout.loader_offset[loader] = layout.total;
+        layout.total += loader_byte_count[loader] == 0
+                            ? ZERO_STRIDE_BYTES
+                            : (max_vertex - min_vertex + 1) * loader_byte_count[loader];
+    }
+    if (ring) {
+        layout.total = Common::AlignUp(layout.total, 16u);
+    }
+    layout.index_offset = layout.total;
+    layout.total += index_bytes;
+    if (ring) {
+        layout.total = Common::AlignUp(std::max(layout.total, 1u),
+                                       static_cast<u32>(sizeof(OutputVertex)));
+    }
+    return layout;
+}
+
+void VertexLoader::WriteRingIndices(u8* dst, const u8* src, bool index_u16, u32 count,
+                                    u32 min_vertex) {
+    u16* const out = reinterpret_cast<u16*>(dst);
+    if (index_u16) {
+        const u16* const in = reinterpret_cast<const u16*>(src);
+        for (u32 n = 0; n < count; n++) {
+            out[n] = static_cast<u16>(in[n] - min_vertex);
+        }
+    } else {
+        for (u32 n = 0; n < count; n++) {
+            out[n] = static_cast<u16>(src[n] - min_vertex);
+        }
+    }
+}
+
+void VertexLoader::CopyIntoArena(PAddr base_address, u32 min_vertex, u32 max_vertex,
+                                 const DrawArenaLayout& layout, u8* dst) const {
+    constexpr u32 ZERO_STRIDE_BYTES = 64;
+    for (u32 loader = 0; loader < 12; ++loader) {
+        if (!loader_used[loader]) {
+            continue;
+        }
+        const PAddr start =
+            base_address + loader_data_offset[loader] + min_vertex * loader_byte_count[loader];
+        u32 bytes = loader_byte_count[loader] == 0
+                        ? ZERO_STRIDE_BYTES
+                        : (max_vertex - min_vertex + 1) * loader_byte_count[loader];
+        const u8* const src = memory.GetPhysicalPointer(start);
+        if (src == nullptr) {
+            std::memset(dst + layout.loader_offset[loader], 0, bytes);
+            continue;
+        }
+        // Clamp to the end of the physical region so a buffer straddling the region tail cannot
+        // read past the mapping; the hardware would have wrapped or read garbage there anyway.
+        const auto region = memory.GetPhysMemRegionInfo(start);
+        if (region.valid()) {
+            bytes = std::min<u64>(bytes, region.region_end - start);
+        }
+        std::memcpy(dst + layout.loader_offset[loader], src, bytes);
+    }
+}
+
+void VertexLoader::AttachArena(const u8* arena, const DrawArenaLayout& layout, u32 min_vertex) {
+    for (s32 i = 0; i < num_total_attributes; ++i) {
+        if (vertex_attribute_is_default[i]) {
+            continue;
+        }
+        const u32 loader = vertex_attribute_loader[i];
+        const u32 within_loader = vertex_attribute_sources[i] - loader_data_offset[loader];
+        // Biased by -min_vertex*stride so lookups use the absolute vertex id.
+        vertex_attribute_data[i] = arena + layout.loader_offset[loader] + within_loader -
+                                   min_vertex * vertex_attribute_strides[i];
+    }
+}
+
+void VertexLoader::Rebase(PAddr base_address) {
+    std::array<const u8*, 12> loader_host{};
+    for (u32 loader = 0; loader < 12; ++loader) {
+        if (loader_used[loader] && loader_byte_count[loader] != 0) {
+            loader_host[loader] =
+                memory.GetPhysicalPointer(base_address + loader_data_offset[loader]);
+        }
+    }
+    static constexpr std::array<u8, 64> zeroes{};
+    for (s32 i = 0; i < num_total_attributes; ++i) {
+        if (vertex_attribute_is_default[i]) {
+            continue;
+        }
+        const u32 loader = vertex_attribute_loader[i];
+        const u8* const host = loader_host[loader];
+        if (host == nullptr) {
+            // Invalid base: read zeroes, with a stride of zero folded in by pointing every
+            // vertex at the same block.
+            vertex_attribute_data[i] = zeroes.data();
+            continue;
+        }
+        vertex_attribute_data[i] = host + (vertex_attribute_sources[i] - loader_data_offset[loader]);
+    }
+}
+
+void VertexLoader::LoadVertex(u32 vertex, AttributeBuffer& input,
                               AttributeBuffer& input_default_attributes) const {
     for (s32 i = 0; i < num_total_attributes; ++i) {
         // Load the default attribute if we're configured to do so
@@ -78,22 +199,21 @@ void VertexLoader::LoadVertex(PAddr base_address, u32 index, u32 vertex, Attribu
             continue;
         }
 
-        // Load per-vertex data from the loader arrays
-        const PAddr source_addr =
-            base_address + vertex_attribute_sources[i] + vertex_attribute_strides[i] * vertex;
+        // Per-vertex data comes from the snapshot arena, never from guest memory.
+        const u8* const source = vertex_attribute_data[i] + vertex_attribute_strides[i] * vertex;
 
         switch (vertex_attribute_formats[i]) {
         case PipelineRegs::VertexAttributeFormat::BYTE:
-            LoadAttribute<s8>(source_addr, i, input);
+            LoadAttribute<s8>(source, i, input);
             break;
         case PipelineRegs::VertexAttributeFormat::UBYTE:
-            LoadAttribute<u8>(source_addr, i, input);
+            LoadAttribute<u8>(source, i, input);
             break;
         case PipelineRegs::VertexAttributeFormat::SHORT:
-            LoadAttribute<s16>(source_addr, i, input);
+            LoadAttribute<s16>(source, i, input);
             break;
         case PipelineRegs::VertexAttributeFormat::FLOAT:
-            LoadAttribute<f32>(source_addr, i, input);
+            LoadAttribute<f32>(source, i, input);
             break;
         }
 
