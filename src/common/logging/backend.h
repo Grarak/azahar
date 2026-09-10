@@ -20,9 +20,8 @@ void Initialize(std::string_view log_file = "");
 void LibRetroStart(retro_log_printf_t callback);
 #endif
 
-void Start();
-
-/// Explictily stops the logger thread and flushes the buffers
+/// Flushes and closes the backends. Messages are written as they are logged, so this is only
+/// needed to make sure what has been logged has reached the disk before the process ends.
 void Stop();
 
 void DisableLoggingInTests();

@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <chrono>
+#include <mutex>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/regex.hpp>
 
@@ -15,6 +16,10 @@
 #define _SH_DENYWR 0
 #endif
 
+#ifdef __vita__
+#include <psp2/kernel/clib.h>
+#endif
+
 #ifdef CITRA_LINUX_GCC_BACKTRACE
 #define BOOST_STACKTRACE_USE_BACKTRACE
 #include <boost/stacktrace.hpp>
@@ -22,7 +27,6 @@
 #include <signal.h>
 #endif
 
-#include "common/bounded_threadsafe_queue.h"
 #include "common/common_paths.h"
 #include "common/file_util.h"
 #include "common/literals.h"
@@ -30,7 +34,6 @@
 #include "common/logging/log.h"
 #include "common/logging/log_entry.h"
 #include "common/logging/text_formatter.h"
-#include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "common/thread.h"
@@ -229,6 +232,33 @@ public:
     void EnableForStacktrace() override {}
 };
 
+#ifdef __vita__
+/**
+ * Backend that writes to the PS Vita's debug channel.
+ *
+ * The only backend on that target. A file backend would write to the memory card through the
+ * same emulator that is being debugged, and there is no console attached to write to - the
+ * kernel's own channel, which a logger plugin picks up, reaches a developer either way and needs
+ * nothing from the process beyond the call itself.
+ */
+class VitaBackend final : public Backend {
+public:
+    explicit VitaBackend() = default;
+
+    ~VitaBackend() override = default;
+
+    void Write(const Entry& entry) override {
+        sceClibPrintf("%s\n", FormatLogMessage(entry).c_str());
+    }
+
+    void Flush() override {}
+
+    void Close() override {}
+
+    void EnableForStacktrace() override {}
+};
+#endif
+
 #ifdef ANDROID
 /**
  * Backend that writes to the Android logcat
@@ -302,12 +332,8 @@ public:
         logging_initialized = true;
     }
 
-    static void Start() {
-        instance->StartBackendThread();
-    }
-
     static void Stop() {
-        instance->StopBackendThread();
+        instance->CloseBackends();
     }
 
     Impl(const Impl&) = delete;
@@ -337,8 +363,10 @@ public:
         return filter;
     }
 
-    void SetColorConsoleBackendEnabled(bool enabled) {
+    void SetColorConsoleBackendEnabled([[maybe_unused]] bool enabled) {
+#ifndef __vita__
         color_console_backend.SetEnabled(enabled);
+#endif
     }
 
     void PushEntry(Class log_class, Level log_level, const char* filename, unsigned int line_num,
@@ -349,14 +377,17 @@ public:
             !boost::regex_search(FormatLogMessage(new_entry), regex_filter)) {
             return;
         }
-        if (Settings::values.instant_debug_log.GetValue()) {
-            ForEachBackend([&new_entry](Backend& backend) {
-                backend.Write(new_entry);
+        // Written here, on the thread that logged it. The backends are not safe to enter from
+        // two threads at once - the file backend counts the bytes it has written and the console
+        // one puts a line out in several calls - so one lock covers the whole set of them.
+        const bool flush = Settings::values.instant_debug_log.GetValue();
+        std::scoped_lock lock{writing_mutex};
+        ForEachBackend([&new_entry, flush](Backend& backend) {
+            backend.Write(new_entry);
+            if (flush) {
                 backend.Flush();
-            });
-        } else {
-            message_queue.EmplaceWait(new_entry);
-        }
+            }
+        });
     }
 
     static Entry CreateEntry(Class log_class, Level log_level, const char* filename,
@@ -382,6 +413,10 @@ private:
     Impl(retro_log_printf_t callback, const Filter& filter_)
         : filter{filter_}, file_backend{""}, libretro_backend{callback} {}
 #endif
+#ifdef __vita__
+    Impl([[maybe_unused]] const std::string& file_backend_filename, const Filter& filter_)
+        : filter{filter_} {}
+#else
     Impl(const std::string& file_backend_filename, const Filter& filter_)
         : filter{filter_}, file_backend{file_backend_filename} {
 #ifdef CITRA_LINUX_GCC_BACKTRACE
@@ -394,14 +429,15 @@ private:
         backtrace_done_printing_fd = done_printing_pipefd[0];
         std::thread([this, wait_fd = waker_pipefd[0], done_fd = done_printing_pipefd[1]] {
             Common::SetCurrentThreadName("citra:Crash");
+            Common::SetCurrentThreadRole(Common::ThreadRole::Other);
             for (u8 ignore = 0; read(wait_fd, &ignore, 1) != 1;)
                 ;
             const int sig = received_signal;
             if (sig <= 0) {
                 abort();
             }
-            backend_thread.request_stop();
-            backend_thread.join();
+            // Deliberately without writing_mutex: the thread that faulted may hold it, and a
+            // crash report that deadlocks is worth less than one whose lines interleave.
             const auto signal_entry = CreateEntry(
                 Class::Log, Level::Critical, "?", 0, "?",
                 fmt::vformat("Received signal {}", fmt::make_format_args(sig)), time_origin);
@@ -437,6 +473,7 @@ private:
         signal(SIGABRT, &HandleSignal);
 #endif
     }
+#endif // __vita__
 
     ~Impl() {
 #ifdef CITRA_LINUX_GCC_BACKTRACE
@@ -447,36 +484,8 @@ private:
 #endif
     }
 
-    void StartBackendThread() {
-        backend_thread = std::jthread([this](std::stop_token stop_token) {
-            Common::SetCurrentThreadName("citra:Log");
-            Entry entry;
-            const auto write_logs = [this, &entry]() {
-                ForEachBackend([&entry](Backend& backend) { backend.Write(entry); });
-            };
-            while (!stop_token.stop_requested()) {
-                message_queue.PopWait(entry, stop_token);
-                // Only write the log if something was actually popped (entry.filename != nullptr)
-                // (for example, when the stop token is signaled).
-                if (entry.filename != nullptr) {
-                    write_logs();
-                }
-            }
-            // Drain the logging queue. Only writes out up to MAX_LOGS_TO_WRITE to prevent a
-            // case where a system is repeatedly spamming logs even on close.
-            int max_logs_to_write = filter.IsDebug() ? INT_MAX : 100;
-            while (max_logs_to_write-- && message_queue.TryPop(entry)) {
-                write_logs();
-            }
-        });
-    }
-
-    void StopBackendThread() {
-        backend_thread.request_stop();
-        if (backend_thread.joinable()) {
-            backend_thread.join();
-        }
-
+    void CloseBackends() {
+        std::scoped_lock lock{writing_mutex};
         ForEachBackend([](Backend& backend) {
             backend.Flush();
             backend.Close();
@@ -484,7 +493,9 @@ private:
     }
 
     void ForEachBackend(auto lambda) {
-#ifdef HAVE_LIBRETRO
+#if defined(__vita__)
+        lambda(static_cast<Backend&>(vita_backend));
+#elif defined(HAVE_LIBRETRO)
         lambda(static_cast<Backend&>(libretro_backend));
 #else
         lambda(static_cast<Backend&>(debugger_backend));
@@ -493,7 +504,7 @@ private:
 #ifdef ANDROID
         lambda(static_cast<Backend&>(lc_backend));
 #endif // ANDROID
-#endif // HAVE_LIBRETRO
+#endif
     }
 
     static void Deleter(Impl* ptr) {
@@ -534,6 +545,9 @@ private:
 
     Filter filter;
     boost::regex regex_filter;
+#ifdef __vita__
+    VitaBackend vita_backend{};
+#else
     DebuggerBackend debugger_backend{};
     ColorConsoleBackend color_console_backend{};
     FileBackend file_backend;
@@ -543,10 +557,10 @@ private:
 #ifdef HAVE_LIBRETRO
     LibRetroBackend libretro_backend;
 #endif
+#endif // __vita__
 
-    MPSCQueue<Entry> message_queue{};
+    std::mutex writing_mutex;
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
-    std::jthread backend_thread;
 
 #ifdef CITRA_LINUX_GCC_BACKTRACE
     std::atomic_int received_signal{0};
@@ -560,16 +574,11 @@ private:
 #ifdef HAVE_LIBRETRO
 void LibRetroStart(retro_log_printf_t callback) {
     Impl::Initialize(callback);
-    Impl::Start();
 }
 #endif
 
 void Initialize(std::string_view log_file) {
     Impl::Initialize(log_file.empty() ? LOG_FILE : log_file);
-}
-
-void Start() {
-    Impl::Start();
 }
 
 void Stop() {
