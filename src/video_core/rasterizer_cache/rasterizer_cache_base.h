@@ -10,6 +10,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <array>
 #include <boost/icl/interval_map.hpp>
 #include <tsl/robin_map.h>
 
@@ -96,6 +97,67 @@ public:
     /// Returns a reference to the surface object assigned to surface_id
     Surface& GetSurface(SurfaceId surface_id);
 
+    /// Calls func(surface_id, surface) for every live surface, for a debug dump.
+    template <typename Func>
+    void ForEachSurface(Func&& func) {
+        slot_surfaces.ForEach(std::forward<Func>(func));
+    }
+
+    /// Every cached surface to <dir> as an image plus an index, for looking at what the
+    /// renderer holds. Render thread only: it reads back through the runtime.
+    void DumpSurfaces(const std::string& dir, u32 frame);
+
+    /// The surface whose validation is forcing a flush, for the readback log. Render thread.
+    const Surface* validating_for{};
+
+    /// Surfaces waiting for the garbage collector: unregistered, still holding their memory.
+    [[nodiscard]] std::size_t SentencedCount() const {
+        return sentenced.size();
+    }
+
+    /**
+     * Gives up the surfaces the runtime nominates: each is unregistered and sentenced, and the
+     * garbage collector frees it once the runtime's tick has moved past.
+     *
+     * Nothing else evicts. A surface leaves the cache when the guest writes over its memory,
+     * and this port never sees the guest's writes - the render thread cannot flip page
+     * attributes under the emulation thread, and the native CPU backend traps no stores at
+     * all - so the cache keeps every surface a title ever makes. A desktop driver absorbs
+     * that; a fixed pool of video memory does not.
+     *
+     * The runtime chooses, because only it knows what a surface costs and whether the GPU
+     * still holds it. Call with no scene open and nothing bound.
+     */
+    void SentenceSurfaces(std::span<const SurfaceId> ids);
+
+    /**
+     * Gives up least recently used surfaces until about `want_bytes` of them are sentenced.
+     * `cost(surface)` says what a surface holds, in the runtime's own bytes; `skip(surface)`
+     * names the ones the runtime still needs (targets in flight, what presentation samples).
+     * A surface that owns a dirty region is never a candidate: its pixels exist nowhere
+     * else. Returns how many were sentenced. Call with no scene open and nothing bound.
+     */
+    template <typename CostFn, typename SkipFn>
+    u32 TrimSurfaces(u64 want_bytes, CostFn&& cost, SkipFn&& skip);
+
+    /// Whether `surface_id` owns any dirty region, i.e. holds rendered pixels the guest's
+    /// memory has not received.
+    [[nodiscard]] bool OwnsDirtyRegion(SurfaceId surface_id) const;
+
+    /// Uploads a guest cache flush would have caused that the hash of guest memory proved
+    /// unnecessary. For the backend's stats line, which resets it.
+    u32 guest_flush_hash_skips = 0;
+    /// What the current validation serves (texture, framebuffer): CopySurface logging.
+    const char* validate_reason = "?";
+
+    /// Trace-probe builds: log every surface given up and every reload of one, for a backend
+    /// with no environment to read AZAHAR_TRIM_LOG from.
+    void SetProbeTrimLog([[maybe_unused]] bool enabled) {
+#ifdef CITRA_TRACE_PROBES
+        probe_trim_log = enabled;
+#endif
+    }
+
     /// Returns a reference to the sampler object matching the provided configuration
     Sampler& GetSampler(const Pica::TexturingRegs::TextureConfig& config);
     Sampler& GetSampler(SamplerId sampler_id);
@@ -131,6 +193,11 @@ public:
 
     /// Mark region as being invalidated by region_owner (nullptr if 3DS memory)
     void InvalidateRegion(PAddr addr, u32 size, SurfaceId region_owner = {});
+
+    /// Invalidates the parts of [addr, addr+size) that no surface holds unflushed rendered
+    /// pixels for, byte-exactly. What a guest cache flush of CPU-written data means to a
+    /// renderer that never writes its output back to guest memory.
+    void InvalidateRegionUnlessDirty(PAddr addr, u32 size);
 
     /// Flush all cached resources tracked by this cache manager
     void FlushAll();
@@ -224,6 +291,9 @@ private:
     Common::SlotVector<Surface> slot_surfaces;
     Common::SlotVector<Sampler> slot_samplers;
     Common::SlotVector<Framebuffer> slot_framebuffers;
+    /// The framebuffer the last draw used, so a change of render target can be counted
+    /// (Common::PipelineStats::fb_switches).
+    FramebufferId last_framebuffer{};
     SurfaceMap dirty_regions;
     PageMap cached_pages;
     u32 resolution_scale_factor;
@@ -231,6 +301,16 @@ private:
     Settings::TextureFilter filter;
     bool dump_textures;
     bool use_custom_textures;
+#ifdef CITRA_TRACE_PROBES
+    /// AZAHAR_SURFACE_BUDGET_MB: trim the cache to this many (guest-scaled) bytes each frame,
+    /// on any backend, so eviction can be exercised where memory is not short.
+    u64 probe_budget_bytes = 0;
+    /// AZAHAR_TRIM_LOG: log every surface given up and every reload of an address that was
+    /// given up recently, with what guest memory held at the time.
+    bool probe_trim_log = false;
+    std::array<PAddr, 128> recent_evictions{};
+    u32 recent_eviction_next = 0;
+#endif
 };
 
 } // namespace VideoCore

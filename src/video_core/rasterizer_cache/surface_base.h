@@ -21,10 +21,19 @@ enum class SurfaceFlagBits : u32 {
     Custom = 1 << 3,       ///< Surface texture has been replaced with a custom texture.
     ShadowSource = 1 << 4, ///< Surface is used as a shadow source.
     RenderTarget = 1 << 5, ///< Surface was a render target.
+    /// The guest flushed its CPU cache over the whole surface: its pixels may have changed,
+    /// and a hash of guest memory decides at the next use whether they did.
+    GuestFlushed = 1 << 6,
 };
 DECLARE_ENUM_FLAG_OPERATORS(SurfaceFlagBits);
 
 class SurfaceBase : public SurfaceParams {
+public:
+    /// Readbacks answered from what the last one left in guest memory rather than by draining
+    /// the GPU, and whether a real one has ever run. See RasterizerCache::DownloadSurface.
+    u8 download_skips{};
+    bool ever_downloaded{};
+
 public:
     SurfaceBase(const SurfaceParams& params, const SurfaceFlagBits& initial_flag_bits);
     ~SurfaceBase();
@@ -90,6 +99,16 @@ public:
     u32 fill_size = 0;
     std::array<u8, 4> fill_data{};
     u64 modification_tick = 1;
+    /// Runtime resource tick of the last frame that validated (so used) this surface; the
+    /// least recently used surfaces are what a trim gives up first.
+    u64 last_use_tick = 0;
+    /// Resource tick of the last guest-flush hash check (see InvalidateRegionUnlessDirty).
+    u64 last_hash_tick = 0;
+    /// Hash of the guest bytes the whole surface was last uploaded from, 0 when it never was
+    /// uploaded whole. A guest cache flush over the surface compares against it instead of
+    /// decoding and uploading again: titles flush texture memory every frame whether or not
+    /// they wrote it.
+    u64 upload_hash = 0;
 };
 
 } // namespace VideoCore

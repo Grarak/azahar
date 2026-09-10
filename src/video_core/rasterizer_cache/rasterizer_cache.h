@@ -4,12 +4,17 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdlib>
 #include <type_traits>
 #include <boost/container/small_vector.hpp>
 #include <boost/range/iterator_range.hpp>
 #include "common/alignment.h"
+#include "common/file_util.h"
+#include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
+#include "common/pipeline_stats.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/memory.h"
@@ -42,6 +47,12 @@ RasterizerCache<T>::RasterizerCache(Memory::MemorySystem& memory_,
       dump_textures{Settings::values.dump_textures.GetValue()},
       use_custom_textures{Settings::values.custom_textures.GetValue()} {
     using TextureConfig = Pica::TexturingRegs::TextureConfig;
+#ifdef CITRA_TRACE_PROBES
+    if (const char* budget = std::getenv("AZAHAR_SURFACE_BUDGET_MB")) {
+        probe_budget_bytes = static_cast<u64>(std::strtoul(budget, nullptr, 10)) << 20;
+    }
+    probe_trim_log = std::getenv("AZAHAR_TRIM_LOG") != nullptr;
+#endif
 
     // Create null handles for all cached resources
     void(slot_surfaces.insert(runtime, SurfaceParams{
@@ -104,6 +115,39 @@ template <class T>
 void RasterizerCache<T>::TickFrame() {
     custom_tex_manager.TickFrame();
     RunGarbageCollector();
+#ifdef CITRA_TRACE_PROBES
+    if (probe_budget_bytes != 0) {
+        // A backend-neutral cost: the guest bytes scaled by the resolution factor. Close
+        // enough to drive eviction on a machine that is not short of video memory.
+        const auto cost = [](const Surface& surface) -> u64 {
+            return static_cast<u64>(surface.size) * surface.res_scale * surface.res_scale;
+        };
+        u64 resident = 0;
+        slot_surfaces.ForEach([&](SurfaceId id, const Surface& surface) {
+            if (True(surface.flags & SurfaceFlagBits::Registered)) {
+                const u64 bytes = cost(surface);
+                if (bytes > (64u << 20) && probe_trim_log) {
+                    LOG_INFO(HW_GPU, "trim: surface {} at {:08X} costs {} bytes ({}x{} stride {} "
+                             "scale {} size {} type {})",
+                             id.index, surface.addr, bytes, surface.width, surface.height,
+                             surface.stride, surface.res_scale, surface.size,
+                             static_cast<u32>(surface.type));
+                }
+                resident += bytes;
+            }
+        });
+        u32 trimmed = 0;
+        if (resident > probe_budget_bytes) {
+            trimmed = TrimSurfaces(resident - probe_budget_bytes, cost,
+                                   [](const Surface&) { return false; });
+        }
+        if (probe_trim_log && runtime.GetResourceTick() % 120 == 0) {
+            LOG_INFO(HW_GPU, "trim: tick {} resident {} KiB budget {} KiB, {} sentenced, {} trimmed now",
+                     runtime.GetResourceTick(), resident >> 10, probe_budget_bytes >> 10,
+                     sentenced.size(), trimmed);
+        }
+    }
+#endif
 
     const auto new_filter = Settings::values.texture_filter.GetValue();
     if (filter != new_filter) [[unlikely]] {
@@ -127,14 +171,111 @@ void RasterizerCache<T>::TickFrame() {
 }
 
 template <class T>
+void RasterizerCache<T>::SentenceSurfaces(std::span<const SurfaceId> ids) {
+    for (const SurfaceId id : ids) {
+        const Surface& surface = slot_surfaces[id];
+        if (False(surface.flags & SurfaceFlagBits::Registered)) {
+            continue;
+        }
+        // A surface that owns a dirty region holds pixels that exist nowhere else - the
+        // guest's memory has not been written back - so dropping it would lose them. This is
+        // what makes eviction safe: everything else can be uploaded again from guest memory.
+        if (OwnsDirtyRegion(id)) {
+            continue;
+        }
+#ifdef CITRA_TRACE_PROBES
+        if (probe_trim_log) {
+            LOG_INFO(HW_GPU,
+                     "trim: give up surface {} at {:08X} size {} {}x{} stride {} {} type {} "
+                     "flags {:#x} scale {} last used tick {} of {}",
+                     id.index, surface.addr, surface.size, surface.width, surface.height,
+                     surface.stride, PixelFormatAsString(surface.pixel_format),
+                     static_cast<u32>(surface.type), static_cast<u32>(surface.flags),
+                     surface.res_scale, surface.last_use_tick, runtime.GetResourceTick());
+        }
+        recent_evictions[recent_eviction_next] = surface.addr;
+        recent_eviction_next = (recent_eviction_next + 1) % recent_evictions.size();
+#endif
+        UnregisterSurface(id);
+    }
+}
+
+template <class T>
+bool RasterizerCache<T>::OwnsDirtyRegion(SurfaceId surface_id) const {
+    const Surface& surface = slot_surfaces[surface_id];
+    for (const auto& pair : RangeFromInterval(dirty_regions, surface.GetInterval())) {
+        if (pair.second == surface_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class T>
+template <typename CostFn, typename SkipFn>
+u32 RasterizerCache<T>::TrimSurfaces(u64 want_bytes, CostFn&& cost, SkipFn&& skip) {
+    struct Candidate {
+        SurfaceId id;
+        u64 last_use;
+        u64 bytes;
+    };
+    boost::container::small_vector<Candidate, 64> candidates;
+    slot_surfaces.ForEach([&](SurfaceId id, Surface& surface) {
+        if (False(surface.flags & SurfaceFlagBits::Registered) || skip(surface)) {
+            return;
+        }
+        // Never the surfaces the current frame is drawing with, whatever the runtime says:
+        // the trim runs between frames and anything used this tick is bound somewhere.
+        if (surface.last_use_tick >= runtime.GetResourceTick()) {
+            return;
+        }
+        if (OwnsDirtyRegion(id)) {
+            return;
+        }
+        candidates.push_back({id, surface.last_use_tick, cost(surface)});
+    });
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.last_use < b.last_use; });
+    boost::container::small_vector<SurfaceId, 64> give_up;
+    u64 freed = 0;
+    for (const Candidate& c : candidates) {
+        if (freed >= want_bytes) {
+            break;
+        }
+        give_up.push_back(c.id);
+        freed += c.bytes;
+    }
+    if (give_up.empty()) {
+        return 0;
+    }
+    SentenceSurfaces({give_up.data(), give_up.size()});
+    return static_cast<u32>(give_up.size());
+}
+
+template <class T>
 void RasterizerCache<T>::RunGarbageCollector() {
+    // A sentenced surface is freed once the runtime's tick has moved a few steps past the
+    // value recorded when it was sentenced. The tick says how far the GPU has got: frames
+    // finished for OpenGL and GXM, the master semaphore's known GPU tick for Vulkan. The
+    // margin stands in for the old RemoveThreshold, which was the swap chain's length.
+    //
+    // The test used to read `remove_tick >= resource_tick`, and both values come from the
+    // same counter, which never goes backwards - so it was true every time, every sentenced
+    // surface was skipped, and slot_surfaces.erase was unreachable. Nothing was ever
+    // collected and no Surface destructor ever ran.
+    //
+    // On a desktop driver that only wastes memory. On the Vita the surface cache owns a
+    // fixed pool of CDRAM and gets a block back only from ~Surface, so it filled
+    // monotonically: Super Smash Bros reached 419 surfaces holding 51.5 MB of 56 MB after
+    // two minutes of a fight, and the allocation that could not be satisfied then parked the
+    // render thread for good. It also mints an SceGxmRenderTarget per surface pair and the
+    // hardware allows 48.
+    constexpr u64 RemoveThreshold = 4;
     const u64 remove_tick = runtime.GetResourceTick();
     for (auto it = sentenced.begin(); it != sentenced.end();) {
         const auto [surface_id, resource_tick] = *it;
-        // Anything older(lower tick-value) than the resource-free tick-value is done being used
-        // and is ready to be deleted
-        if (remove_tick >= resource_tick) {
-            // Resource is still possibly in-use, skip
+        if (remove_tick < resource_tick + RemoveThreshold) {
+            // Still close enough to the sentencing that the GPU may not be done with it.
             it++;
             continue;
         }
@@ -319,6 +460,27 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
     if (!src_surface_id) {
         return false;
     }
+    // What the transfer asked for against what the cache handed back. A source that does not
+    // land inside the surface the guest just rendered into means a new surface was made and
+    // validated from guest memory, which downloads the render target: Mario Kart 7's readback
+    // storm (2026-09-09). AZAHAR_BLIT_LOG names the first few.
+    static const bool log_xfers = std::getenv("AZAHAR_BLIT_LOG") != nullptr;
+    if (log_xfers) {
+        static u32 logged = 0;
+        if (logged < 10) {
+            logged++;
+            const Surface& got = slot_surfaces[src_surface_id];
+            LOG_INFO(HW_GPU,
+                     "xfer {}: want src {:08x} {}x{} stride {} {} tiled {} -> got {:08x} {}x{} "
+                     "stride {} {} tiled {} | want dst {:08x} {}x{} stride {} {} tiled {}",
+                     logged, src_params.addr, src_params.width, src_params.height,
+                     src_params.stride, PixelFormatAsString(src_params.pixel_format),
+                     src_params.is_tiled, got.addr, got.width, got.height, got.stride,
+                     PixelFormatAsString(got.pixel_format), got.is_tiled, dst_params.addr,
+                     dst_params.width, dst_params.height, dst_params.stride,
+                     PixelFormatAsString(dst_params.pixel_format), dst_params.is_tiled);
+        }
+    }
 
     dst_params.res_scale = slot_surfaces[src_surface_id].res_scale;
 
@@ -348,6 +510,20 @@ bool RasterizerCache<T>::AccelerateDisplayTransfer(const Pica::DisplayTransferCo
         .src_rect = src_rect,
         .dst_rect = dst_rect,
     };
+    static const bool log_blits = std::getenv("AZAHAR_BLIT_LOG") != nullptr;
+    if (log_blits) {
+        static u32 logged = 0;
+        if (logged < 40) {
+            logged++;
+            LOG_INFO(HW_GPU, "blit {}: {:08x} {}x{} {} [{},{}-{},{}] -> {:08x} {}x{} {} "
+                             "[{},{}-{},{}]",
+                     logged, src_surface.addr, src_surface.width, src_surface.height,
+                     PixelFormatAsString(src_surface.pixel_format), src_rect.left, src_rect.bottom,
+                     src_rect.right, src_rect.top, dst_surface.addr, dst_surface.width,
+                     dst_surface.height, PixelFormatAsString(dst_surface.pixel_format),
+                     dst_rect.left, dst_rect.bottom, dst_rect.right, dst_rect.top);
+        }
+    }
     runtime.BlitTextures(src_surface, dst_surface, texture_blit);
 
     InvalidateRegion(dst_params.addr, dst_params.size, dst_surface_id);
@@ -562,6 +738,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureSurface(
 template <class T>
 SurfaceId RasterizerCache<T>::GetTextureSurface(const Pica::Texture::TextureInfo& info,
                                                 u32 max_level) {
+    validate_reason = "texture";
     if (info.physical_address == 0) [[unlikely]] {
         // Can occur when texture addr is null or its memory is unmapped/invalid
         // HACK: In this case, the correct behaviour for the PICA is to use the last
@@ -710,6 +887,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
 template <class T>
 FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color_fb,
                                                                 bool using_depth_fb) {
+    validate_reason = "framebuffer";
     const auto& config = regs.framebuffer.framebuffer;
 
     const s32 framebuffer_width = config.GetWidth();
@@ -795,6 +973,12 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
     auto [it, new_framebuffer] = framebuffers.try_emplace(fb_params);
     if (new_framebuffer) {
         it->second = slot_framebuffers.insert(runtime, fb_params, color_surface, depth_surface);
+    }
+
+    Common::PipelineStats::fb_binds.fetch_add(1, std::memory_order_relaxed);
+    if (it->second != last_framebuffer) {
+        last_framebuffer = it->second;
+        Common::PipelineStats::fb_switches.fetch_add(1, std::memory_order_relaxed);
     }
 
     return FramebufferHelper<T>{this, &slot_framebuffers[it->second],
@@ -968,6 +1152,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
 
     Surface& surface = slot_surfaces[surface_id];
     const SurfaceInterval validate_interval(addr, addr + size);
+    surface.last_use_tick = runtime.GetResourceTick();
 
     if (surface.type == SurfaceType::Fill) {
         ASSERT_MSG(surface.IsRegionValid(validate_interval),
@@ -1009,7 +1194,18 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         if (copy_surface_id && copy_surface_id != surface_id) {
             Surface& copy_surface = slot_surfaces[copy_surface_id];
             const SurfaceInterval copy_interval = copy_surface.GetCopyableInterval(params);
+            static const bool log_copies = std::getenv("AZAHAR_CACHE_LOG") != nullptr;
+            if (log_copies) {
+                static u32 shown = 0;
+                if (shown++ < 200) {
+                    LOG_INFO(HW_GPU, "validate for {}: {:08X} {}x{} from {:08X} {}x{} ({:X}..{:X})",
+                             validate_reason, surface.addr, surface.width, surface.height,
+                             copy_surface.addr, copy_surface.width, copy_surface.height,
+                             copy_interval.lower(), copy_interval.upper());
+                }
+            }
             CopySurface(copy_surface, surface, copy_interval);
+            surface.upload_hash = 0;
             notify_validated(copy_interval);
             continue;
         }
@@ -1017,11 +1213,32 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
         // Try to find surface in cache with different format
         // that can can be reinterpreted to the requested format.
         if (ValidateByReinterpretation(surface, params, interval)) {
+            surface.upload_hash = 0;
             notify_validated(interval);
             continue;
         }
 
+        if (True(surface.flags & SurfaceFlagBits::GuestFlushed) &&
+            interval == surface.GetInterval()) {
+            // The guest flushed this texture's memory; whether it changed is decided here,
+            // once, by the bytes.
+            surface.flags &= ~SurfaceFlagBits::GuestFlushed;
+            surface.last_hash_tick = runtime.GetResourceTick();
+            const MemoryRef source = memory.GetPhysicalRef(surface.addr);
+            if (source && source.GetSize() >= surface.size) {
+                const u64 hash = Common::ComputeHash64(source.GetPtr(), surface.size);
+                if (hash == surface.upload_hash) {
+                    guest_flush_hash_skips++;
+                    memory.WriteTracker().Arm(source.GetPtr(), surface.size);
+                    notify_validated(interval);
+                    continue;
+                }
+            }
+        }
+        // Whose validation forced the flush, for the readback log below.
+        validating_for = &surface;
         FlushRegion(params.addr, params.size);
+        validating_for = nullptr;
         if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
             UploadSurface(surface, interval);
         }
@@ -1051,8 +1268,46 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
     }
 
     const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
-    DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
-                  runtime.NeedsConversion(surface));
+    // What was just read from guest memory is what the guest must not change unnoticed.
+    memory.WriteTracker().Arm(upload_data.data(), upload_data.size());
+    // Whole uploads of textures and colour surfaces are hashed so a later guest flush of the
+    // same bytes can skip the upload. Smash's title screen uploads a CPU-written 512x256 RGBA4
+    // colour target every frame (256 KiB, the largest per-frame cost on the render thread).
+    if (surface.type != SurfaceType::Texture && surface.type != SurfaceType::Color) {
+        // Depth data is not compared.
+    } else if (load_info.addr == surface.addr && load_info.end == surface.end) {
+        surface.upload_hash = Common::ComputeHash64(upload_data.data(), upload_data.size());
+    } else {
+        surface.upload_hash = 0;
+    }
+#ifdef CITRA_TRACE_PROBES
+    if (probe_trim_log) {
+        const bool evicted_before =
+            std::find(recent_evictions.begin(), recent_evictions.end(), surface.addr) !=
+            recent_evictions.end();
+        if (evicted_before) {
+            // What guest memory holds for a surface that was given up: all zero and all 0xFF
+            // are the two shapes a lost texture takes.
+            std::size_t zero = 0, ones = 0;
+            for (const u8 byte : upload_data) {
+                zero += byte == 0;
+                ones += byte == 0xFF;
+            }
+            LOG_INFO(HW_GPU,
+                     "trim: reload {:08X}+{} into surface at {:08X} {}x{} {} type {}: {} of {} "
+                     "bytes zero, {} are ff",
+                     load_info.addr, load_info.end - load_info.addr, surface.addr, surface.width,
+                     surface.height, PixelFormatAsString(surface.pixel_format),
+                     static_cast<u32>(surface.type), zero, upload_data.size(), ones);
+        }
+    }
+#endif
+    const BufferTextureCopy upload = {
+        .buffer_offset = staging.offset,
+        .buffer_size = staging.size,
+        .texture_rect = surface.GetSubRect(load_info),
+        .texture_level = surface.LevelOf(load_info.addr),
+    };
 
     const bool should_dump = False(surface.flags & SurfaceFlagBits::Custom) &&
                              False(surface.flags & SurfaceFlagBits::RenderTarget);
@@ -1062,12 +1317,18 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
         custom_tex_manager.DumpTexture(load_info, level, upload_data, hash);
     }
 
-    const BufferTextureCopy upload = {
-        .buffer_offset = staging.offset,
-        .buffer_size = staging.size,
-        .texture_rect = surface.GetSubRect(load_info),
-        .texture_level = surface.LevelOf(load_info.addr),
-    };
+    // A runtime whose texture memory the CPU can write decodes straight into it when the
+    // destination is contiguous, and skips the staging copy.
+    if constexpr (requires { surface.DirectUploadSpan(upload, staging.size); }) {
+        const std::span<u8> direct = surface.DirectUploadSpan(upload, staging.size);
+        if (!direct.empty()) {
+            DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, direct,
+                          runtime.NeedsConversion(surface));
+            return;
+        }
+    }
+    DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
+                  runtime.NeedsConversion(surface));
     surface.Upload(upload, staging);
 }
 
@@ -1135,8 +1396,193 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
 }
 
 template <class T>
+void RasterizerCache<T>::DumpSurfaces(const std::string& dir, u32 frame) {
+    // Level 0 of every surface that has memory, read back the way a download is, as a PPM of
+    // its colour or depth and a PGM of its alpha or stencil where the format carries one.
+    // Rows are stored bottom-up and the files are written top-down.
+    FileUtil::CreateFullPath(dir + "/");
+    const std::string index_path = fmt::format("{}/f{:02}_index.txt", dir, frame);
+    FILE* index = std::fopen(index_path.c_str(), "wb");
+    u32 count = 0;
+    ForEachSurface([&](SurfaceId, Surface& surface) {
+        if (surface.addr == 0 || surface.type == SurfaceType::Invalid || surface.width == 0 ||
+            surface.height == 0) {
+            return;
+        }
+        const u32 n = count++;
+        const u32 w = surface.width;
+        const u32 h = surface.height;
+        const PixelFormat pf = surface.pixel_format;
+        const u32 bpp = surface.GetInternalBytesPerPixel();
+        const u32 bytes = w * h * bpp;
+        const auto staging = runtime.FindStaging(bytes, false);
+        surface.Download(BufferTextureCopy{.buffer_offset = 0,
+                                           .buffer_size = bytes,
+                                           .texture_rect = {0, h, w, 0},
+                                           .texture_level = 0},
+                         staging);
+        static constexpr const char* TypeNames[] = {"color", "texture", "depth", "depthstencil",
+                                                    "fill", "invalid"};
+        const char* type = TypeNames[std::min<u32>(static_cast<u32>(surface.type), 5)];
+        const std::string stem =
+            fmt::format("{}/f{:02}_{:03}_{}_{:08x}_{}x{}_{}", dir, frame, n, type, surface.addr, w,
+                        h, PixelFormatAsString(pf));
+        if (index != nullptr) {
+            const std::string line =
+                fmt::format("{:03} {} addr {:08x}-{:08x} {}x{} stride {} levels {} {}{}{}\n", n,
+                            type, surface.addr, surface.end, w, h, surface.stride, surface.levels,
+                            PixelFormatAsString(pf),
+                            surface.type == SurfaceType::Color ? " colour-target" : "",
+                            surface.type == SurfaceType::Depth ||
+                                    surface.type == SurfaceType::DepthStencil
+                                ? " depth-target"
+                                : "");
+            std::fwrite(line.data(), 1, line.size(), index);
+        }
+        const bool depth_word = pf == PixelFormat::D24S8;
+        const bool depth_f32 = pf == PixelFormat::D24;
+        const bool depth_16 = pf == PixelFormat::D16;
+        const bool has_alpha = !depth_word && !depth_f32 && !depth_16 &&
+                               pf != PixelFormat::RGB565 && pf != PixelFormat::RGB8;
+        FILE* ppm = std::fopen((stem + ".ppm").c_str(), "wb");
+        FILE* pgm = (has_alpha || depth_word)
+                        ? std::fopen((stem + (depth_word ? "_s.pgm" : "_a.pgm")).c_str(), "wb")
+                        : nullptr;
+        if (ppm == nullptr) {
+            if (pgm != nullptr) {
+                std::fclose(pgm);
+            }
+            return;
+        }
+        std::string header = fmt::format("P6\n{} {}\n255\n", w, h);
+        std::fwrite(header.data(), 1, header.size(), ppm);
+        if (pgm != nullptr) {
+            header = fmt::format("P5\n{} {}\n255\n", w, h);
+            std::fwrite(header.data(), 1, header.size(), pgm);
+        }
+        std::vector<u8> rgb(w * 3);
+        std::vector<u8> extra(w);
+        for (u32 row = 0; row < h; row++) {
+            const u8* src = staging.mapped.data() + static_cast<std::size_t>(h - 1 - row) * w * bpp;
+            for (u32 x = 0; x < w; x++) {
+                const u8* px = src + x * bpp;
+                u8 r = 0, g = 0, b = 0, a = 255;
+                switch (pf) {
+                case PixelFormat::RGB5A1: {
+                    u16 v;
+                    std::memcpy(&v, px, 2);
+                    r = static_cast<u8>(((v >> 11) & 31) * 255 / 31);
+                    g = static_cast<u8>(((v >> 6) & 31) * 255 / 31);
+                    b = static_cast<u8>(((v >> 1) & 31) * 255 / 31);
+                    a = (v & 1) ? 255 : 0;
+                    break;
+                }
+                case PixelFormat::RGB565: {
+                    u16 v;
+                    std::memcpy(&v, px, 2);
+                    r = static_cast<u8>(((v >> 11) & 31) * 255 / 31);
+                    g = static_cast<u8>(((v >> 5) & 63) * 255 / 63);
+                    b = static_cast<u8>((v & 31) * 255 / 31);
+                    break;
+                }
+                case PixelFormat::RGBA4: {
+                    u16 v;
+                    std::memcpy(&v, px, 2);
+                    r = static_cast<u8>(((v >> 12) & 15) * 17);
+                    g = static_cast<u8>(((v >> 8) & 15) * 17);
+                    b = static_cast<u8>(((v >> 4) & 15) * 17);
+                    a = static_cast<u8>((v & 15) * 17);
+                    break;
+                }
+                case PixelFormat::D16: {
+                    u16 v;
+                    std::memcpy(&v, px, 2);
+                    r = g = b = static_cast<u8>(v >> 8);
+                    break;
+                }
+                case PixelFormat::D24: {
+                    float f;
+                    std::memcpy(&f, px, 4);
+                    r = g = b = static_cast<u8>(std::clamp(f, 0.0f, 1.0f) * 255.0f);
+                    break;
+                }
+                case PixelFormat::D24S8: {
+                    u32 v;
+                    std::memcpy(&v, px, 4);
+                    r = g = b = static_cast<u8>(v >> 24);
+                    a = static_cast<u8>(v & 0xff);
+                    break;
+                }
+                default:
+                    r = px[0];
+                    g = bpp > 1 ? px[1] : px[0];
+                    b = bpp > 2 ? px[2] : px[0];
+                    a = bpp > 3 ? px[3] : 255;
+                    break;
+                }
+                rgb[x * 3 + 0] = r;
+                rgb[x * 3 + 1] = g;
+                rgb[x * 3 + 2] = b;
+                extra[x] = a;
+            }
+            std::fwrite(rgb.data(), 1, rgb.size(), ppm);
+            if (pgm != nullptr) {
+                std::fwrite(extra.data(), 1, extra.size(), pgm);
+            }
+        }
+        std::fclose(ppm);
+        if (pgm != nullptr) {
+            std::fclose(pgm);
+        }
+    });
+    if (index != nullptr) {
+        std::fclose(index);
+    }
+    LOG_INFO(HW_GPU, "dumped {} surfaces to {}", count, dir);
+}
+
+template <class T>
 void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_DownloadSurface);
+
+    // A readback the guest asks for while the GPU is still writing the surface costs a full
+    // drain of the pipeline before it can be answered, and Mario Kart 7 asks 140 times a
+    // second (27 MB, two and a half screenfuls a frame, measured on the pi5 2026-09-09). What
+    // the last readback left in guest memory is a frame or so old and free, so it is handed
+    // over instead - but only so many times in a row, or a surface read every frame would
+    // freeze at its first download and never advance again.
+    constexpr u8 MaxStaleReadbacks = 2;
+    if (surface.ever_downloaded && surface.download_skips < MaxStaleReadbacks &&
+        runtime.CanSkipDownload(surface)) {
+        surface.download_skips++;
+        Common::PipelineStats::cache_stale_reads.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    surface.download_skips = 0;
+    surface.ever_downloaded = true;
+    // What the guest actually reads back, for deciding whether it can be answered stale:
+    // AZAHAR_READBACK_LOG=1 names the first ranges and their surfaces.
+    static const bool log_readbacks = std::getenv("AZAHAR_READBACK_LOG") != nullptr;
+    if (log_readbacks) {
+        static u32 logged = 0;
+        if (logged < 12) {
+            logged++;
+            LOG_INFO(HW_GPU,
+                     "readback {}: {:#010x}+{:#x} surface {:#010x} {}x{} {} {} for {}", logged,
+                     boost::icl::first(interval),
+                     boost::icl::last_next(interval) - boost::icl::first(interval), surface.addr,
+                     surface.width, surface.height,
+                     VideoCore::PixelFormatAsString(surface.pixel_format),
+                     surface.type == SurfaceType::Color ? "color" : "other",
+                     validating_for != nullptr
+                         ? fmt::format("validating {:#010x} {}x{} stride {} {} tiled {}",
+                                       validating_for->addr, validating_for->width,
+                                       validating_for->height, validating_for->stride,
+                                       PixelFormatAsString(validating_for->pixel_format),
+                                       validating_for->is_tiled)
+                         : std::string{"the guest"});
+        }
+    }
 
     const SurfaceParams flush_info = surface.FromInterval(interval);
     const u32 flush_start = boost::icl::first(interval);
@@ -1160,6 +1606,9 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
     }
 
     const auto download_dest = dest_ptr.GetWriteBytes(flush_end - flush_start);
+    Common::PipelineStats::cache_downloads.fetch_add(1, std::memory_order_relaxed);
+    Common::PipelineStats::cache_download_kb.fetch_add((flush_end - flush_start) / 1024,
+                                                       std::memory_order_relaxed);
     EncodeTexture(flush_info, flush_start, flush_end, staging.mapped, download_dest,
                   runtime.NeedsConversion(surface));
 }
@@ -1315,6 +1764,70 @@ void RasterizerCache<T>::FlushAll() {
 }
 
 template <class T>
+void RasterizerCache<T>::InvalidateRegionUnlessDirty(PAddr addr, u32 size) {
+    if (size == 0) [[unlikely]] {
+        return;
+    }
+    const SurfaceInterval interval(addr, addr + size);
+    // Take the dirty regions out of the range; what remains is CPU data the guest may have
+    // rewritten. A texture that was uploaded whole is kept, invalid, with the guest-flushed
+    // flag: its next use hashes guest memory against what it was uploaded from and skips the
+    // upload when nothing changed (Smash flushes the same texture memory every frame;
+    // decoding and uploading 20 textures a frame for that measured 780 KiB a frame under
+    // Vita3K). Everything else in the range is dropped as InvalidateRegion would.
+    boost::container::small_vector<SurfaceInterval, 8> keep;
+    for (const auto& [region, surface_id] : RangeFromInterval(dirty_regions, interval)) {
+        keep.push_back(region & interval);
+    }
+    // A blanket flush: Smash flushes its whole FCRAM (0x20000000+0x3DAB000) every frame,
+    // which says nothing about which bytes changed. Taken literally it queued a hash of
+    // every texture in the cache each frame (11 a frame, 400 MB per 3 s on the Smash title
+    // screen; the page-map gate it replaced ignored the flush outright). Under a blanket
+    // flush a hashed texture is re-checked at most once every BlanketRecheckTicks resource
+    // ticks: the cost spreads out, a stale texture shows for at most that long, and a
+    // targeted flush still checks at once.
+    constexpr u32 BlanketBytes = 16 * 1024 * 1024;
+    constexpr u64 BlanketRecheckTicks = 30;
+    const bool blanket = size >= BlanketBytes;
+    const u64 tick = runtime.GetResourceTick();
+    boost::container::small_vector<SurfaceId, 8> remove_surfaces;
+    const auto invalidate_cpu = [&](PAddr start, u32 length) {
+        const SurfaceInterval cpu_interval(start, start + length);
+        ForEachSurfaceInRegion(start, length, [&](SurfaceId surface_id, Surface& surface) {
+            if (blanket && surface.upload_hash != 0 &&
+                tick - surface.last_hash_tick < BlanketRecheckTicks &&
+                (surface.GetInterval() & cpu_interval) == surface.GetInterval()) {
+                return;
+            }
+            surface.MarkInvalid(surface.GetInterval() & cpu_interval);
+            if (!surface.IsFullyInvalid()) {
+                return;
+            }
+            if (surface.upload_hash != 0) {
+                surface.flags |= SurfaceFlagBits::GuestFlushed;
+                return;
+            }
+            remove_surfaces.push_back(surface_id);
+        });
+    };
+    PAddr cursor = addr;
+    for (const SurfaceInterval& dirty : keep) {
+        if (dirty.lower() > cursor) {
+            invalidate_cpu(cursor, dirty.lower() - cursor);
+        }
+        cursor = std::max(cursor, dirty.upper());
+    }
+    if (cursor < addr + size) {
+        invalidate_cpu(cursor, addr + size - cursor);
+    }
+    for (const SurfaceId surface_id : remove_surfaces) {
+        if (True(slot_surfaces[surface_id].flags & SurfaceFlagBits::Registered)) {
+            UnregisterSurface(surface_id);
+        }
+    }
+}
+
+template <class T>
 void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region_owner_id) {
     if (size == 0) [[unlikely]] {
         return;
@@ -1328,6 +1841,9 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         ASSERT(addr >= region_owner.addr && addr + size <= region_owner.end);
         ASSERT(region_owner.width == region_owner.stride);
         region_owner.MarkValid(invalid_interval);
+        // The GPU wrote this surface: its content no longer matches any upload, so a guest
+        // flush of the old upload bytes must not be mistaken for "unchanged".
+        region_owner.upload_hash = 0;
     }
 
     boost::container::small_vector<SurfaceId, 4> remove_surfaces;
@@ -1335,9 +1851,16 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
         if (surface_id == region_owner_id) {
             return;
         }
-        // If the CPU is invalidating this region we want to remove it
-        // to (likely) mark the memory pages as uncached
-        if (!region_owner_id && size <= 8) {
+        // A small invalidation with no owner is upstream's page-marking write hook: the guest
+        // CPU is about to store into a cached page, so the surface is written back first (the
+        // pixels the store does not cover must survive) and then dropped to make the pages
+        // uncached again. That order only holds while the hook exists. With marking off - the
+        // render thread cannot flip page attributes under the emulation thread - the only
+        // caller of this shape is the guest's own GSP cache flush, which arrives *after* the
+        // stores have landed, so writing the surface back puts dead pixels on top of live
+        // data. Mario Kart 7 read a pointer out of a freed 64x64 texture's grave and
+        // dereferenced null. Under no marking the range is invalidated and nothing is written.
+        if (!region_owner_id && size <= 8 && memory.RasterizerCacheMarkingEnabled()) {
             FlushRegion(surface.addr, surface.size, surface_id);
             remove_surfaces.push_back(surface_id);
             return;
