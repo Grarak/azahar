@@ -1,0 +1,109 @@
+diff --git a/crypto/CMakeLists.txt b/crypto/CMakeLists.txt
+index a6842f5..1fab923 100644
+--- a/crypto/CMakeLists.txt
++++ b/crypto/CMakeLists.txt
+@@ -783,6 +783,14 @@ if(UNIX)
+ 	set(CRYPTO_SRC ${CRYPTO_SRC} ui/ui_openssl.c)
+ endif()
+ 
++# The vitasdk's toolchain file does not set UNIX, but the console is POSIX enough for the
++# locking and BIO sources above. ui_openssl.c is left out on purpose: it prompts on a terminal
++# this platform does not have, and ui_lib.c uses the null method instead.
++if(VITA)
++	set(CRYPTO_SRC ${CRYPTO_SRC} crypto_lock.c)
++	set(CRYPTO_SRC ${CRYPTO_SRC} bio/b_posix.c)
++endif()
++
+ if(WIN32)
+ 	set(CRYPTO_SRC ${CRYPTO_SRC} compat/crypto_lock_win.c)
+ 	set(CRYPTO_SRC ${CRYPTO_SRC} bio/b_win.c)
+diff --git a/crypto/armcap.c b/crypto/armcap.c
+index e1a721b..a3b0049 100644
+--- a/crypto/armcap.c
++++ b/crypto/armcap.c
+@@ -10,6 +10,20 @@
+ 
+ unsigned int OPENSSL_armcap_P;
+ 
++#ifdef __vita__
++/*
++ * The PS Vita is a Cortex-A9: ARMv7 with NEON and none of the ARMv8 crypto extensions. Its
++ * newlib has no sigsetjmp, and the probe below could not work there anyway - it identifies
++ * instructions by executing them and catching SIGILL, which needs signal delivery this
++ * platform does not provide. The answer is known at build time, so it is simply stated.
++ */
++void
++OPENSSL_cpuid_setup(void)
++{
++	OPENSSL_armcap_P = ARMV7_NEON;
++}
++#else
++
+ #if __ARM_ARCH__ >= 7
+ static sigset_t all_masked;
+ 
+@@ -86,3 +100,4 @@ OPENSSL_cpuid_setup(void)
+ 	sigprocmask(SIG_SETMASK, &oset, NULL);
+ #endif
+ }
++#endif /* __vita__ */
+diff --git a/crypto/cryptlib.c b/crypto/cryptlib.c
+index 38d31e7..7ec8d48 100644
+--- a/crypto/cryptlib.c
++++ b/crypto/cryptlib.c
+@@ -345,20 +345,34 @@ OPENSSL_cpuid_setup(void)
+ static void
+ OPENSSL_showfatal(const char *fmta, ...)
+ {
+-	struct syslog_data sdata = SYSLOG_DATA_INIT;
+ 	va_list ap;
+ 
+ 	va_start(ap, fmta);
+-	vsyslog_r(LOG_INFO|LOG_LOCAL2, &sdata, fmta, ap);
++#ifdef __vita__
++	/* No syslog on this platform; the frontend captures stderr to its log file. */
++	vfprintf(stderr, fmta, ap);
++#else
++	{
++		struct syslog_data sdata = SYSLOG_DATA_INIT;
++		vsyslog_r(LOG_INFO|LOG_LOCAL2, &sdata, fmta, ap);
++	}
++#endif
+ 	va_end(ap);
+ }
+ 
+ void
+ OpenSSLDie(const char *file, int line, const char *assertion)
+ {
++#ifdef __vita__
++	/* Neither getuid nor getprogname exists here, and neither says anything useful on a
++	   console running exactly one program. */
++	OPENSSL_showfatal("%s(%d): OpenSSL internal error, assertion failed: %s\n", file, line,
++	    assertion);
++#else
+ 	OPENSSL_showfatal(
+ 	    "uid %u cmd %s %s(%d): OpenSSL internal error, assertion failed: %s\n",
+ 	    getuid(), getprogname(), file, line, assertion);
++#endif
+ 	_exit(1);
+ }
+ 
+diff --git a/crypto/ui/ui_lib.c b/crypto/ui/ui_lib.c
+index 73d899a..14f0653 100644
+--- a/crypto/ui/ui_lib.c
++++ b/crypto/ui/ui_lib.c
+@@ -543,7 +543,14 @@ const UI_METHOD *
+ UI_get_default_method(void)
+ {
+ 	if (default_UI_meth == NULL)
++#ifdef __vita__
++		/* UI_OpenSSL prompts on a terminal, of which this console has none - and its
++		   implementation is excluded from the build for that reason. The null method is
++		   what "cannot ask the user" looks like. */
++		default_UI_meth = UI_null();
++#else
+ 		default_UI_meth = UI_OpenSSL();
++#endif
+ 
+ 	return default_UI_meth;
+ }

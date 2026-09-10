@@ -132,6 +132,14 @@ if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
     endif()
 endif()
 
+# robin-map
+# Normally pulled in as a side effect of adding dynarmic. On architectures with
+# no dynarmic backend the libretro frontend still needs it, so add the bundled
+# copy directly.
+if (NOT TARGET tsl::robin_map)
+    add_subdirectory(dynarmic/externals/robin-map EXCLUDE_FROM_ALL)
+endif()
+
 # getopt
 if (MSVC)
     add_subdirectory(getopt EXCLUDE_FROM_ALL)
@@ -200,8 +208,10 @@ if(NOT USE_SYSTEM_SOUNDTOUCH)
 endif()
 
 # Teakra
-set(BUILD_TESTING OFF CACHE BOOL "")
-add_subdirectory(teakra EXCLUDE_FROM_ALL)
+if (ENABLE_DSP_LLE)
+    set(BUILD_TESTING OFF CACHE BOOL "")
+    add_subdirectory(teakra EXCLUDE_FROM_ALL)
+endif()
 
 # SDL2
 if (ENABLE_SDL2 AND NOT USE_SYSTEM_SDL2)
@@ -248,8 +258,10 @@ else()
     target_link_libraries(zstd INTERFACE libzstd_static zstd_seekable)
 endif()
 
-# ENet
-if(USE_SYSTEM_ENET)
+# ENet - the room protocol is its only user
+if(NOT ENABLE_ROOM)
+    # not built
+elseif(USE_SYSTEM_ENET)
     find_package(libenet REQUIRED)
     add_library(enet INTERFACE)
     target_link_libraries(enet INTERFACE libenet::libenet)
@@ -514,13 +526,27 @@ endif()
 
 set(XXHASH_BUILD_XXHSUM OFF)
 add_subdirectory(xxHash/cmake_unofficial EXCLUDE_FROM_ALL)
-target_compile_definitions(xxhash PRIVATE XXH_FORCE_MEMORY_ACCESS=2)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^arm(v[0-9]+.*)?$")
+    # Mode 2 reads u64s through plain casts. On 32-bit ARM the compiler then emits ldrd, which
+    # requires alignment the hashed data does not have, and the kernel answers with SIGBUS rather
+    # than a fixup. The default memcpy-based access is the only safe mode there.
+    target_compile_definitions(xxhash PRIVATE XXH_FORCE_MEMORY_ACCESS=2)
+endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_definitions(xxhash PRIVATE XXH_VECTOR=XXH_SSE2)
     message(STATUS "Enabling SSE2 for xxHash")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|armv8")
     target_compile_definitions(xxhash PRIVATE XXH_VECTOR=XXH_NEON)
     message(STATUS "Enabling NEON for xxHash")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm" AND
+       (CMAKE_C_FLAGS MATCHES "mfpu=neon" OR CMAKE_CXX_FLAGS MATCHES "mfpu=neon"))
+    # 32-bit ARM builds with NEON fell through to the scalar path, which left XXH3 running its
+    # SIMD-shaped long loop on 64-bit lanes with no SIMD. Measured on a Pi 5 in armhf over a
+    # 3 KB unaligned buffer (the shape the shader cache hashes): 945 ns scalar against 563 ns
+    # with NEON. XXH3 is specified to give identical results on every backend, and that was
+    # verified here across all 8 alignments, so no cached hash changes meaning.
+    target_compile_definitions(xxhash PRIVATE XXH_VECTOR=XXH_NEON)
+    message(STATUS "Enabling NEON for xxHash (32-bit ARM)")
 else()
     target_compile_definitions(xxhash PRIVATE XXH_VECTOR=XXH_SCALAR)
     message(STATUS "Disabling SIMD for xxHash")
