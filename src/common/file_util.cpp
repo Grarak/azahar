@@ -88,6 +88,10 @@ typedef struct stat file_stat_t;
 #endif
 
 #include <algorithm>
+#ifdef __vita__
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+#endif
 #include <sys/stat.h>
 
 #ifndef S_ISDIR
@@ -152,8 +156,15 @@ static void StripTailDirSlashes(std::string& fname) {
     while (i > 0 && fname[i - 1] == DIR_SEP_CHR) {
         --i;
     }
+    // A mount point is named "ux0:" and its root is "ux0:/"; the two are different paths to the
+    // Vita's newlib, and only the second one stats. Windows has the same rule for drive letters
+    // and handles it at each call site; doing it here covers both callers at once.
+    if (i > 0 && fname[i - 1] == ':') {
+        return;
+    }
     fname.resize(i);
 }
+
 
 bool Exists(const std::string& filename) {
     std::string copy(filename);
@@ -281,7 +292,17 @@ bool Delete(const std::string& filepath) {
     return true;
 }
 
-bool CreateDir(const std::string& path) {
+bool CreateDir(const std::string& path_in) {
+    // CreateFullPath hands every component down with its trailing separator attached, and the
+    // console's mkdir answers a trailing separator with EINVAL - so on the Vita nothing
+    // CreateFullPath tried to build was ever created (savedata directories, most visibly).
+    // Stripping it is free elsewhere: POSIX and Win32 both accept either form. A root or a
+    // device prefix ("/" , "ux0:/") keeps its separator, since that is the whole path.
+    std::string path = path_in;
+    while (path.size() > 1 && (path.back() == '/' || path.back() == '\\') &&
+           path[path.size() - 2] != ':') {
+        path.pop_back();
+    }
     LOG_TRACE(Common_Filesystem, "directory {}", path);
 #ifdef _WIN32
     if (::CreateDirectoryW(Common::UTF8ToUTF16W(path).c_str(), nullptr))
@@ -327,6 +348,35 @@ bool CreateDir(const std::string& path) {
         return true;
     }
 
+#elif defined(__vita__)
+    // Straight to the kernel call: newlib's mkdir maps every SCE error to errno by its low
+    // byte, which turns the console's own diagnosis into a bare "Invalid argument". The raw
+    // code is what a failure here needs to show.
+    const int sce = sceIoMkdir(path.c_str(), 0777);
+    if (sce >= 0) {
+        return true;
+    }
+    if (sce == static_cast<int>(0x80010011)) { // SCE_ERROR_ERRNO_EEXIST
+        LOG_DEBUG(Common_Filesystem, "mkdir failed on {}: already exists", path);
+        return true;
+    }
+    LOG_ERROR(Common_Filesystem, "mkdir failed on {}: 0x{:08x} (path {} chars, {} components)",
+              path, static_cast<u32>(sce), path.size(),
+              std::count(path.begin(), path.end(), '/'));
+    // What the kernel sees at both ends of the failing call: the parent it must extend and
+    // whatever already answers to the target's name.
+    const auto describe = [](const std::string& p) {
+        SceIoStat st{};
+        const int r = sceIoGetstat(p.c_str(), &st);
+        if (r < 0) {
+            return fmt::format("stat 0x{:08x}", static_cast<u32>(r));
+        }
+        return fmt::format("mode 0x{:x} attr 0x{:x} size {}", static_cast<u32>(st.st_mode),
+                           static_cast<u32>(st.st_attr), static_cast<u64>(st.st_size));
+    };
+    LOG_ERROR(Common_Filesystem, "  target: {}", describe(path));
+    LOG_ERROR(Common_Filesystem, "  parent: {}", describe(std::string(GetParentPath(path))));
+    return false;
 #else
     if (mkdir(path.c_str(), 0755) == 0)
         return true;
@@ -1392,6 +1442,22 @@ bool IOFile::Open() {
         }
     }
     m_good = m_file != nullptr;
+#elif defined(__vita__)
+    // Straight to the kernel: newlib's stdio carries a 32-bit off_t, so through it a 2 GB
+    // cartridge image has a negative size and no reachable second half. The kernel's SceOff
+    // is 64 bits. m_fd holds the SceUID; m_file stays null on this platform.
+    int mode = 0;
+    const bool plus = openmode.find('+') != std::string::npos;
+    if (openmode.find('w') != std::string::npos) {
+        mode = (plus ? SCE_O_RDWR : SCE_O_WRONLY) | SCE_O_CREAT | SCE_O_TRUNC;
+    } else if (openmode.find('a') != std::string::npos) {
+        mode = (plus ? SCE_O_RDWR : SCE_O_WRONLY) | SCE_O_CREAT | SCE_O_APPEND;
+    } else {
+        mode = plus ? SCE_O_RDWR : SCE_O_RDONLY;
+    }
+    const SceUID fd = sceIoOpen(filename.c_str(), mode, 0666);
+    m_fd = fd >= 0 ? static_cast<int>(fd) : -1;
+    m_good = m_fd >= 0;
 #else
     m_file = FOPEN(filename.c_str(), openmode.c_str());
     m_good = m_file != nullptr;
@@ -1401,39 +1467,73 @@ bool IOFile::Open() {
 }
 
 bool IOFile::Close() {
+#ifdef __vita__
+    if (!IsOpen() || sceIoClose(m_fd) < 0)
+        m_good = false;
+    m_fd = -1;
+    return m_good;
+#else
     if (!IsOpen() || 0 != FCLOSE(m_file))
         m_good = false;
 
     m_file = nullptr;
     return m_good;
+#endif
 }
 
 u64 IOFile::GetSize() const {
+#ifdef __vita__
+    if (!IsOpen())
+        return 0;
+    SceIoStat st{};
+    if (sceIoGetstatByFd(m_fd, &st) < 0)
+        return 0;
+    return static_cast<u64>(st.st_size);
+#else
     if (IsOpen())
         return FileUtil::GetSize(m_file);
 
     return 0;
+#endif
 }
 
 bool IOFile::Seek(s64 off, int origin) {
+#ifdef __vita__
+    if (!IsOpen() || sceIoLseek(m_fd, static_cast<SceOff>(off), origin) < 0)
+        m_good = false;
+    return m_good;
+#else
     if (!IsOpen() || 0 != FSEEK(m_file, off, origin))
         m_good = false;
 
     return m_good;
+#endif
 }
 
 u64 IOFile::Tell() const {
+#ifdef __vita__
+    if (IsOpen())
+        return static_cast<u64>(sceIoLseek(m_fd, 0, SEEK_CUR));
+    return std::numeric_limits<u64>::max();
+#else
     if (IsOpen())
         return FTELL(m_file);
 
     return std::numeric_limits<u64>::max();
+#endif
 }
 
 bool IOFile::Flush() {
+#ifdef __vita__
+    if (!IsOpen() || sceIoSyncByFd(m_fd, 0) < 0)
+        m_good = false;
+    return m_good;
+#else
     if (!IsOpen() || 0 != FFLUSH(m_file))
         m_good = false;
 
     return m_good;
+#endif
 }
 
 std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t elem_size) {
@@ -1448,11 +1548,21 @@ std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t elem_si
 
     DEBUG_ASSERT(data != nullptr);
 
+#ifdef __vita__
+    const int got = sceIoRead(m_fd, data, static_cast<SceSize>(length * elem_size));
+    if (got < 0) {
+        m_good = false;
+        return 0;
+    }
+    const std::size_t read = static_cast<std::size_t>(got) / elem_size;
+    return read;
+#else
     std::size_t read = FREAD(data, elem_size, length, m_file);
     if (read != length) {
         m_good = FERROR(m_file) != 0;
     }
     return read;
+#endif
 }
 
 #ifdef _WIN32
@@ -1503,6 +1613,12 @@ std::size_t IOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_t o
     int64_t rv = FREAD(data, 1, byte_count, m_file);
     FSEEK(m_file, pos, RETRO_VFS_SEEK_POSITION_START);
     read = static_cast<std::size_t>(rv);
+#elif defined(__vita__)
+    read = static_cast<std::size_t>(sceIoPread(m_fd, data, byte_count, static_cast<SceOff>(offset)));
+    if (read != byte_count) {
+        m_good = false;
+    }
+    return read;
 #else
     read = pread(fileno(m_file), data, byte_count, offset);
 #endif
@@ -1528,6 +1644,14 @@ std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t 
     std::size_t written;
 #if defined(HAVE_LIBRETRO_VFS)
     written = rfwrite(data, elem_size, length, m_file) / elem_size;
+#elif defined(__vita__)
+    const int put = sceIoWrite(m_fd, data, static_cast<SceSize>(length * elem_size));
+    if (put < 0) {
+        m_good = false;
+        return 0;
+    }
+    written = static_cast<std::size_t>(put) / elem_size;
+    return written;
 #else
     written = std::fwrite(data, elem_size, length, m_file);
 #endif
@@ -1578,7 +1702,11 @@ size_t IOFileBase::WriteLine(const std::string_view line) {
 }
 
 inline bool IOFile::IsOpen() const {
+#ifdef __vita__
+    return m_fd >= 0;
+#else
     return nullptr != m_file;
+#endif
 }
 
 inline bool IOFile::IsGood() const {
@@ -1620,6 +1748,9 @@ int IOFile::GetFd() const {
         return m_fd;
     }
 #endif // ANDROID
+#ifdef __vita__
+    return m_fd; // the SceUID; nothing in this build asks
+#endif
     if (m_file == nullptr)
         return -1;
     return fileno(m_file);
@@ -1627,6 +1758,38 @@ int IOFile::GetFd() const {
 }
 
 bool IOFile::Resize(u64 size) {
+#ifdef __vita__
+    // The kernel offers no truncate; growing is a write of zeros at the end, which is what
+    // savedata creation needs. Shrinking is refused and logged.
+    if (!IsOpen()) {
+        m_good = false;
+        return false;
+    }
+    const u64 current = GetSize();
+    if (size == current) {
+        return true;
+    }
+    if (size < current) {
+        LOG_ERROR(Common_Filesystem, "cannot shrink {} from {} to {} on this platform", filename,
+                  current, size);
+        m_good = false;
+        return false;
+    }
+    static const std::vector<u8> zeros(64 * 1024, 0);
+    const SceOff pos = sceIoLseek(m_fd, 0, SEEK_CUR);
+    sceIoLseek(m_fd, static_cast<SceOff>(current), SEEK_SET);
+    u64 left = size - current;
+    while (left > 0) {
+        const SceSize chunk = static_cast<SceSize>(std::min<u64>(left, zeros.size()));
+        if (sceIoWrite(m_fd, zeros.data(), chunk) != static_cast<int>(chunk)) {
+            m_good = false;
+            return false;
+        }
+        left -= chunk;
+    }
+    sceIoLseek(m_fd, pos, SEEK_SET);
+    return true;
+#endif
     if (!IsOpen() || 0 !=
 #if defined(HAVE_LIBRETRO_VFS)
                          filestream_truncate(m_file, size)

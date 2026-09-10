@@ -2,9 +2,10 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
-#include <thread>
+#include "common/named_thread.h"
 #include "common/assert.h"
 #include "common/detached_tasks.h"
+#include "common/thread.h"
 
 namespace Common {
 
@@ -29,11 +30,15 @@ DetachedTasks::~DetachedTasks() {
 void DetachedTasks::AddTask(std::function<void()> task) {
     std::unique_lock lock{instance->mutex};
     ++instance->count;
-    std::thread([task{std::move(task)}]() {
+    // Notification happens inside the callable rather than through
+    // std::notify_all_at_thread_exit: the detached NamedThread is a raw SCE thread on the
+    // Vita, and pthread exit hooks never run there.
+    Common::NamedThread(Common::ThreadCfg{"detached task"}, [task{std::move(task)}]() {
+        Common::SetCurrentThreadRole(Common::ThreadRole::Other);
         task();
         std::unique_lock lock{instance->mutex};
         --instance->count;
-        std::notify_all_at_thread_exit(instance->cv, std::move(lock));
+        instance->cv.notify_all();
     }).detach();
 }
 
