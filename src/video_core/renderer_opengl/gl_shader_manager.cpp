@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdlib>
 #include <algorithm>
 #include <mutex>
 #include <set>
@@ -11,6 +12,7 @@
 #include <variant>
 #include "common/hash.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "core/frontend/emu_window.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/renderer_opengl/gl_driver.h"
@@ -18,6 +20,8 @@
 #include "video_core/renderer_opengl/gl_shader_disk_cache.h"
 #include "video_core/renderer_opengl/gl_shader_manager.h"
 #include "video_core/renderer_opengl/gl_state.h"
+#include "video_core/shader/generator/cg_fs_shader_gen.h"
+#include "video_core/shader/generator/cg_vs_shader_gen.h"
 #include "video_core/shader/generator/glsl_fs_shader_gen.h"
 #include "video_core/shader/generator/glsl_shader_gen.h"
 #include "video_core/shader/generator/profile.h"
@@ -152,6 +156,100 @@ private:
     OGLShaderStage program;
 };
 
+/**
+ * Power-of-two open-addressing map for pre-hashed u64 keys. std::unordered_map's prime-modulo
+ * bucket indexing compiles to a software division on 32-bit ARM (__aeabi_uidiv), and these maps
+ * sit on the per-draw path. Keys are already high-quality hashes, so indexing is a mask after a
+ * cheap avalanche. No erase; Clear only.
+ */
+template <typename V>
+class Pow2HashMap {
+public:
+    Pow2HashMap() : slots(1024) {}
+
+    V* Find(u64 key) {
+        const std::size_t mask = slots.size() - 1;
+        std::size_t i = Mix(key) & mask;
+        while (slots[i].used) {
+            if (slots[i].key == key) {
+                return &slots[i].value;
+            }
+            i = (i + 1) & mask;
+        }
+        return nullptr;
+    }
+
+    /// Returns the value slot for key, default-constructing it if absent.
+    V& FindOrInsert(u64 key, bool& inserted) {
+        if (count * 4 >= slots.size() * 3) {
+            Grow();
+        }
+        const std::size_t mask = slots.size() - 1;
+        std::size_t i = Mix(key) & mask;
+        while (slots[i].used) {
+            if (slots[i].key == key) {
+                inserted = false;
+                return slots[i].value;
+            }
+            i = (i + 1) & mask;
+        }
+        slots[i].used = true;
+        slots[i].key = key;
+        count++;
+        inserted = true;
+        return slots[i].value;
+    }
+
+    void InsertOrAssign(u64 key, V value) {
+        bool inserted;
+        FindOrInsert(key, inserted) = std::move(value);
+    }
+
+    void Clear() {
+        slots.clear();
+        slots.resize(1024);
+        count = 0;
+    }
+
+private:
+    static u64 Mix(u64 k) {
+        k ^= k >> 33;
+        k *= 0xff51afd7ed558ccdull;
+        k ^= k >> 33;
+        return k;
+    }
+
+    struct Slot {
+        u64 key = 0;
+        bool used = false;
+        V value{};
+    };
+
+    void Grow() {
+        std::vector<Slot> old = std::move(slots);
+        slots.clear();
+        slots.resize(old.size() * 2);
+        count = 0;
+        const std::size_t mask = slots.size() - 1;
+        for (auto& slot : old) {
+            if (!slot.used) {
+                continue;
+            }
+            std::size_t i = Mix(slot.key) & mask;
+            while (slots[i].used) {
+                i = (i + 1) & mask;
+            }
+            slots[i].used = true;
+            slots[i].key = slot.key;
+            slots[i].value = std::move(slot.value);
+            count++;
+        }
+    }
+
+    std::vector<Slot> slots;
+    std::size_t count = 0;
+};
+
 template <typename KeyConfigType, auto CodeGenerator, GLenum ShaderType>
 class ShaderCache {
 public:
@@ -161,29 +259,32 @@ public:
     template <typename... Args>
     std::tuple<u64, GLuint, std::optional<std::string>> Get(const KeyConfigType& config,
                                                             Args&&... args) {
-        auto [iter, new_shader] = shaders.emplace(config.Hash(), OGLShaderStage{separable});
-        OGLShaderStage& cached_shader = iter->second;
+        const u64 hash = config.Hash();
+        bool new_shader;
+        auto& entry = shaders.FindOrInsert(hash, new_shader);
         std::optional<std::string> result{};
         if (new_shader) {
+            entry = std::make_unique<OGLShaderStage>(separable);
             result = CodeGenerator(config, args...);
-            cached_shader.Create(result->c_str(), ShaderType);
+            entry->Create(result->c_str(), ShaderType);
         }
-        return {iter->first, cached_shader.GetHandle(), std::move(result)};
+        return {hash, entry->GetHandle(), std::move(result)};
     }
 
     void Inject(const KeyConfigType& key, OGLProgram&& program) {
-        OGLShaderStage stage{separable};
-        stage.Inject(std::move(program));
-        shaders.emplace(key.Hash(), std::move(stage));
+        auto stage = std::make_unique<OGLShaderStage>(separable);
+        stage->Inject(std::move(program));
+        shaders.InsertOrAssign(key.Hash(), std::move(stage));
     }
 
     void Inject(const KeyConfigType& key, OGLShaderStage&& stage) {
-        shaders.emplace(key.Hash(), std::move(stage));
+        shaders.InsertOrAssign(key.Hash(),
+                               std::make_unique<OGLShaderStage>(std::move(stage)));
     }
 
 private:
     bool separable;
-    std::unordered_map<u64, OGLShaderStage> shaders;
+    Pow2HashMap<std::unique_ptr<OGLShaderStage>> shaders;
 };
 
 // This is a cache designed for shaders translated from PICA shaders. The first cache matches the
@@ -202,53 +303,72 @@ public:
                                                             const ExtraConfigType& extra,
                                                             const Pica::ShaderSetup& setup) {
         std::optional<std::string> result{};
-        const size_t key_hash = key.Hash();
-        auto map_it = shader_map.find(key_hash);
-        if (map_it == shader_map.end()) {
-            auto program = Common::HashableString(CodeGenerator(setup, key, extra));
-            if (program.empty()) {
-                shader_map[key_hash] = nullptr;
+        const u64 key_hash = key.Hash();
+        if (MapEntry* mapped = shader_map.Find(key_hash)) {
+            if (mapped->stage == nullptr) {
                 return {0, 0, std::nullopt};
             }
-
-            auto [iter, new_shader] =
-                shader_cache.emplace(program.Hash(), OGLShaderStage{separable});
-            OGLShaderStage& cached_shader = iter->second;
-            if (new_shader) {
-                result = std::move(program);
-                cached_shader.Create((*result).c_str(), ShaderType);
-            }
-            shader_map[key_hash] = &cached_shader;
-            return {key_hash, cached_shader.GetHandle(), std::move(result)};
+            return {mapped->code_hash, mapped->stage->GetHandle(), std::nullopt};
         }
 
-        if (map_it->second == nullptr) {
+        auto program = Common::HashableString(CodeGenerator(setup, key, extra));
+        if (program.empty()) {
+            shader_map.InsertOrAssign(key_hash, MapEntry{});
             return {0, 0, std::nullopt};
         }
 
-        return {key_hash, map_it->second->GetHandle(), std::nullopt};
+        // The returned identity is the hash of the generated code, not of the config: configs
+        // hash leftover PICA program-buffer bytes, so the same shader reaches here under a
+        // different config hash every boot. Program ids built from config hashes never matched
+        // the precompiled disk cache again, which re-linked and re-dumped every program on
+        // every run. The code hash is stable across boots.
+        const u64 code_hash = program.Hash();
+        bool new_shader;
+        auto& entry = shader_cache.FindOrInsert(code_hash, new_shader);
+        if (new_shader) {
+            entry = std::make_unique<OGLShaderStage>(separable);
+            result = std::move(program);
+            entry->Create((*result).c_str(), ShaderType);
+        }
+        shader_map.InsertOrAssign(key_hash, MapEntry{entry.get(), code_hash});
+        return {code_hash, entry->GetHandle(), std::move(result)};
     }
 
     void Inject(const KeyConfigType& key, std::string decomp, OGLProgram&& program) {
-        OGLShaderStage stage{separable};
-        stage.Inject(std::move(program));
+        auto stage = std::make_unique<OGLShaderStage>(separable);
+        stage->Inject(std::move(program));
         auto decomp_hash = Common::HashableString(std::move(decomp));
-        const auto iter = shader_cache.emplace(decomp_hash.Hash(), std::move(stage)).first;
-        OGLShaderStage& cached_shader = iter->second;
-        shader_map.insert_or_assign(key.Hash(), &cached_shader);
+        const u64 code_hash = decomp_hash.Hash();
+        bool inserted;
+        auto& entry = shader_cache.FindOrInsert(code_hash, inserted);
+        if (inserted) {
+            entry = std::move(stage);
+        }
+        shader_map.InsertOrAssign(key.Hash(), MapEntry{entry.get(), code_hash});
     }
 
     void Inject(const KeyConfigType& key, std::string decomp, OGLShaderStage&& stage) {
         auto decomp_hash = Common::HashableString(std::move(decomp));
-        const auto iter = shader_cache.emplace(decomp_hash.Hash(), std::move(stage)).first;
-        OGLShaderStage& cached_shader = iter->second;
-        shader_map.insert_or_assign(key.Hash(), &cached_shader);
+        const u64 code_hash = decomp_hash.Hash();
+        bool inserted;
+        auto& entry = shader_cache.FindOrInsert(code_hash, inserted);
+        if (inserted) {
+            entry = std::make_unique<OGLShaderStage>(std::move(stage));
+        }
+        shader_map.InsertOrAssign(key.Hash(), MapEntry{entry.get(), code_hash});
     }
 
 private:
+    // Config-hash -> {stage, code hash}. The code hash rides along so cache hits can return
+    // the boot-stable identity without regenerating the source.
+    struct MapEntry {
+        OGLShaderStage* stage = nullptr;
+        u64 code_hash = 0;
+    };
+
     bool separable;
-    std::unordered_map<u64, OGLShaderStage*> shader_map;
-    std::unordered_map<u64, OGLShaderStage> shader_cache;
+    Pow2HashMap<MapEntry> shader_map;
+    Pow2HashMap<std::unique_ptr<OGLShaderStage>> shader_cache;
 };
 
 using ProgrammableVertexShaders =
@@ -271,7 +391,15 @@ public:
         profile = Pica::Shader::Profile{
             .has_separable_shaders = separable,
             .has_clip_planes = driver.HasClipCullDistance(),
-            .has_geometry_shader = true,
+            // Geometry shaders are not used: the quaternion short-arc fix runs per fragment
+            // against a flat varying, so GS-less targets are first-class.
+            .has_geometry_shader = false,
+            // GLES reads LUTs from 2D textures (works on 3.1-class hardware without TBOs);
+            // desktop GL keeps the texture-buffer path.
+            .has_texture_buffer = !driver.IsOpenGLES(),
+            // Every desktop GL and GLES 3.0 context has texelFetch. GXM-backed drivers do
+            // not, and CITRA_NO_TEXEL_FETCH=1 exercises that path on hardware that does.
+            .has_texel_fetch = std::getenv("CITRA_NO_TEXEL_FETCH") == nullptr,
             .has_custom_border_color = true,
             .has_fragment_shader_interlock = driver.HasArbFragmentShaderInterlock(),
             // TODO: This extension requires GLSL 450 / OpenGL 4.5 context.
@@ -325,7 +453,7 @@ public:
     FixedGeometryShaders fixed_geometry_shaders;
 
     FragmentShaders fragment_shaders;
-    std::unordered_map<u64, OGLProgram> program_cache;
+    Pow2HashMap<OGLProgram> program_cache;
     OGLPipeline pipeline;
     ShaderDiskCache disk_cache;
 
@@ -333,12 +461,10 @@ public:
         const Pica::Shader::Generator::PicaVSConfig& config, bool accurate_mul) {
         auto res = ExtraVSConfig();
 
-        // Enable the geometry-shader only if we are actually doing per-fragment lighting
-        // and care about proper quaternions. Otherwise just use standard vertex+fragment shaders.
-        const bool use_geometry_shader = !config.state.lighting_disable;
-
         res.use_clip_planes = profile.has_clip_planes;
-        res.use_geometry_shader = use_geometry_shader;
+        // Never route through a geometry stage: the vertex shader emits the full fragment
+        // interface (including the flat quaternion copy) directly.
+        res.use_geometry_shader = false;
         res.sanitize_mul = accurate_mul;
         res.separable_shader = separable;
         res.load_flags.fill(AttribLoadFlags::Float);
@@ -367,6 +493,10 @@ bool ShaderProgramManager::UseProgrammableVertexShader(const Pica::RegsInternal&
         return false;
     impl->current.vs = handle;
     impl->current.vs_hash = hash;
+    if (result) {
+        // The Cg emitter's corpus: every vertex program this session compiles, as GXM Cg.
+        Pica::Shader::Generator::Cg::MaybeDumpVertex(setup, config, hash);
+    }
 
     // Save VS to the disk cache if its a new shader
     if (result) {
@@ -390,15 +520,8 @@ void ShaderProgramManager::UseTrivialVertexShader() {
 }
 
 void ShaderProgramManager::UseFixedGeometryShader(const Pica::RegsInternal& regs) {
-    PicaFixedGSConfig gs_config(regs);
-    ExtraFixedGSConfig extra{
-        .use_clip_planes = driver.HasClipCullDistance(),
-        .separable_shader = impl->separable,
-    };
-
-    auto [hash, handle, _] = impl->fixed_geometry_shaders.Get(gs_config, extra);
-    impl->current.gs = handle;
-    impl->current.gs_hash = hash;
+    // Geometry shaders are gone; the per-fragment flat-varying fix replaced the fixed GS.
+    UseTrivialGeometryShader();
 }
 
 void ShaderProgramManager::UseTrivialGeometryShader() {
@@ -419,6 +542,9 @@ void ShaderProgramManager::UseFragmentShader(const Pica::RegsInternal& regs,
         ShaderDiskCacheRaw raw{unique_identifier, ProgramType::FS, regs, {}};
         disk_cache.SaveRaw(raw);
         disk_cache.SaveDecompiled(unique_identifier, *result, false);
+        // Emitter-validation harness: every config the GL renderer meets also goes through
+        // the GXM Cg emitter, so a play session produces the corpus psp2cgc must accept.
+        Pica::Shader::Generator::Cg::MaybeDump(fs_config, user, hash);
     }
 }
 
@@ -437,7 +563,9 @@ void ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul) {
         state.draw.program_pipeline = impl->pipeline.handle;
     } else {
         const u64 unique_identifier = impl->current.GetConfigHash();
-        OGLProgram& cached_program = impl->program_cache[unique_identifier];
+        bool program_inserted;
+        OGLProgram& cached_program =
+            impl->program_cache.FindOrInsert(unique_identifier, program_inserted);
         if (cached_program.handle == 0) {
             cached_program.Create(false,
                                   std::array{impl->current.vs, impl->current.gs, impl->current.fs});
@@ -567,8 +695,9 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
             const u64 unique_identifier{dump.first};
             const auto decomp{decompiled_map.find(unique_identifier)};
 
-            // Only load the program if its sanitize_mul setting matches
-            if (decomp->second.sanitize_mul != accurate_mul) {
+            // Only load the program if its sanitize_mul setting matches. A dump with no
+            // decompiled entry used to dereference end() here and read garbage.
+            if (decomp == decompiled_map.end() || decomp->second.sanitize_mul != accurate_mul) {
                 continue;
             }
 
@@ -576,7 +705,7 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
             OGLProgram shader =
                 GeneratePrecompiledProgram(dump.second, supported_formats, impl->separable);
             if (shader.handle != 0) {
-                impl->program_cache.emplace(unique_identifier, std::move(shader));
+                impl->program_cache.InsertOrAssign(unique_identifier, std::move(shader));
             } else {
                 LOG_ERROR(Frontend, "Failed to link Precompiled program!");
                 compilation_failed = true;
@@ -597,7 +726,7 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
     bool load_all_raws = false;
     if (compilation_failed) {
         // Invalidate the precompiled cache if a shader dumped shader was rejected
-        impl->program_cache.clear();
+        impl->program_cache.Clear();
         disk_cache.InvalidatePrecompiled();
         dumps.clear();
         precompiled_cache_altered = true;
@@ -698,7 +827,13 @@ void ShaderProgramManager::LoadDiskCache(const std::atomic_bool& stop_loading,
             contexts[i] = emu_window.CreateSharedContext();
             // Release the context, so it can be immediately used by the spawned thread
             contexts[i]->DoneCurrent();
-            threads[i] = std::thread(LoadRawSepareble, start, end, contexts[i].get());
+            threads[i] = std::thread(
+                [&LoadRawSepareble](std::size_t begin, std::size_t end,
+                                    Frontend::GraphicsContext* context) {
+                    Common::SetCurrentThreadRole(Common::ThreadRole::Other);
+                    LoadRawSepareble(begin, end, context);
+                },
+                start, end, contexts[i].get());
         }
         for (auto& thread : threads) {
             thread.join();

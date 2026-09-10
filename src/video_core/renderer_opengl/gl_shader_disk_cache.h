@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <glad/glad.h>
 
@@ -223,6 +224,12 @@ private:
 
     FileUtil::IOFile transferable_file;
     FileUtil::IOFile precompiled_file;
+
+    // Program binaries known to already exist in the precompiled file (loaded at boot or
+    // appended this session). SaveDumpToFile skips these: without the check, any dump that
+    // fails to apply at load is recompiled and re-appended every run, and the append-only
+    // file grows without bound (observed at 738 MB, which a 32-bit load cannot survive).
+    std::unordered_set<u64> dumped_ids;
 };
 
 } // namespace OpenGL

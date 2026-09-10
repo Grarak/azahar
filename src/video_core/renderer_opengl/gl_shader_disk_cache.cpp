@@ -202,6 +202,15 @@ ShaderDiskCache::LoadPrecompiled(bool compressed) {
 
 std::optional<std::pair<std::unordered_map<u64, ShaderDiskCacheDecompiled>, ShaderDumpsMap>>
 ShaderDiskCache::LoadPrecompiledFile(FileUtil::IOFile& file, bool compressed) {
+    // A precompiled file this large is the append-bug artifact of older builds; loading it
+    // needs two copies in memory at once, which a 32-bit address space cannot survive.
+    // Reject it so the caller invalidates and starts fresh.
+    constexpr u64 MAX_PRECOMPILED_FILE_BYTES = 256 * 1024 * 1024;
+    if (file.GetSize() > MAX_PRECOMPILED_FILE_BYTES) {
+        LOG_ERROR(Render_OpenGL, "Precompiled cache is {} bytes, rejecting", file.GetSize());
+        return std::nullopt;
+    }
+
     // Read compressed file from disk and decompress to virtual precompiled cache file
     std::vector<u8> precompiled_file(file.GetSize());
     file.ReadBytes(precompiled_file.data(), precompiled_file.size());
@@ -272,6 +281,7 @@ ShaderDiskCache::LoadPrecompiledFile(FileUtil::IOFile& file, bool compressed) {
             }
 
             dumps.insert({unique_identifier, dump});
+            dumped_ids.insert(unique_identifier);
             break;
         }
         default:
@@ -348,6 +358,7 @@ void ShaderDiskCache::InvalidateAll() {
 }
 
 void ShaderDiskCache::InvalidatePrecompiled() {
+    dumped_ids.clear();
     // Clear virtual precompiled cache file
     decompressed_precompiled_cache.resize(0);
 
@@ -383,6 +394,15 @@ void ShaderDiskCache::SaveDecompiled(u64 unique_identifier, const std::string& c
     if (!IsUsable())
         return;
 
+    // The decompiled programs accumulate in this in-memory image of the precompiled file for the
+    // whole session. A long session (or a large transferable cache from previous ones) walks it
+    // past what a 32-bit address space survives — observed at 631 MB before the OOM. Cap it: the
+    // cache beyond this point is a nicety, running out of address space is not.
+    constexpr std::size_t MAX_VIRTUAL_PRECOMPILED_BYTES = 48 * 1024 * 1024;
+    if (decompressed_precompiled_cache.size() > MAX_VIRTUAL_PRECOMPILED_BYTES) {
+        return;
+    }
+
     if (decompressed_precompiled_cache.empty()) {
         SavePrecompiledHeaderToVirtualPrecompiledCache();
     }
@@ -396,6 +416,10 @@ void ShaderDiskCache::SaveDecompiled(u64 unique_identifier, const std::string& c
 
 void ShaderDiskCache::SaveDump(u64 unique_identifier, GLuint program) {
     if (!IsUsable())
+        return;
+
+    // Same dedup as SaveDumpToFile: never append a binary the image already holds.
+    if (!dumped_ids.insert(unique_identifier).second)
         return;
 
     GLint binary_length{};
@@ -419,6 +443,11 @@ void ShaderDiskCache::SaveDump(u64 unique_identifier, GLuint program) {
 
 void ShaderDiskCache::SaveDumpToFile(u64 unique_identifier, GLuint program, bool sanitize_mul) {
     if (!IsUsable())
+        return;
+
+    // Already in the file (from a previous session or this one); appending again only grows
+    // the file with duplicates that the loader then has to parse and shadow.
+    if (!dumped_ids.insert(unique_identifier).second)
         return;
 
     GLint binary_length{};
