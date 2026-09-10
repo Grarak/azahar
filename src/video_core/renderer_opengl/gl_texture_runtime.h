@@ -52,6 +52,15 @@ public:
     /// Returns true if the provided pixel format cannot be used natively by the runtime.
     bool NeedsConversion(const Surface& surface) const;
 
+    /// Whether a readback of this surface may be answered from the last one instead. Nothing
+    /// here waits for the GPU, so this exists to let the desktop tier show what the staleness
+    /// looks like: AZAHAR_STALE_READBACK=1. Off by default, and for the reason in the GXM
+    /// runtime's copy of this.
+    bool CanSkipDownload(const Surface&) const {
+        static const bool on = std::getenv("AZAHAR_STALE_READBACK") != nullptr;
+        return on;
+    }
+
     /// Maps an internal staging buffer of the provided size of pixel uploads/downloads
     VideoCore::StagingData FindStaging(u32 size, bool upload);
 

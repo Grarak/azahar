@@ -2,6 +2,8 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
+#include <cstdlib>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/literals.h"
@@ -11,6 +13,8 @@
 #include "core/loader/loader.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_opengl/gl_rasterizer.h"
+#include "video_core/video_core.h"
+#include "video_core/renderer_opengl/gl_vars.h"
 #include "video_core/renderer_opengl/pica_to_gl.h"
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #include "video_core/shader/generator/shader_gen.h"
@@ -30,7 +34,9 @@ using VideoCore::SurfaceType;
 using namespace Common::Literals;
 using namespace Pica::Shader::Generator;
 
-constexpr std::size_t VERTEX_BUFFER_SIZE = 16_MiB;
+// The vertex buffer doubles as the zero-copy ring the emulation thread writes shaded vertices
+// into; sized for several uncapped frames of triangles so ring-full waits stay rare.
+constexpr std::size_t VERTEX_BUFFER_SIZE = 64_MiB;
 constexpr std::size_t INDEX_BUFFER_SIZE = 2_MiB;
 constexpr std::size_t UNIFORM_BUFFER_SIZE = 8_MiB;
 constexpr std::size_t TEXTURE_BUFFER_SIZE = 2_MiB;
@@ -87,7 +93,7 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
     : VideoCore::RasterizerAccelerated{memory, pica}, driver{driver_},
       render_window{renderer.GetRenderWindow()}, runtime{driver, renderer},
       res_cache{memory, custom_tex_manager, runtime, regs, renderer},
-      vertex_buffer{driver, GL_ARRAY_BUFFER, VERTEX_BUFFER_SIZE},
+      vertex_buffer{driver, GL_ARRAY_BUFFER, VERTEX_BUFFER_SIZE, true},
       uniform_buffer{driver, GL_UNIFORM_BUFFER, UNIFORM_BUFFER_SIZE},
       index_buffer{driver, GL_ELEMENT_ARRAY_BUFFER, INDEX_BUFFER_SIZE},
       texture_buffer{driver, GL_TEXTURE_BUFFER, TextureBufferSize(driver, false)},
@@ -108,55 +114,83 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
     uniform_size_aligned_fs =
         Common::AlignUp<std::size_t>(sizeof(FSUniformData), uniform_buffer_alignment);
 
-    // Set vertex attributes for software shader path
+    // Set vertex attributes for software shader path. With a persistently mapped vertex buffer
+    // the ring holds Pica::OutputVertex exactly as the emulation thread produced it — the GL
+    // reads the guest layout in place and the HardwareVertex relayout never happens. Without the
+    // mapping the batch is HardwareVertex uploaded by memcpy, as before.
     state.draw.vertex_array = sw_vao.handle;
     state.draw.vertex_buffer = vertex_buffer.GetHandle();
     state.Apply();
 
-    glVertexAttribPointer(ATTRIBUTE_POSITION, 4, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, position));
-    glEnableVertexAttribArray(ATTRIBUTE_POSITION);
+    const bool ring_layout = vertex_buffer.CoherentMapping() != nullptr;
+    const GLsizei stride =
+        ring_layout ? sizeof(Pica::OutputVertex) : sizeof(HardwareVertex);
+    const auto attrib = [&](GLuint index, GLint size, std::size_t ring_offset,
+                            std::size_t batch_offset) {
+        glVertexAttribPointer(index, size, GL_FLOAT, GL_FALSE, stride,
+                              (GLvoid*)(ring_layout ? ring_offset : batch_offset));
+        glEnableVertexAttribArray(index);
+    };
+    attrib(ATTRIBUTE_POSITION, 4, offsetof(Pica::OutputVertex, pos),
+           offsetof(HardwareVertex, position));
+    attrib(ATTRIBUTE_COLOR, 4, offsetof(Pica::OutputVertex, color),
+           offsetof(HardwareVertex, color));
+    attrib(ATTRIBUTE_TEXCOORD0, 2, offsetof(Pica::OutputVertex, tc0),
+           offsetof(HardwareVertex, tex_coord0));
+    attrib(ATTRIBUTE_TEXCOORD1, 2, offsetof(Pica::OutputVertex, tc1),
+           offsetof(HardwareVertex, tex_coord1));
+    attrib(ATTRIBUTE_TEXCOORD2, 2, offsetof(Pica::OutputVertex, tc2),
+           offsetof(HardwareVertex, tex_coord2));
+    attrib(ATTRIBUTE_TEXCOORD0_W, 1, offsetof(Pica::OutputVertex, tc0_w),
+           offsetof(HardwareVertex, tex_coord0_w));
+    attrib(ATTRIBUTE_NORMQUAT, 4, offsetof(Pica::OutputVertex, quat),
+           offsetof(HardwareVertex, normquat));
+    attrib(ATTRIBUTE_VIEW, 3, offsetof(Pica::OutputVertex, view),
+           offsetof(HardwareVertex, view));
 
-    glVertexAttribPointer(ATTRIBUTE_COLOR, 4, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, color));
-    glEnableVertexAttribArray(ATTRIBUTE_COLOR);
-
-    glVertexAttribPointer(ATTRIBUTE_TEXCOORD0, 2, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, tex_coord0));
-    glVertexAttribPointer(ATTRIBUTE_TEXCOORD1, 2, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, tex_coord1));
-    glVertexAttribPointer(ATTRIBUTE_TEXCOORD2, 2, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, tex_coord2));
-    glEnableVertexAttribArray(ATTRIBUTE_TEXCOORD0);
-    glEnableVertexAttribArray(ATTRIBUTE_TEXCOORD1);
-    glEnableVertexAttribArray(ATTRIBUTE_TEXCOORD2);
-
-    glVertexAttribPointer(ATTRIBUTE_TEXCOORD0_W, 1, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, tex_coord0_w));
-    glEnableVertexAttribArray(ATTRIBUTE_TEXCOORD0_W);
-
-    glVertexAttribPointer(ATTRIBUTE_NORMQUAT, 4, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, normquat));
-    glEnableVertexAttribArray(ATTRIBUTE_NORMQUAT);
-
-    glVertexAttribPointer(ATTRIBUTE_VIEW, 3, GL_FLOAT, GL_FALSE, sizeof(HardwareVertex),
-                          (GLvoid*)offsetof(HardwareVertex, view));
-    glEnableVertexAttribArray(ATTRIBUTE_VIEW);
-
-    // Allocate and bind texture buffer lut textures
+    // Allocate and bind the LUT textures. Desktop GL exposes them as texture buffers over the
+    // stream buffers; GLES uses 2D textures so 3.1-class hardware without TBOs works, uploaded
+    // row-per-block by UploadLutRow.
+    lut_textures_2d = driver.IsOpenGLES();
     texture_buffer_lut_lf.Create();
     texture_buffer_lut_rg.Create();
     texture_buffer_lut_rgba.Create();
-    state.texture_buffer_lut_lf.texture_buffer = texture_buffer_lut_lf.handle;
-    state.texture_buffer_lut_rg.texture_buffer = texture_buffer_lut_rg.handle;
-    state.texture_buffer_lut_rgba.texture_buffer = texture_buffer_lut_rgba.handle;
-    state.Apply();
-    glActiveTexture(TextureUnits::TextureBufferLUT_LF.Enum());
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_lf_buffer.GetHandle());
-    glActiveTexture(TextureUnits::TextureBufferLUT_RG.Enum());
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_buffer.GetHandle());
-    glActiveTexture(TextureUnits::TextureBufferLUT_RGBA.Enum());
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, texture_buffer.GetHandle());
+    if (lut_textures_2d) {
+        // Shape comes from the shader generator's constants: the fragment shader bakes the
+        // index arithmetic in, so the allocation must match it.
+        lut_lf_rows = Pica::Shader::LUT_LF_ROWS;
+        lut_rg_rows = Pica::Shader::LUT_RG_ROWS;
+        lut_rgba_rows = Pica::Shader::LUT_RGBA_ROWS;
+        const auto setup_2d = [&](u32 unit_enum, const OGLTexture& tex, GLenum internal_format,
+                                  u32 rows) {
+            glActiveTexture(unit_enum);
+            glBindTexture(GL_TEXTURE_2D, tex.handle);
+            glTexStorage2D(GL_TEXTURE_2D, 1, internal_format, LUT_TEX_WIDTH, rows);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            // Clamped so the normalised LUT reads used when the target has no texelFetch
+            // cannot wrap at the ends of a row.
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        };
+        setup_2d(TextureUnits::TextureBufferLUT_LF.Enum(), texture_buffer_lut_lf, GL_RG32F,
+                 lut_lf_rows);
+        setup_2d(TextureUnits::TextureBufferLUT_RG.Enum(), texture_buffer_lut_rg, GL_RG32F,
+                 lut_rg_rows);
+        setup_2d(TextureUnits::TextureBufferLUT_RGBA.Enum(), texture_buffer_lut_rgba, GL_RGBA32F,
+                 lut_rgba_rows);
+    } else {
+        state.texture_buffer_lut_lf.texture_buffer = texture_buffer_lut_lf.handle;
+        state.texture_buffer_lut_rg.texture_buffer = texture_buffer_lut_rg.handle;
+        state.texture_buffer_lut_rgba.texture_buffer = texture_buffer_lut_rgba.handle;
+        state.Apply();
+        glActiveTexture(TextureUnits::TextureBufferLUT_LF.Enum());
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_lf_buffer.GetHandle());
+        glActiveTexture(TextureUnits::TextureBufferLUT_RG.Enum());
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RG32F, texture_buffer.GetHandle());
+        glActiveTexture(TextureUnits::TextureBufferLUT_RGBA.Enum());
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, texture_buffer.GetHandle());
+    }
 
     // Bind index buffer for hardware shader path
     state.draw.vertex_array = hw_vao.handle;
@@ -164,11 +198,98 @@ RasterizerOpenGL::RasterizerOpenGL(Memory::MemorySystem& memory, Pica::PicaCore&
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, index_buffer.GetHandle());
 
     glEnable(GL_BLEND);
+
+    // Zero-copy vertex path: when the vertex buffer is persistently and coherently mapped, the
+    // emulation thread writes HardwareVertex data straight into it and draws arrive as ring
+    // ranges. The usable size is truncated to a whole number of vertices so byte positions
+    // divide evenly into first-vertex indices.
+    if (u8* const mapping = vertex_buffer.CoherentMapping()) {
+        ring.base = mapping;
+        ring.size = (static_cast<u64>(vertex_buffer.GetSize()) / sizeof(Pica::OutputVertex)) *
+                    sizeof(Pica::OutputVertex);
+        LOG_INFO(Render_OpenGL, "Zero-copy vertex ring active: {} MiB", ring.size >> 20);
+    } else {
+        LOG_INFO(Render_OpenGL, "No persistent coherent mapping; vertex data will be copied");
+    }
+    // What the renderer holds, on request from the debug port.
+    VideoCore::surface_dump_hook = [](void* self, const char* dir) {
+        static_cast<RasterizerOpenGL*>(self)->res_cache.DumpSurfaces(dir, 0);
+    };
+    VideoCore::surface_dump_user = this;
 }
 
-RasterizerOpenGL::~RasterizerOpenGL() = default;
+RasterizerOpenGL::~RasterizerOpenGL() {
+    VideoCore::surface_dump_hook = nullptr;
+    VideoCore::surface_dump_user = nullptr;
+    for (const auto& fence : ring_fences) {
+        glDeleteSync(fence.sync);
+    }
+}
+
+VideoCore::VertexRing* RasterizerOpenGL::GetVertexRing() {
+    return ring.Active() ? &ring : nullptr;
+}
+
+void RasterizerOpenGL::PollRingFences() {
+    while (!ring_fences.empty()) {
+        const auto& fence = ring_fences.front();
+        const GLenum status = glClientWaitSync(fence.sync, 0, 0);
+        if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
+            break;
+        }
+        glDeleteSync(fence.sync);
+        ring.Retire(fence.ring_pos);
+        ring_fences.pop_front();
+    }
+}
+
+void RasterizerOpenGL::RingFenceTick() {
+    if (ring_unfenced_pos > ring_fenced_pos) {
+        ring_fences.push_back({glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0), ring_unfenced_pos});
+        ring_fenced_pos = ring_unfenced_pos;
+    }
+    PollRingFences();
+}
+
+void RasterizerOpenGL::RingRetireBlocking() {
+    if (ring_fences.empty()) {
+        // Nothing in flight is fenced yet: fence what has been drawn so far so there is
+        // something to wait on. Without this a full ring between presents would spin.
+        if (ring_unfenced_pos <= ring_fenced_pos) {
+            return;
+        }
+        RingFenceTick();
+        if (ring_fences.empty()) {
+            return;
+        }
+    }
+    const auto& fence = ring_fences.front();
+    // A generous timeout in a loop rather than GL_TIMEOUT_IGNORED: a wedged GL should surface as
+    // a stall with log context, not a silent hang.
+    GLenum status;
+    do {
+        status = glClientWaitSync(fence.sync, GL_SYNC_FLUSH_COMMANDS_BIT, 100'000'000);
+    } while (status == GL_TIMEOUT_EXPIRED);
+    glDeleteSync(fence.sync);
+    ring.Retire(fence.ring_pos);
+    ring_fences.pop_front();
+    PollRingFences();
+}
+
+void RasterizerOpenGL::DrawRingRange(u32 first, u32 count, u64 ring_end_pos) {
+    ring_draw_first = first;
+    ring_draw_count = count;
+    ring_draw_active = true;
+    Draw(false, false);
+    ring_draw_active = false;
+    ring_unfenced_pos = std::max(ring_unfenced_pos, ring_end_pos);
+}
 
 void RasterizerOpenGL::TickFrame() {
+    // The runtime's resource tick is what the garbage collector and the trim measure age
+    // against, and nothing else on this backend advanced it: sentenced surfaces were never
+    // freed and every surface looked used this tick.
+    runtime.Finish();
     res_cache.TickFrame();
 }
 
@@ -365,7 +486,8 @@ void RasterizerOpenGL::SyncDrawState() {
 }
 
 void RasterizerOpenGL::SetupVertexArray(u8* array_ptr, GLintptr buffer_offset,
-                                        GLuint vs_input_index_min, GLuint vs_input_index_max) {
+                                        GLuint vs_input_index_min, GLuint vs_input_index_max,
+                                        const Pica::DrawPayload* shipped) {
     MICROPROFILE_SCOPE(OpenGL_VAO);
     const auto& vertex_attributes = regs.pipeline.vertex_attributes;
     PAddr base_address = vertex_attributes.GetPhysicalBaseAddress();
@@ -376,8 +498,15 @@ void RasterizerOpenGL::SetupVertexArray(u8* array_ptr, GLintptr buffer_offset,
 
     std::array<bool, 16> enable_attributes{};
 
+    u32 loader_index = static_cast<u32>(-1);
     for (const auto& loader : vertex_attributes.attribute_loaders) {
+        loader_index++;
         if (loader.component_count == 0 || loader.byte_count == 0) {
+            continue;
+        }
+        if (shipped && !(shipped->layout.used_mask & (1u << loader_index))) {
+            // The emulation side recorded no attribute bytes for this loader (padding-only);
+            // nothing to upload and nothing references it.
             continue;
         }
 
@@ -407,14 +536,20 @@ void RasterizerOpenGL::SetupVertexArray(u8* array_ptr, GLintptr buffer_offset,
             }
         }
 
-        const PAddr data_addr =
-            base_address + loader.data_offset + (vs_input_index_min * loader.byte_count);
-
         const u32 vertex_num = vs_input_index_max - vs_input_index_min + 1;
         const u32 data_size = loader.byte_count * vertex_num;
 
-        res_cache.FlushRegion(data_addr, data_size);
-        std::memcpy(array_ptr, memory.GetPhysicalPointer(data_addr), data_size);
+        if (shipped) {
+            // The draw's attribute bytes were frozen in the arena when it shipped; the arena
+            // layout matches this loader walk by construction.
+            std::memcpy(array_ptr, shipped->arena + shipped->layout.loader_offset[loader_index],
+                        data_size);
+        } else {
+            const PAddr data_addr =
+                base_address + loader.data_offset + (vs_input_index_min * loader.byte_count);
+            res_cache.FlushRegion(data_addr, data_size);
+            std::memcpy(array_ptr, memory.GetPhysicalPointer(data_addr), data_size);
+        }
 
         array_ptr += data_size;
         buffer_offset += data_size;
@@ -454,16 +589,24 @@ bool RasterizerOpenGL::SetupGeometryShader() {
         return false;
     }
 
-    // Enable the quaternion fix-up geometry-shader only if we are actually doing per-fragment
-    // lighting and care about proper quaternions. Otherwise just use standard vertex+fragment
-    // shaders
-    if (regs.lighting.disable) {
-        curr_shader_manager->UseTrivialGeometryShader();
-    } else {
-        curr_shader_manager->UseFixedGeometryShader(regs);
-    }
+    // No geometry stage: the quaternion short-arc fix runs per fragment against the flat
+    // varying the vertex shader emits, so this path works on hardware without geometry shaders.
+    curr_shader_manager->UseTrivialGeometryShader();
 
     return true;
+}
+
+bool RasterizerOpenGL::AccelerateShippedDraw(const Pica::DrawPayload& payload) {
+    if (regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No) {
+        return false;
+    }
+    if (!SetupVertexShader()) {
+        return false;
+    }
+    if (!SetupGeometryShader()) {
+        return false;
+    }
+    return Draw(true, payload.is_indexed, &payload);
 }
 
 bool RasterizerOpenGL::AccelerateDrawBatch(bool is_indexed) {
@@ -487,9 +630,13 @@ bool RasterizerOpenGL::AccelerateDrawBatch(bool is_indexed) {
     return Draw(true, is_indexed);
 }
 
-bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
+bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed,
+                                                   const Pica::DrawPayload* shipped) {
     const GLenum primitive_mode = MakePrimitiveMode(regs.pipeline.triangle_topology);
-    const auto vertex_array_info = AnalyzeVertexArray(is_indexed);
+    const auto vertex_array_info =
+        shipped ? VertexArrayInfo{shipped->vertex_min, shipped->vertex_max,
+                                  shipped->layout.index_offset}
+                : AnalyzeVertexArray(is_indexed);
 
     if (vertex_array_info.Invalid()) {
         // Do not draw anything if the vertex array is invalid.
@@ -507,11 +654,30 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
 
     u8* buffer_ptr;
     GLintptr buffer_offset;
-    std::tie(buffer_ptr, buffer_offset, std::ignore) =
-        vertex_buffer.Map(vertex_array_info.vs_input_size, 4);
+    bool ring_upload = false;
+    if (shipped && ring.Active()) {
+        // The vertex buffer is the persistently mapped ring: allocate from it directly. Padding
+        // to the software path's vertex stride keeps the ring's first-index arithmetic exact for
+        // the triangle writes that share this buffer.
+        const u32 bytes = Common::AlignUp<u32>(
+            std::max<u32>(vertex_array_info.vs_input_size, 1), sizeof(Pica::OutputVertex));
+        u32 off = ring.TryAlloc(bytes);
+        while (off == VideoCore::VertexRing::FULL) {
+            RingRetireBlocking();
+            off = ring.TryAlloc(bytes);
+        }
+        buffer_ptr = ring.base + off;
+        buffer_offset = off;
+        ring_upload = true;
+    } else {
+        std::tie(buffer_ptr, buffer_offset, std::ignore) =
+            vertex_buffer.Map(vertex_array_info.vs_input_size, 4);
+    }
     SetupVertexArray(buffer_ptr, buffer_offset, vertex_array_info.vs_input_index_min,
-                     vertex_array_info.vs_input_index_max);
-    vertex_buffer.Unmap(vertex_array_info.vs_input_size);
+                     vertex_array_info.vs_input_index_max, shipped);
+    if (!ring_upload) {
+        vertex_buffer.Unmap(vertex_array_info.vs_input_size);
+    }
 
     curr_shader_manager->ApplyTo(state, accurate_mul);
     state.Apply();
@@ -526,8 +692,10 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
         }
 
         const u8* index_data =
-            memory.GetPhysicalPointer(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
-                                      regs.pipeline.index_array.offset);
+            shipped ? shipped->arena + shipped->layout.index_offset
+                    : memory.GetPhysicalPointer(
+                          regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
+                          regs.pipeline.index_array.offset);
         std::tie(buffer_ptr, buffer_offset, std::ignore) = index_buffer.Map(index_buffer_size, 4);
         std::memcpy(buffer_ptr, index_data, index_buffer_size);
         index_buffer.Unmap(index_buffer_size);
@@ -541,22 +709,40 @@ bool RasterizerOpenGL::AccelerateDrawBatchInternal(bool is_indexed) {
     } else {
         glDrawArrays(primitive_mode, 0, regs.pipeline.num_vertices);
     }
+    if (ring_upload) {
+        ring_unfenced_pos = std::max(ring_unfenced_pos, ring.cursor);
+    }
     return true;
 }
 
 void RasterizerOpenGL::DrawTriangles() {
+    if (!pending_ring_ranges.empty()) {
+        // Triangles were written straight into the vertex ring by AddTriangle; draw the ranges.
+        for (const auto& range : pending_ring_ranges) {
+            DrawRingRange(range.first, range.count, range.end_pos);
+        }
+        pending_ring_ranges.clear();
+        return;
+    }
     if (vertex_batch.empty())
         return;
     Draw(false, false);
 }
 
-bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed, const Pica::DrawPayload* shipped) {
     MICROPROFILE_SCOPE(OpenGL_Drawing);
     const DebugScope scope(runtime, Common::Vec4f{}, "RasterizerOpenGL::Draw");
 
     SyncDrawState();
 
     const bool shadow_rendering = regs.framebuffer.IsShadowRendering();
+    if (shadow_rendering && GLES && !GLAD_GL_ES_VERSION_3_1) {
+        // Shadow rendering needs image load/store, which GLES 3.0-class hardware lacks. Dropping
+        // the pass loses shadow maps but keeps everything else rendering.
+        LOG_WARNING(Render_OpenGL, "Skipping shadow-rendering pass: needs GLES 3.1 image "
+                                   "load/store (once per session)");
+        return true;
+    }
     const bool has_stencil = regs.framebuffer.HasStencil();
 
     const bool write_color_fb = shadow_rendering || state.color_mask.red_enabled == GL_TRUE ||
@@ -632,7 +818,7 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
     // Draw the vertex batch
     bool succeeded = true;
     if (accelerate) {
-        succeeded = AccelerateDrawBatchInternal(is_indexed);
+        succeeded = AccelerateDrawBatchInternal(is_indexed, shipped);
     } else {
         state.draw.vertex_array = sw_vao.handle;
         state.draw.vertex_buffer = vertex_buffer.GetHandle();
@@ -641,18 +827,27 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
         curr_shader_manager->ApplyTo(state, accurate_mul);
         state.Apply();
 
-        std::size_t max_vertices = 3 * (VERTEX_BUFFER_SIZE / (3 * sizeof(HardwareVertex)));
-        for (std::size_t base_vertex = 0; base_vertex < vertex_batch.size();
-             base_vertex += max_vertices) {
-            const std::size_t vertices = std::min(max_vertices, vertex_batch.size() - base_vertex);
-            const std::size_t vertex_size = vertices * sizeof(HardwareVertex);
+        if (ring_draw_active) {
+            // The vertices are already in the vertex buffer, written there by the emulation
+            // thread through the persistent mapping. Nothing to upload.
+            glDrawArrays(GL_TRIANGLES, static_cast<GLint>(ring_draw_first),
+                         static_cast<GLsizei>(ring_draw_count));
+        } else {
+            std::size_t max_vertices = 3 * (VERTEX_BUFFER_SIZE / (3 * sizeof(HardwareVertex)));
+            for (std::size_t base_vertex = 0; base_vertex < vertex_batch.size();
+                 base_vertex += max_vertices) {
+                const std::size_t vertices =
+                    std::min(max_vertices, vertex_batch.size() - base_vertex);
+                const std::size_t vertex_size = vertices * sizeof(HardwareVertex);
 
-            const auto [vbo, offset, _] = vertex_buffer.Map(vertex_size, sizeof(HardwareVertex));
-            std::memcpy(vbo, vertex_batch.data() + base_vertex, vertex_size);
-            vertex_buffer.Unmap(vertex_size);
+                const auto [vbo, offset, _] =
+                    vertex_buffer.Map(vertex_size, sizeof(HardwareVertex));
+                std::memcpy(vbo, vertex_batch.data() + base_vertex, vertex_size);
+                vertex_buffer.Unmap(vertex_size);
 
-            glDrawArrays(GL_TRIANGLES, static_cast<GLint>(offset / sizeof(HardwareVertex)),
-                         static_cast<GLsizei>(vertices));
+                glDrawArrays(GL_TRIANGLES, static_cast<GLint>(offset / sizeof(HardwareVertex)),
+                             static_cast<GLsizei>(vertices));
+            }
         }
     }
 
@@ -830,6 +1025,10 @@ void RasterizerOpenGL::InvalidateRegion(PAddr addr, u32 size) {
     res_cache.InvalidateRegion(addr, size);
 }
 
+void RasterizerOpenGL::InvalidateGuestFlushedRegion(PAddr addr, u32 size) {
+    res_cache.InvalidateRegionUnlessDirty(addr, size);
+}
+
 void RasterizerOpenGL::FlushAndInvalidateRegion(PAddr addr, u32 size) {
     res_cache.FlushRegion(addr, size);
     res_cache.InvalidateRegion(addr, size);
@@ -854,6 +1053,11 @@ bool RasterizerOpenGL::AccelerateFill(const Pica::MemoryFillConfig& config) {
 bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
                                          PAddr framebuffer_addr, u32 pixel_stride,
                                          ScreenInfo& screen_info) {
+    // Presenting from a cached surface is the only source the guest cannot be writing while
+    // the render thread reads it - guest memory it can, and does, which is a race that shows
+    // up as one screen carrying the other's picture. So this path is the correct one to be on;
+    // what it needed was for the lookup below to refuse a surface that merely covers the
+    // address without being this framebuffer.
     if (framebuffer_addr == 0) {
         return false;
     }
@@ -883,6 +1087,59 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
                            src_params.addr};
 
     const Surface& src_surface = res_cache.GetSurface(src_surface_id);
+    // The cache matches by coverage, so a framebuffer that a game has recycled from the other
+    // screen finds the surface built while it belonged there - same address, different shape -
+    // and the display ends up showing a crop of the wrong screen. Both screens carry the same
+    // stride here, so width is what separates them: 400 for the top against 320 for the
+    // bottom. Take the surface only when it is this framebuffer rather than something that
+    // happens to contain it.
+    // A framebuffer is often a sub-rectangle of a taller surface. Mario Kart 7 renders 256x416
+    // and shows 240x400 from 0x2000 in, so its visible rows are the last 400 of the surface and
+    // the two end at the same address; GetSurfaceSubRect hands back exactly that rectangle,
+    // [0,16-240,416], and the texture coordinates below already carry it. Refusing it fell back
+    // to reading the framebuffer out of guest memory, which flushes whichever surface owns
+    // those bytes: 140 readbacks a second and 27 MB on the pi5 race (2026-09-09). The GXM
+    // rasterizer's own AccelerateDisplay had already learned this for NSMB2 and accepts the
+    // sub-rectangle by fitting it inside the surface, so this brings the desktop and pi5 tier
+    // back to parity with the console rather than fixing anything on the console.
+    //
+    // What the guard is for stays: a framebuffer a game has recycled from the other screen
+    // finds the surface built while it belonged there, same address and a different shape, and
+    // the display ends up showing a crop of the wrong screen. So a sub-rectangle is taken only
+    // when the two agree on stride and format, the rectangle handed back is exactly this
+    // framebuffer's size, and it reaches the far edge of the surface. That last test is what
+    // separates the two cases: a framebuffer sitting at the end of a taller surface passes,
+    // while a shorter view of a taller surface at the same base stops short of the edge and
+    // does not.
+    const bool exact_surface =
+        src_surface.addr == src_params.addr && src_surface.width == src_params.width;
+    const bool tail_of_surface = src_surface.stride == src_params.stride &&
+                                 src_rect.top == src_surface.GetScaledHeight() &&
+                                 src_rect.GetWidth() == src_params.width * src_surface.res_scale &&
+                                 src_rect.GetHeight() == src_params.height * src_surface.res_scale;
+    if (src_surface.pixel_format != src_params.pixel_format ||
+        (!exact_surface && !tail_of_surface)) {
+        static const bool log_display = std::getenv("AZAHAR_BLIT_LOG") != nullptr;
+        if (log_display) {
+            static u32 logged = 0;
+            if (logged < 8) {
+                logged++;
+                LOG_INFO(HW_GPU,
+                         "display {}: want {:#010x} {}x{} stride {} {} -> got {:#010x} {}x{} "
+                         "stride {} {} rect [{},{}-{},{}] refused on{}{}{}",
+                         logged, src_params.addr, src_params.width, src_params.height,
+                         src_params.stride, VideoCore::PixelFormatAsString(src_params.pixel_format),
+                         src_surface.addr, src_surface.width, src_surface.height,
+                         src_surface.stride,
+                         VideoCore::PixelFormatAsString(src_surface.pixel_format), src_rect.left,
+                         src_rect.bottom, src_rect.right, src_rect.top,
+                         src_surface.stride != src_params.stride ? " stride" : "",
+                         src_rect.top != src_surface.GetScaledHeight() ? " edge" : "",
+                         src_surface.pixel_format != src_params.pixel_format ? " format" : "");
+            }
+        }
+        return false;
+    }
     const u32 scaled_width = src_surface.GetScaledWidth();
     const u32 scaled_height = src_surface.GetScaledHeight();
 
@@ -895,12 +1152,66 @@ bool RasterizerOpenGL::AccelerateDisplay(const Pica::FramebufferConfig& config,
     return true;
 }
 
+u32 RasterizerOpenGL::UploadLutRow(u32 unit_enum, u32& row_cursor, u32 total_rows,
+                                   GLenum format, GLenum type, const void* data,
+                                   u32 texel_count) {
+    ASSERT(texel_count <= LUT_TEX_WIDTH);
+    if (row_cursor >= total_rows) {
+        row_cursor = 0;
+    }
+    glActiveTexture(unit_enum);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, static_cast<GLint>(row_cursor),
+                    static_cast<GLsizei>(texel_count), 1, format, type, data);
+    return (row_cursor++) * LUT_TEX_WIDTH;
+}
+
 void RasterizerOpenGL::SyncAndUploadLUTsLF() {
     constexpr std::size_t max_size =
         sizeof(Common::Vec2f) * 256 * Pica::LightingRegs::NumLightingSampler +
         sizeof(Common::Vec2f) * 128; // fog
 
     if (!pica.lighting.lut_dirty && !pica.fog.lut_dirty) {
+        return;
+    }
+
+    if (lut_textures_2d) {
+        // Row allocation is round-robin with no liveness tracking: a wrap hands out rows whose
+        // offsets other, non-dirty LUTs still point at, and those then sample whatever was
+        // written over them - measured as whole frames of terrain rendered at full fog. Mirror
+        // the buffer path's invalidate handling: when this sync would wrap, restart the ring
+        // and re-upload every LUT of this texture so no stale offset survives.
+        {
+            const u32 rows_needed = static_cast<u32>(std::popcount(pica.lighting.lut_dirty)) +
+                                    (pica.fog.lut_dirty ? 1u : 0u);
+            if (lut_lf_row + rows_needed > lut_lf_rows) {
+                lut_lf_row = 0;
+                pica.lighting.lut_dirty = pica.lighting.LutAllDirty;
+                pica.fog.lut_dirty = true;
+            }
+        }
+        std::array<Common::Vec2f, 256> scratch;
+        while (pica.lighting.lut_dirty) {
+            const u32 index = std::countr_zero(pica.lighting.lut_dirty);
+            pica.lighting.lut_dirty &= ~(1 << index);
+            const auto& source_lut = pica.lighting.luts[index];
+            for (u32 i = 0; i < source_lut.size(); i++) {
+                scratch[i] = {source_lut[i].ToFloat(), source_lut[i].DiffToFloat()};
+            }
+            fs_data.lighting_lut_offset[index / 4][index % 4] = static_cast<int>(
+                UploadLutRow(TextureUnits::TextureBufferLUT_LF.Enum(), lut_lf_row, lut_lf_rows,
+                             GL_RG, GL_FLOAT, scratch.data(), source_lut.size()));
+            fs_data_dirty = true;
+        }
+        if (pica.fog.lut_dirty) {
+            for (u32 i = 0; i < pica.fog.lut.size(); i++) {
+                scratch[i] = {pica.fog.lut[i].ToFloat(), pica.fog.lut[i].DiffToFloat()};
+            }
+            fs_data.fog_lut_offset = static_cast<int>(
+                UploadLutRow(TextureUnits::TextureBufferLUT_LF.Enum(), lut_lf_row, lut_lf_rows,
+                             GL_RG, GL_FLOAT, scratch.data(), pica.fog.lut.size()));
+            fs_data_dirty = true;
+            pica.fog.lut_dirty = false;
+        }
         return;
     }
 
@@ -952,6 +1263,64 @@ void RasterizerOpenGL::SyncAndUploadLUTs() {
         sizeof(Common::Vec4f) * 256;      // proctex diff
 
     if (!pica.proctex.table_dirty) {
+        return;
+    }
+
+    if (lut_textures_2d) {
+        // Same wrap-invalidate as SyncAndUploadLUTsLF: a ring wrap may not strand any
+        // non-dirty LUT's offset on a row about to be reused.
+        {
+            const u32 rg_needed = (pica.proctex.noise_lut_dirty ? 1u : 0u) +
+                                  (pica.proctex.color_map_dirty ? 1u : 0u) +
+                                  (pica.proctex.alpha_map_dirty ? 1u : 0u);
+            const u32 rgba_needed =
+                (pica.proctex.lut_dirty ? 1u : 0u) + (pica.proctex.diff_lut_dirty ? 1u : 0u);
+            if (lut_rg_row + rg_needed > lut_rg_rows ||
+                lut_rgba_row + rgba_needed > lut_rgba_rows) {
+                lut_rg_row = 0;
+                lut_rgba_row = 0;
+                pica.proctex.table_dirty = pica.proctex.TableAllDirty;
+            }
+        }
+        std::array<Common::Vec2f, 256> scratch2;
+        std::array<Common::Vec4f, 256> scratch4;
+        const auto sync_value_lut_2d = [&](const auto& lut, GLint& lut_offset) {
+            for (u32 i = 0; i < lut.size(); i++) {
+                scratch2[i] = {lut[i].ToFloat(), lut[i].DiffToFloat()};
+            }
+            lut_offset = static_cast<int>(
+                UploadLutRow(TextureUnits::TextureBufferLUT_RG.Enum(), lut_rg_row, lut_rg_rows,
+                             GL_RG, GL_FLOAT, scratch2.data(), lut.size()));
+            fs_data_dirty = true;
+        };
+        if (pica.proctex.noise_lut_dirty) {
+            sync_value_lut_2d(pica.proctex.noise_table, fs_data.proctex_noise_lut_offset);
+        }
+        if (pica.proctex.color_map_dirty) {
+            sync_value_lut_2d(pica.proctex.color_map_table, fs_data.proctex_color_map_offset);
+        }
+        if (pica.proctex.alpha_map_dirty) {
+            sync_value_lut_2d(pica.proctex.alpha_map_table, fs_data.proctex_alpha_map_offset);
+        }
+        if (pica.proctex.lut_dirty) {
+            for (u32 i = 0; i < pica.proctex.color_table.size(); i++) {
+                scratch4[i] = pica.proctex.color_table[i].ToVector() / 255.0f;
+            }
+            fs_data.proctex_lut_offset = static_cast<int>(UploadLutRow(
+                TextureUnits::TextureBufferLUT_RGBA.Enum(), lut_rgba_row, lut_rgba_rows, GL_RGBA,
+                GL_FLOAT, scratch4.data(), pica.proctex.color_table.size()));
+            fs_data_dirty = true;
+        }
+        if (pica.proctex.diff_lut_dirty) {
+            for (u32 i = 0; i < pica.proctex.color_diff_table.size(); i++) {
+                scratch4[i] = pica.proctex.color_diff_table[i].ToVector() / 255.0f;
+            }
+            fs_data.proctex_diff_lut_offset = static_cast<int>(UploadLutRow(
+                TextureUnits::TextureBufferLUT_RGBA.Enum(), lut_rgba_row, lut_rgba_rows, GL_RGBA,
+                GL_FLOAT, scratch4.data(), pica.proctex.color_diff_table.size()));
+            fs_data_dirty = true;
+        }
+        pica.proctex.table_dirty = 0;
         return;
     }
 
