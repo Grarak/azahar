@@ -56,4 +56,14 @@ Common::Vec4<u8> LookupTexture(const u8* source, unsigned int x, unsigned int y,
 Common::Vec4<u8> LookupTexelInTile(const u8* source, unsigned int x, unsigned int y,
                                    const TextureInfo& info, bool disable_alpha);
 
+/**
+ * Decodes one whole 8x8 tile into packed RGBA8 words (r | g<<8 | b<<16 | a<<24), the layout the
+ * software renderer's texture planes use. Equivalent to calling LookupTexelInTile for all 64
+ * texels with disable_alpha off, but the format switch runs once per tile instead of once per
+ * texel, and ETC1 subtiles are unpacked in one pass.
+ * @param dst Top-left texel of the tile inside the destination plane
+ * @param dst_stride Plane width in texels
+ */
+void DecodeTileRGBA8(u32* dst, u32 dst_stride, const u8* tile, const TextureInfo& info);
+
 } // namespace Pica::Texture

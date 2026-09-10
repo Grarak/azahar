@@ -70,6 +70,166 @@ Common::Vec4<u8> LookupTexture(const u8* source, unsigned int x, unsigned int y,
     return LookupTexelInTile(tile, fine_x, fine_y, info, disable_alpha);
 }
 
+void DecodeTileRGBA8(u32* dst, u32 dst_stride, const u8* tile, const TextureInfo& info) {
+    using VideoCore::MortonInterleaveX;
+    using VideoCore::MortonInterleaveY;
+    using namespace Common::Color;
+
+    const auto pack = [](u8 r, u8 g, u8 b, u8 a) {
+        return static_cast<u32>(r) | (static_cast<u32>(g) << 8) | (static_cast<u32>(b) << 16) |
+               (static_cast<u32>(a) << 24);
+    };
+
+    switch (info.format) {
+    case TextureFormat::RGBA8:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const auto c = DecodeRGBA8(tile + (MortonInterleaveX(x) + my) * 4);
+                row[x] = pack(c.r(), c.g(), c.b(), c.a());
+            }
+        }
+        return;
+    case TextureFormat::RGB8:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const auto c = DecodeRGB8(tile + (MortonInterleaveX(x) + my) * 3);
+                row[x] = pack(c.r(), c.g(), c.b(), 255);
+            }
+        }
+        return;
+    case TextureFormat::RGB5A1:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const auto c = DecodeRGB5A1(tile + (MortonInterleaveX(x) + my) * 2);
+                row[x] = pack(c.r(), c.g(), c.b(), c.a());
+            }
+        }
+        return;
+    case TextureFormat::RGB565:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const auto c = DecodeRGB565(tile + (MortonInterleaveX(x) + my) * 2);
+                row[x] = pack(c.r(), c.g(), c.b(), 255);
+            }
+        }
+        return;
+    case TextureFormat::RGBA4:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const auto c = DecodeRGBA4(tile + (MortonInterleaveX(x) + my) * 2);
+                row[x] = pack(c.r(), c.g(), c.b(), c.a());
+            }
+        }
+        return;
+    case TextureFormat::IA8:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const u8* p = tile + (MortonInterleaveX(x) + my) * 2;
+                row[x] = pack(p[1], p[1], p[1], p[0]);
+            }
+        }
+        return;
+    case TextureFormat::RG8:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const auto c = DecodeRG8(tile + (MortonInterleaveX(x) + my) * 2);
+                row[x] = pack(c.r(), c.g(), 0, 255);
+            }
+        }
+        return;
+    case TextureFormat::I8:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const u8 v = tile[MortonInterleaveX(x) + my];
+                row[x] = pack(v, v, v, 255);
+            }
+        }
+        return;
+    case TextureFormat::A8:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                row[x] = pack(0, 0, 0, tile[MortonInterleaveX(x) + my]);
+            }
+        }
+        return;
+    case TextureFormat::IA4:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const u8 v = tile[MortonInterleaveX(x) + my];
+                const u8 i = Convert4To8((v & 0xF0) >> 4);
+                const u8 a = Convert4To8(v & 0xF);
+                row[x] = pack(i, i, i, a);
+            }
+        }
+        return;
+    case TextureFormat::I4:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const u32 m = MortonInterleaveX(x) + my;
+                const u8 v = tile[m / 2];
+                const u8 i = Convert4To8((m % 2) ? ((v & 0xF0) >> 4) : (v & 0xF));
+                row[x] = pack(i, i, i, 255);
+            }
+        }
+        return;
+    case TextureFormat::A4:
+        for (u32 y = 0; y < 8; ++y) {
+            const u32 my = MortonInterleaveY(y);
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const u32 m = MortonInterleaveX(x) + my;
+                const u8 v = tile[m / 2];
+                row[x] = pack(0, 0, 0, Convert4To8((m % 2) ? ((v & 0xF0) >> 4) : (v & 0xF)));
+            }
+        }
+        return;
+    case TextureFormat::ETC1:
+    case TextureFormat::ETC1A4: {
+        u8 rgba[8][8][4];
+        DecodeETC1TileRGBA8(tile, info.format == TextureFormat::ETC1A4, rgba);
+        for (u32 y = 0; y < 8; ++y) {
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                row[x] = pack(rgba[y][x][0], rgba[y][x][1], rgba[y][x][2], rgba[y][x][3]);
+            }
+        }
+        return;
+    }
+    default:
+        // Unknown format: keep the per-texel path's behaviour.
+        for (u32 y = 0; y < 8; ++y) {
+            u32* row = dst + y * dst_stride;
+            for (u32 x = 0; x < 8; ++x) {
+                const auto c = LookupTexelInTile(tile, x, y, info, false);
+                row[x] = pack(c.r(), c.g(), c.b(), c.a());
+            }
+        }
+        return;
+    }
+}
+
 Common::Vec4<u8> LookupTexelInTile(const u8* source, unsigned int x, unsigned int y,
                                    const TextureInfo& info, bool disable_alpha) {
     DEBUG_ASSERT(x < 8);
