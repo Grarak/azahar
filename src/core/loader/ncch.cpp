@@ -193,7 +193,7 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
         auto& ncch_caps = overlay_ncch->exheader_header.arm11_system_local_caps;
         const auto o3ds_mode = *LoadKernelMemoryMode().first;
         const auto n3ds_mode = static_cast<Kernel::New3dsMemoryMode>(ncch_caps.n3ds_mode);
-        const bool is_new_3ds = Settings::values.is_new_3ds.GetValue();
+        constexpr bool is_new_3ds = false; // only the Old 3DS is emulated
         if (is_new_3ds && n3ds_mode == Kernel::New3dsMemoryMode::Legacy &&
             category == Kernel::ResourceLimitCategory::Application) {
             u64 new_limit = 0;
@@ -311,12 +311,14 @@ ResultStatus AppLoader_NCCH::Load(std::shared_ptr<Kernel::Process>& process) {
         }
     }
 
+#ifdef ENABLE_ROOM
     if (auto room_member = Network::GetRoomMember().lock()) {
         Network::GameInfo game_info;
         ReadTitle(game_info.name);
         game_info.id = ncch_program_id;
         room_member->SendGameInfo(game_info);
     }
+#endif
 
     is_loaded = true; // Set state to loaded
 

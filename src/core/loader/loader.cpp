@@ -12,7 +12,9 @@
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/am/am.h"
 #include "core/loader/3dsx.h"
+#ifdef ENABLE_ARTIC
 #include "core/loader/artic.h"
+#endif
 #include "core/loader/elf.h"
 #include "core/loader/ncch.h"
 
@@ -115,6 +117,10 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileUtil::
         return std::make_unique<AppLoader_NCCH>(system, std::move(file), filepath);
 
     case FileType::ARTIC: {
+#ifndef ENABLE_ARTIC
+        LOG_ERROR(Loader, "This build has no Artic Base client");
+        return nullptr;
+#else
         Apploader_Artic::ArticInitMode mode = Apploader_Artic::ArticInitMode::NONE;
         if (filename.starts_with("articinio://")) {
             mode = Apploader_Artic::ArticInitMode::O3DS;
@@ -140,6 +146,7 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileUtil::
             }
         }
         return std::make_unique<Apploader_Artic>(system, server_addr, port, mode);
+#endif
     }
 
     default:
