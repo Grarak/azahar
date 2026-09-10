@@ -17,7 +17,7 @@ src/common/scm_rev.cpp
 *.swp
 *.kdev4
 .markdown-preview.html
-.idea/*
+.idea
 !.idea/inspectionProfiles
 .vs/
 .vscode/
