@@ -5,17 +5,17 @@
 //? #version 430 core
 precision mediump float;
 
-layout(location = 0) in vec2 tex_coord;
-layout(location = 0) out vec4 frag_color;
+VARYING_LOCATION(0) in vec2 tex_coord;
+VARYING_LOCATION(0) out vec4 frag_color;
 
-layout(binding = 0) uniform sampler2D tex;
+SAMPLER_BINDING(0) uniform sampler2D tex;
 
 #ifdef VULKAN
 layout(push_constant, std140) uniform XbrzInfo {
     float scale;
 };
 #else
-layout(location = 2) uniform float scale;
+EXPLICIT_UNIFORM_LOCATION(2) uniform float scale;
 #endif
 
 const int BLEND_NONE = 0;

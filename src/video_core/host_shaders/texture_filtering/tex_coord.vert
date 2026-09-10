@@ -3,7 +3,7 @@
 // Refer to the license.txt file included.
 
 //? #version 430 core
-layout(location = 0) out vec2 tex_coord;
+VARYING_LOCATION(0) out vec2 tex_coord;
 
 #ifdef VULKAN
 #define gl_VertexID gl_VertexIndex

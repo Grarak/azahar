@@ -23,11 +23,11 @@
 //? #version 430 core
 precision mediump float;
 
-layout(location = 0) in vec2 tex_coord;
-layout(location = 0) out vec4 frag_color;
+VARYING_LOCATION(0) in vec2 tex_coord;
+VARYING_LOCATION(0) out vec4 frag_color;
 
-layout(binding = 0) uniform sampler2D HOOKED;
-layout(binding = 1) uniform sampler2D LUMAD;
+SAMPLER_BINDING(0) uniform sampler2D HOOKED;
+SAMPLER_BINDING(1) uniform sampler2D LUMAD;
 
 const float LINE_DETECT_THRESHOLD = 0.4;
 const float STRENGTH = 0.6;

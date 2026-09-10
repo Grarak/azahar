@@ -5,9 +5,9 @@
 //? #version 430 core
 precision mediump float;
 
-layout(location = 0) in vec2 tex_coord;
-layout(location = 0) out vec4 frag_color;
-layout(binding = 0) uniform sampler2D tex;
+VARYING_LOCATION(0) in vec2 tex_coord;
+VARYING_LOCATION(0) out vec4 frag_color;
+SAMPLER_BINDING(0) uniform sampler2D tex;
 
 #define src(x, y) texture(tex, coord + vec2(x, y) * 1.0 / source_size)
 

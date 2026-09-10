@@ -23,10 +23,10 @@
 //? #version 430 core
 precision mediump float;
 
-layout(location = 0) in vec2 tex_coord;
-layout(location = 0) out float frag_color;
+VARYING_LOCATION(0) in vec2 tex_coord;
+VARYING_LOCATION(0) out float frag_color;
 
-layout(binding = 2) uniform sampler2D tex_input;
+SAMPLER_BINDING(2) uniform sampler2D tex_input;
 
 void main() {
     vec2 t = textureLodOffset(tex_input, tex_coord, 0.0, ivec2(0, 1)).xy;
