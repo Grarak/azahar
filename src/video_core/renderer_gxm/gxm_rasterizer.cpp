@@ -1282,6 +1282,16 @@ bool RasterizerGxm::BindPrograms(const VertexLayout& layout, u32 vertex_count) {
 
     // The fragment program for this PICA configuration, compiled on the worker if new.
     Pica::Shader::FSConfig fs_config{regs};
+    // These comparisons cannot reject an 8-bit alpha. Reuse the Always shader before
+    // hashing so the USSE emitter omits the alpha kill and its GXP discard flag (unless
+    // scissoring still needs it), without putting the reference value in the shader key.
+    using CompareFunc = Pica::FramebufferRegs::CompareFunc;
+    if ((fs_config.framebuffer.alpha_test_func == CompareFunc::GreaterThanOrEqual &&
+         om.alpha_test.ref == 0) ||
+        (fs_config.framebuffer.alpha_test_func == CompareFunc::LessThanOrEqual &&
+         om.alpha_test.ref == 255)) {
+        fs_config.framebuffer.alpha_test_func.Assign(CompareFunc::Always);
+    }
     if (scissor_covers_draw && fs_config.framebuffer.scissor_test_mode ==
                                    Pica::RasterizerRegs::ScissorMode::Include) {
         fs_config.framebuffer.scissor_test_mode.Assign(
