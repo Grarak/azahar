@@ -12,6 +12,7 @@ SERIALIZE_EXPORT_IMPL(ConfigMem::Handler)
 namespace ConfigMem {
 
 Handler::Handler() {
+    ConfigMemDef& config_mem = GetConfigMem();
     std::memset(&config_mem, 0, sizeof(config_mem));
 
     // Values extracted from firmware 11.17.0-50E
@@ -29,13 +30,13 @@ Handler::Handler() {
 }
 
 ConfigMemDef& Handler::GetConfigMem() {
-    return config_mem;
+    return *reinterpret_cast<ConfigMemDef*>(block.Data());
 }
 
 template <class Archive>
 void Handler::serialize(Archive& ar, const unsigned int) {
     ar& boost::serialization::base_object<BackingMem>(*this);
-    ar& boost::serialization::make_binary_object(&config_mem, sizeof(config_mem));
+    ar& boost::serialization::make_binary_object(block.Data(), sizeof(ConfigMemDef));
 }
 SERIALIZE_IMPL(Handler)
 

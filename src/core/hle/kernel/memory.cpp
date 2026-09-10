@@ -42,7 +42,6 @@ static const u32 memory_region_sizes[8][3] = {
 };
 
 void KernelSystem::MemoryInit(MemoryMode memory_mode, u64 override_init_time) {
-    const bool is_new_3ds = Settings::values.is_new_3ds.GetValue();
     const u32 mem_type_index = static_cast<u32>(memory_mode);
 
     // The kernel allocation regions (APPLICATION, SYSTEM and BASE) are laid out in sequence, with
@@ -55,7 +54,7 @@ void KernelSystem::MemoryInit(MemoryMode memory_mode, u64 override_init_time) {
     }
 
     // We must've allocated the entire FCRAM by the end
-    ASSERT(base == (is_new_3ds ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE));
+    ASSERT(base == Memory::FCRAM_SIZE);
 
     config_mem_handler = std::make_shared<ConfigMem::Handler>();
     auto& config_mem = config_mem_handler->GetConfigMem();
@@ -142,6 +141,15 @@ void KernelSystem::HandleSpecialMapping(VMManager& address_space, const AddressM
                   "Unhandled special mapping: address=0x{:08X} size=0x{:X}"
                   " read_only={} unk_flag={}",
                   mapping.address, mapping.size, mapping.read_only, mapping.unk_flag);
+        return;
+    }
+
+    if (area->paddr_base == N3DS_EXTRA_RAM_PADDR) {
+        // Only a New 3DS has this memory, and only an Old 3DS is emulated: it was never
+        // allocated, and mapping it would hand the process a window onto nothing.
+        LOG_ERROR(Loader,
+                  "Title asked for the New 3DS extra RAM: address=0x{:08X} size=0x{:X}",
+                  mapping.address, mapping.size);
         return;
     }
 

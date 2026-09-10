@@ -14,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/serialization/export.hpp>
 #include "common/common_types.h"
+#include "common/logging/log.h"
 #include "common/serialization/boost_small_vector.hpp"
 #include "common/settings.h"
 #include "common/swap.h"
@@ -310,8 +311,21 @@ public:
                 std::make_shared<AsyncWakeUpCallback<ResultFunctor>>(
                     kernel, result_function,
                     std::move(std::async(std::launch::async, [this, async_section] {
-                        s64 sleep_for = async_section(*this);
-                        this->thread->WakeAfterDelay(sleep_for, true);
+                        s64 sleep_for = 0;
+                        try {
+                            sleep_for = async_section(*this);
+                        } catch (const std::exception& e) {
+                            // The future captures a throw and nothing ever reads it back: the
+                            // wake below would be skipped and the client would sleep forever
+                            // on nanoseconds(-1), silently. A std::bad_alloc inside an FS read
+                            // stranded the guest exactly that way on the Vita, whose heap runs
+                            // within a few megabytes of its ceiling.
+                            LOG_CRITICAL(Kernel, "async section threw '{}'; waking the client",
+                                         e.what());
+                        }
+                        // WakeAfterDelay treats -1 as "schedule nothing", which here would
+                        // also mean sleeping forever.
+                        this->thread->WakeAfterDelay(std::max<s64>(sleep_for, 0), true);
                     }))));
 
         } else {
@@ -350,8 +364,17 @@ public:
 
             // We use packaged_task so we can retrieve a std::future to pass to AsyncWakeUpCallback
             auto task = std::make_shared<std::packaged_task<void()>>([this, async_section] {
-                s64 sleep_for = async_section(*this);
-                this->thread->WakeAfterDelay(sleep_for, true);
+                s64 sleep_for = 0;
+                try {
+                    sleep_for = async_section(*this);
+                } catch (const std::exception& e) {
+                    // Same contract as RunAsync above: the packaged_task would capture the
+                    // throw into a future nobody reads, the wake would be skipped, and the
+                    // client thread would sleep forever with nothing logged.
+                    LOG_CRITICAL(Kernel, "async section threw '{}'; waking the client",
+                                 e.what());
+                }
+                this->thread->WakeAfterDelay(std::max<s64>(sleep_for, 0), true);
             });
 
             auto future = task->get_future();

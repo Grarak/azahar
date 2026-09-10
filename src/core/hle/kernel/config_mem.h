@@ -55,19 +55,26 @@ public:
     ConfigMemDef& GetConfigMem();
 
     u8* GetPtr() override {
-        return reinterpret_cast<u8*>(&config_mem);
+        return block.Data();
     }
 
     const u8* GetPtr() const override {
-        return reinterpret_cast<const u8*>(&config_mem);
+        return block.Data();
     }
 
     std::size_t GetSize() const override {
-        return sizeof(config_mem);
+        return sizeof(ConfigMemDef);
+    }
+
+    const Common::HostSharedMemory* AliasableBlock() const override {
+        return block.SupportsAliasing() ? &block : nullptr;
     }
 
 private:
-    ConfigMemDef config_mem;
+    // The guest reads this page directly, so under native execution it has to be mappable at the
+    // guest's own address. ConfigMemDef is a plain layout of integers, so living in a zeroed
+    // aliasable block rather than in an ordinary member costs nothing.
+    Common::HostSharedMemory block{sizeof(ConfigMemDef), "azahar-config-mem"};
 
     friend class boost::serialization::access;
     template <class Archive>

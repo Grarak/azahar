@@ -110,15 +110,19 @@ public:
     SharedPageDef& GetSharedPage();
 
     u8* GetPtr() override {
-        return reinterpret_cast<u8*>(&shared_page);
+        return block.Data();
     }
 
     const u8* GetPtr() const override {
-        return reinterpret_cast<const u8*>(&shared_page);
+        return block.Data();
     }
 
     std::size_t GetSize() const override {
-        return sizeof(shared_page);
+        return sizeof(SharedPageDef);
+    }
+
+    const Common::HostSharedMemory* AliasableBlock() const override {
+        return block.SupportsAliasing() ? &block : nullptr;
     }
 
     /// Gets the system time in milliseconds since the year 2000.
@@ -133,7 +137,12 @@ private:
     Core::TimingEventType* update_time_event;
     std::chrono::seconds init_time;
 
-    SharedPageDef shared_page;
+    // Mappable at the guest's own address, as the guest reads this page directly under native
+    // execution. SharedPageDef is a plain layout of integers.
+    Common::HostSharedMemory block{sizeof(SharedPageDef), "azahar-shared-page"};
+
+    /// The shared page itself, living inside `block`.
+    SharedPageDef& shared_page{*reinterpret_cast<SharedPageDef*>(block.Data())};
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

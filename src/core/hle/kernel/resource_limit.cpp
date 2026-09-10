@@ -168,7 +168,6 @@ SERIALIZE_IMPL(ResourceLimit)
 ResourceLimitList::ResourceLimitList(KernelSystem& kernel) {
     // PM makes APPMEMALLOC always match app RESLIMIT_COMMIT.
     // See: https://github.com/LumaTeam/Luma3DS/blob/e2778a45/sysmodules/pm/source/reslimit.c#L275
-    const bool is_new_3ds = Settings::values.is_new_3ds.GetValue();
     const auto& appmemalloc = kernel.GetMemoryRegion(MemoryRegion::APPLICATION);
 
     // Create the Application resource limit
@@ -190,9 +189,9 @@ ResourceLimitList::ResourceLimitList(KernelSystem& kernel) {
     resource_limit =
         ResourceLimit::Create(kernel, ResourceLimitCategory::SysApplet, "System Applets");
     resource_limit->SetLimitValue(ResourceLimitType::Priority, 0x4);
-    resource_limit->SetLimitValue(ResourceLimitType::Commit, is_new_3ds ? 0x5E06000 : 0x2606000);
-    resource_limit->SetLimitValue(ResourceLimitType::Thread, is_new_3ds ? 0x1D : 0xE);
-    resource_limit->SetLimitValue(ResourceLimitType::Event, is_new_3ds ? 0xB : 0x8);
+    resource_limit->SetLimitValue(ResourceLimitType::Commit, 0x2606000);
+    resource_limit->SetLimitValue(ResourceLimitType::Thread, 0xE);
+    resource_limit->SetLimitValue(ResourceLimitType::Event, 0x8);
     resource_limit->SetLimitValue(ResourceLimitType::Mutex, 0x8);
     resource_limit->SetLimitValue(ResourceLimitType::Semaphore, 0x4);
     resource_limit->SetLimitValue(ResourceLimitType::Timer, 0x4);
@@ -219,14 +218,14 @@ ResourceLimitList::ResourceLimitList(KernelSystem& kernel) {
     // Create the Other resource limit
     resource_limit = ResourceLimit::Create(kernel, ResourceLimitCategory::Other, "Others");
     resource_limit->SetLimitValue(ResourceLimitType::Priority, 0x4);
-    resource_limit->SetLimitValue(ResourceLimitType::Commit, is_new_3ds ? 0x2182000 : 0x1682000);
-    resource_limit->SetLimitValue(ResourceLimitType::Thread, is_new_3ds ? 0xE1 : 0xCA);
-    resource_limit->SetLimitValue(ResourceLimitType::Event, is_new_3ds ? 0x108 : 0xF8);
-    resource_limit->SetLimitValue(ResourceLimitType::Mutex, is_new_3ds ? 0x25 : 0x23);
-    resource_limit->SetLimitValue(ResourceLimitType::Semaphore, is_new_3ds ? 0x43 : 0x40);
-    resource_limit->SetLimitValue(ResourceLimitType::Timer, is_new_3ds ? 0x2C : 0x2B);
-    resource_limit->SetLimitValue(ResourceLimitType::SharedMemory, is_new_3ds ? 0x1F : 0x1E);
-    resource_limit->SetLimitValue(ResourceLimitType::AddressArbiter, is_new_3ds ? 0x2D : 0x2B);
+    resource_limit->SetLimitValue(ResourceLimitType::Commit, 0x1682000);
+    resource_limit->SetLimitValue(ResourceLimitType::Thread, 0xCA);
+    resource_limit->SetLimitValue(ResourceLimitType::Event, 0xF8);
+    resource_limit->SetLimitValue(ResourceLimitType::Mutex, 0x23);
+    resource_limit->SetLimitValue(ResourceLimitType::Semaphore, 0x40);
+    resource_limit->SetLimitValue(ResourceLimitType::Timer, 0x2B);
+    resource_limit->SetLimitValue(ResourceLimitType::SharedMemory, 0x1E);
+    resource_limit->SetLimitValue(ResourceLimitType::AddressArbiter, 0x2B);
     resource_limit->SetLimitValue(ResourceLimitType::CpuTime, Core1CpuTime::PREEMPTION_SYSMODULE);
     resource_limits[static_cast<u8>(resource_limit->GetCategory())] = resource_limit;
 }

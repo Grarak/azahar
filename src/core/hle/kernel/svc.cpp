@@ -35,6 +35,8 @@
 #include "core/hle/kernel/server_session.h"
 #include "core/hle/kernel/session.h"
 #include "core/hle/kernel/shared_memory.h"
+#include <atomic>
+#include <cstdlib>
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_wrapper.h"
 #include "core/hle/kernel/thread.h"
@@ -1849,7 +1851,7 @@ Result SVC::GetSystemInfo(s64* out, u32 type, s32 param) {
             *out = kernel.GetMemoryRegion(MemoryRegion::APPLICATION)->size;
             break;
         case SystemInfoLumaCFWInformation::IS_N3DS:
-            *out = Settings::values.is_new_3ds ? 1 : 0;
+            *out = 0; // only the Old 3DS is emulated
             break;
         default:
             LOG_ERROR(Kernel_SVC, "unknown GetSystemInfo type=0x10000 region: param={}", param);

@@ -63,26 +63,35 @@ u32 KernelSystem::GenerateObjectID() {
     return next_object_id++;
 }
 
-std::shared_ptr<Process> KernelSystem::GetCurrentProcess() const {
+const std::shared_ptr<Process>& KernelSystem::GetCurrentProcess() const {
     return current_process;
 }
 
-void KernelSystem::SetCurrentProcess(std::shared_ptr<Process> process) {
-    current_process = process;
+void KernelSystem::SetCurrentProcess(const std::shared_ptr<Process>& process) {
+    // This runs on every core switch, almost always with the process (and therefore the page
+    // table) already in force; the reference-count and page-table churn was measurable, so
+    // skip the redundant work.
+    if (current_process != process) {
+        current_process = process;
+    }
     SetCurrentMemoryPageTable(process->vm_manager.page_table);
 }
 
-void KernelSystem::SetCurrentProcessForCPU(std::shared_ptr<Process> process, u32 core_id) {
+void KernelSystem::SetCurrentProcessForCPU(const std::shared_ptr<Process>& process, u32 core_id) {
     if (current_cpu->GetID() == core_id) {
-        current_process = process;
+        if (current_process != process) {
+            current_process = process;
+        }
         SetCurrentMemoryPageTable(process->vm_manager.page_table);
     } else {
-        stored_processes[core_id] = process;
+        if (stored_processes[core_id] != process) {
+            stored_processes[core_id] = process;
+        }
         thread_managers[core_id]->cpu->SetPageTable(process->vm_manager.page_table);
     }
 }
 
-void KernelSystem::SetCurrentMemoryPageTable(std::shared_ptr<Memory::PageTable> page_table) {
+void KernelSystem::SetCurrentMemoryPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
     memory.SetCurrentPageTable(page_table);
     if (current_cpu != nullptr) {
         current_cpu->SetPageTable(page_table);
@@ -97,7 +106,11 @@ void KernelSystem::SetCPUs(std::vector<std::shared_ptr<Core::ARM_Interface>> cpu
 }
 
 void KernelSystem::SetRunningCPU(Core::ARM_Interface* cpu) {
-    if (current_process) {
+    if (current_cpu == cpu) {
+        timing.SetCurrentTimer(cpu->GetID());
+        return;
+    }
+    if (current_process && stored_processes[current_cpu->GetID()] != current_process) {
         stored_processes[current_cpu->GetID()] = current_process;
     }
     current_cpu = cpu;
@@ -173,10 +186,6 @@ void KernelSystem::ResetThreadIDs() {
 
 void KernelSystem::UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
                                            New3dsHwCapabilities n3ds_hw_cap) {
-    if (Settings::values.is_new_3ds) {
-        SetRunning804MHz(n3ds_hw_cap.enable_804MHz_cpu);
-    }
-
     u32 tid_high = static_cast<u32>(title_id >> 32);
 
     constexpr u32 TID_HIGH_APPLET = 0x00040030;
