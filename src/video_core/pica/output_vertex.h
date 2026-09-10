@@ -14,9 +14,29 @@ struct RasterizerRegs;
 
 using AttributeBuffer = std::array<Common::Vec4<f24>, 16>;
 
+/**
+ * The PICA semantic map (which shader output component lands in which vertex slot), decoded from
+ * the vs_output_attributes registers once per batch instead of per vertex: the BitField unpacking
+ * alone measured several percent of the emulation thread. Attributes whose four components map to
+ * consecutive slots — almost all of them in practice — are marked contiguous and copied as one
+ * 16-byte block.
+ */
+struct OutputVertexMap {
+    struct Attribute {
+        /// Destination slot (0-23) per component; 0xFF discards, matching the hardware's
+        /// behavior for semantic values past the vertex layout.
+        std::array<u8, 4> dst;
+        bool contiguous4;
+    };
+    std::array<Attribute, 16> attributes;
+    u32 num_attributes = 0;
+
+    void Build(const RasterizerRegs& regs);
+};
+
 struct OutputVertex {
     OutputVertex() = default;
-    explicit OutputVertex(const RasterizerRegs& regs, const AttributeBuffer& output);
+    explicit OutputVertex(const OutputVertexMap& map, const AttributeBuffer& output);
 
     Common::Vec4<f24> pos;
     Common::Vec4<f24> quat;

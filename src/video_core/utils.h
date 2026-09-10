@@ -8,11 +8,21 @@
 
 namespace VideoCore {
 
+// The two halves of the 8x8 Z-order coordinate. They are separable, so a caller walking one
+// row can evaluate the y half once for the whole row.
+static constexpr u32 MortonInterleaveX(u32 x) {
+    constexpr u32 xlut[] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15};
+    return xlut[x % 8];
+}
+
+static constexpr u32 MortonInterleaveY(u32 y) {
+    constexpr u32 ylut[] = {0x00, 0x02, 0x08, 0x0a, 0x20, 0x22, 0x28, 0x2a};
+    return ylut[y % 8];
+}
+
 // 8x8 Z-Order coordinate from 2D coordinates
 static constexpr u32 MortonInterleave(u32 x, u32 y) {
-    constexpr u32 xlut[] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15};
-    constexpr u32 ylut[] = {0x00, 0x02, 0x08, 0x0a, 0x20, 0x22, 0x28, 0x2a};
-    return xlut[x % 8] + ylut[y % 8];
+    return MortonInterleaveX(x) + MortonInterleaveY(y);
 }
 
 /**
