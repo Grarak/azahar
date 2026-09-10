@@ -18,8 +18,7 @@ add_library(audio_core STATIC EXCLUDE_FROM_ALL
     hle/shared_memory.h
     hle/source.cpp
     hle/source.h
-    lle/lle.cpp
-    lle/lle.h
+    $<$<BOOL:${ENABLE_DSP_LLE}>:lle/lle.cpp lle/lle.h>
     input.h
     input_details.cpp
     input_details.h
@@ -40,12 +39,17 @@ add_library(audio_core STATIC EXCLUDE_FROM_ALL
     $<$<BOOL:${ENABLE_CUBEB}>:cubeb_sink.cpp cubeb_sink.h cubeb_input.cpp cubeb_input.h>
     $<$<BOOL:${ENABLE_LIBRETRO}>:libretro_sink.cpp libretro_sink.h libretro_input.cpp libretro_input.h>
     $<$<BOOL:${ENABLE_OPENAL}>:openal_input.cpp openal_input.h openal_sink.cpp openal_sink.h>
+    $<$<BOOL:${VITA}>:vita_sink.cpp vita_sink.h>
 )
 
 create_target_directory_groups(audio_core)
 
 target_link_libraries(audio_core PUBLIC citra_common citra_core)
-target_link_libraries(audio_core PRIVATE faad2 SoundTouch teakra)
+target_link_libraries(audio_core PRIVATE faad2 SoundTouch)
+if(ENABLE_DSP_LLE)
+    target_link_libraries(audio_core PRIVATE teakra)
+    target_compile_definitions(audio_core PUBLIC ENABLE_DSP_LLE)
+endif()
 
 if(ENABLE_SDL2)
     target_link_libraries(audio_core PRIVATE SDL2::SDL2)

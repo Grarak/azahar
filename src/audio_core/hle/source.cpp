@@ -4,6 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #include "audio_core/codec.h"
 #include "audio_core/hle/common.h"
 #include "audio_core/hle/source.h"
@@ -37,6 +41,28 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
     const std::array<float, 4>& ramp_start = state.gain_ramp_start.at(intermediate_mix_id);
     constexpr float ramp_scale = 1.0f / static_cast<float>(samples_per_frame - 1);
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // Stereo-to-quad expansion: each output sample is {gain0*L, gain1*R, gain2*L, gain3*R},
+    // one 4-lane multiply-accumulate. vcvtq_s32_f32 truncates toward zero like the scalar
+    // static_cast; the only divergence from the loop below is <= 1 LSB on ramped gains
+    // (the compiler contracts the scalar ramp mul+add into a fused VFMA).
+    const float32x4_t gains_v = vld1q_f32(gains.data());
+    const float32x4_t start_v = vld1q_f32(ramp_start.data());
+    const float32x4_t ramp_diff_v = vsubq_f32(gains_v, start_v);
+    for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
+        float32x4_t gain_v = gains_v;
+        if (ramp_active) {
+            const float progress = static_cast<float>(samplei) * ramp_scale;
+            gain_v = vmlaq_n_f32(start_v, ramp_diff_v, progress);
+        }
+        s32 lr_bits;
+        std::memcpy(&lr_bits, current_frame[samplei].data(), sizeof(lr_bits));
+        const int16x4_t lr16 = vreinterpret_s16_s32(vdup_n_s32(lr_bits)); // L R L R
+        const float32x4_t sample_v = vcvtq_f32_s32(vmovl_s16(lr16));
+        const int32x4_t add_v = vcvtq_s32_f32(vmulq_f32(gain_v, sample_v));
+        vst1q_s32(dest[samplei].data(), vaddq_s32(vld1q_s32(dest[samplei].data()), add_v));
+    }
+#else
     for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
         const float progress = static_cast<float>(samplei) * ramp_scale;
         const float gain0 =
@@ -54,6 +80,7 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
         dest[samplei][2] += static_cast<s32>(gain2 * current_frame[samplei][0]);
         dest[samplei][3] += static_cast<s32>(gain3 * current_frame[samplei][1]);
     }
+#endif
 
     if (ramp_active) {
         state.gain_ramp_start.at(intermediate_mix_id) = gains;
@@ -264,9 +291,7 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
                 if (state.current_buffer.size() < state.current_sample_number) {
                     state.current_sample_number = 0;
                 } else {
-                    state.current_buffer.erase(
-                        state.current_buffer.begin(),
-                        std::next(state.current_buffer.begin(), state.current_sample_number));
+                    state.current_buffer.pop_front(state.current_sample_number);
                 }
             }
         }
@@ -464,9 +489,7 @@ bool Source::DequeueBuffer() {
 
     // Because our interpolation consumes samples instead of using an index,
     // let's just consume the samples up to the current sample number.
-    state.current_buffer.erase(
-        state.current_buffer.begin(),
-        std::next(state.current_buffer.begin(), state.current_sample_number));
+    state.current_buffer.pop_front(state.current_sample_number);
 
     LOG_TRACE(Audio_DSP,
               "source_id={} buffer_id={} from_queue={} current_buffer.size()={}, "

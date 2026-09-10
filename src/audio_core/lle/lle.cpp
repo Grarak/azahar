@@ -152,6 +152,7 @@ struct DspLle::Impl final {
     static constexpr u32 TeakraSlice = 16384;
 
     void TeakraThread() {
+        Common::SetCurrentThreadRole(Common::ThreadRole::Other);
         while (true) {
             teakra.Run(TeakraSlice);
             teakra_slice_barrier.Sync();
