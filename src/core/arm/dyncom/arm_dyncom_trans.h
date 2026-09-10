@@ -29,6 +29,17 @@ struct arm_inst {
     char component[0];
 };
 
+/**
+ * How far one instruction advances the translation cache. Instructions are packed one after
+ * another and stepped over by their own size, so what an allocation takes and what a step
+ * takes must agree - and both are rounded to eight, because an ARM host needs every
+ * instruction's fields aligned: the compiler pairs two 32-bit stores into one STRD, which
+ * faults on an address that is not even, and struct sizes here are not all multiples of four.
+ */
+constexpr std::size_t TransInstStride(std::size_t total_size) {
+    return (total_size + 7) & ~std::size_t{7};
+}
+
 struct generic_arm_inst {
     u32 Ra;
     u32 Rm;
@@ -493,6 +504,17 @@ typedef ARM_INST_PTR (*transop_fp_t)(unsigned int, int);
 extern const transop_fp_t arm_instruction_trans[];
 extern const std::size_t arm_instruction_trans_len;
 
+#ifdef __vita__
+// The Vita's 512 MB user budget already holds 128 MB of guest FCRAM, the GXM heaps and the
+// texture cache, so the cache is a thirty-second of the desktop one. It is cleared on every
+// guest ICache invalidation, so the size bounds how much code one title can run between
+// flushes, not how much it can run in total.
+#define TRANS_CACHE_SIZE (32 * 1024 * 1024)
+#else
 #define TRANS_CACHE_SIZE (64 * 1024 * 2000)
-extern char trans_cache_buf[TRANS_CACHE_SIZE];
+#endif
+// Allocated on first use rather than as a static array: 125 MB of .bss inflated the load image
+// past what the PS Vita's loader could map alongside the newlib heap, and on that target the
+// native backend is preferred so the interpreter — and this buffer — is usually never touched.
+extern char* trans_cache_buf;
 extern std::size_t trans_cache_buf_top;

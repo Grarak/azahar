@@ -6,12 +6,16 @@
 #include "core/arm/skyeye_common/armsupp.h"
 #include "core/arm/skyeye_common/vfp/vfp.h"
 
-char trans_cache_buf[TRANS_CACHE_SIZE];
+char* trans_cache_buf = nullptr;
 size_t trans_cache_buf_top = 0;
 
 static void* AllocBuffer(std::size_t size) {
+    if (trans_cache_buf == nullptr) {
+        trans_cache_buf = static_cast<char*>(std::calloc(1, TRANS_CACHE_SIZE));
+        ASSERT_MSG(trans_cache_buf != nullptr, "Could not allocate the translation cache");
+    }
     std::size_t start = trans_cache_buf_top;
-    trans_cache_buf_top += size;
+    trans_cache_buf_top += TransInstStride(size);
     ASSERT_MSG(trans_cache_buf_top <= TRANS_CACHE_SIZE, "Translation cache is full!");
     return static_cast<void*>(&trans_cache_buf[start]);
 }

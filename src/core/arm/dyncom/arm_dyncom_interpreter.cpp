@@ -953,8 +953,8 @@ unsigned InterpreterMainLoop(ARMul_State* cpu) {
         goto DISPATCH;                                                                             \
     inst_base = (arm_inst*)&trans_cache_buf[ptr]
 
-#define INC_PC(l) ptr += sizeof(arm_inst) + l
-#define INC_PC_STUB ptr += sizeof(arm_inst)
+#define INC_PC(l) ptr += TransInstStride(sizeof(arm_inst) + (l))
+#define INC_PC_STUB ptr += TransInstStride(sizeof(arm_inst))
 
 #ifndef ENABLE_GDBSTUB
 #define GDB_BP_CHECK
