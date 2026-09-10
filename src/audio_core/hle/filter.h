@@ -72,6 +72,8 @@ private:
          * @return Output sample
          */
         std::array<s16, 2> ProcessSample(const std::array<s16, 2>& x0);
+        /// Processes a whole frame in place: the state lives in registers for its length.
+        void ProcessFrame(StereoFrame16& frame);
 
     private:
         // Configuration
@@ -100,6 +102,8 @@ private:
          * @return Output sample
          */
         std::array<s16, 2> ProcessSample(const std::array<s16, 2>& x0);
+        /// Processes a whole frame in place: the state lives in registers for its length.
+        void ProcessFrame(StereoFrame16& frame);
 
     private:
         // Configuration

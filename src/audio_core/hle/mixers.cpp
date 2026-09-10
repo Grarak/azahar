@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #include "audio_core/hle/mixers.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -111,6 +114,24 @@ void Mixers::DownmixAndMixIntoCurrentFrame(float gain, const QuadFrame32& sample
 
     switch (state.output_format) {
     case OutputFormat::Mono:
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        // Two samples per iteration. The horizontal sum is pairwise ((s0+s2)+(s1+s3)) rather
+        // than the scalar's sequential order, which can differ by 1 LSB after truncation;
+        // inaudible. vqmovn_s32/vqadd_s16 saturate exactly like ClampToS16/AddAndClampToS16.
+        for (std::size_t i = 0; i < samples_per_frame; i += 2) {
+            const float32x4_t f0 = vmulq_n_f32(vcvtq_f32_s32(vld1q_s32(samples[i].data())), gain);
+            const float32x4_t f1 =
+                vmulq_n_f32(vcvtq_f32_s32(vld1q_s32(samples[i + 1].data())), gain);
+            const float32x2_t pair0 = vadd_f32(vget_low_f32(f0), vget_high_f32(f0));
+            const float32x2_t pair1 = vadd_f32(vget_low_f32(f1), vget_high_f32(f1));
+            const float32x2_t mono_f = vmul_n_f32(vpadd_f32(pair0, pair1), 0.5f); // {m0, m1}
+            const int32x2_t mono_s = vcvt_s32_f32(mono_f);
+            const int32x2x2_t dup = vzip_s32(mono_s, mono_s); // {m0,m0}, {m1,m1}
+            const int16x4_t mix = vqmovn_s32(vcombine_s32(dup.val[0], dup.val[1]));
+            const int16x4_t acc = vld1_s16(current_frame[i].data());
+            vst1_s16(current_frame[i].data(), vqadd_s16(acc, mix));
+        }
+#else
         std::transform(
             current_frame.begin(), current_frame.end(), samples.begin(), current_frame.begin(),
             [gain](const std::array<s16, 2>& accumulator,
@@ -122,6 +143,7 @@ void Mixers::DownmixAndMixIntoCurrentFrame(float gain, const QuadFrame32& sample
                 // Mix into current frame
                 return AddAndClampToS16(accumulator, {mono, mono});
             });
+#endif
         return;
 
     case OutputFormat::Surround:
@@ -129,6 +151,21 @@ void Mixers::DownmixAndMixIntoCurrentFrame(float gain, const QuadFrame32& sample
         // fallthrough
 
     case OutputFormat::Stereo:
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        // Two samples per iteration: {L,R} = {g*s0 + g*s2, g*s1 + g*s3} is one vector add of
+        // the quad's halves; the saturating narrow and add match the scalar clamps exactly
+        // (float rounding vs the compiler-contracted scalar can differ by 1 LSB; inaudible).
+        for (std::size_t i = 0; i < samples_per_frame; i += 2) {
+            const float32x4_t f0 = vmulq_n_f32(vcvtq_f32_s32(vld1q_s32(samples[i].data())), gain);
+            const float32x4_t f1 =
+                vmulq_n_f32(vcvtq_f32_s32(vld1q_s32(samples[i + 1].data())), gain);
+            const int32x2_t lr0 = vcvt_s32_f32(vadd_f32(vget_low_f32(f0), vget_high_f32(f0)));
+            const int32x2_t lr1 = vcvt_s32_f32(vadd_f32(vget_low_f32(f1), vget_high_f32(f1)));
+            const int16x4_t mix = vqmovn_s32(vcombine_s32(lr0, lr1)); // {L0,R0,L1,R1}
+            const int16x4_t acc = vld1_s16(current_frame[i].data());
+            vst1_s16(current_frame[i].data(), vqadd_s16(acc, mix));
+        }
+#else
         std::transform(
             current_frame.begin(), current_frame.end(), samples.begin(), current_frame.begin(),
             [gain](const std::array<s16, 2>& accumulator,
@@ -139,6 +176,7 @@ void Mixers::DownmixAndMixIntoCurrentFrame(float gain, const QuadFrame32& sample
                 // Mix into current frame
                 return AddAndClampToS16(accumulator, {left, right});
             });
+#endif
         return;
     }
 
