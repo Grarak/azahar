@@ -1,0 +1,9 @@
+// imgui vertices arrive in display pixels; uScale/uOffset fold the orthographic projection
+// into a multiply-add (x*2/w-1, y*-2/h+1).
+void main(float2 aPosition, float2 aTexcoord, float4 aColor, uniform float2 uScale,
+          uniform float2 uOffset, float4 out vPosition : POSITION,
+          float2 out vTexcoord : TEXCOORD0, float4 out vColor : COLOR0) {
+    vPosition = float4(aPosition * uScale + uOffset, 0.0f, 1.0f);
+    vTexcoord = aTexcoord;
+    vColor = aColor;
+}

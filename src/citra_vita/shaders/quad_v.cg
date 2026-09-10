@@ -1,0 +1,7 @@
+// Textured quad, positions already in clip space: the CPU computes the four corners from
+// the FramebufferLayout rects once per frame, so no matrix is needed here.
+void main(float2 aPosition, float2 aTexcoord, float4 out vPosition : POSITION,
+          float2 out vTexcoord : TEXCOORD0) {
+    vPosition = float4(aPosition, 0.0f, 1.0f);
+    vTexcoord = aTexcoord;
+}

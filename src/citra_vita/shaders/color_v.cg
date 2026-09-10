@@ -1,0 +1,4 @@
+// Solid color, clip-space positions; used for the clear quad.
+void main(float2 aPosition, float4 out vPosition : POSITION) {
+    vPosition = float4(aPosition, 0.0f, 1.0f);
+}
