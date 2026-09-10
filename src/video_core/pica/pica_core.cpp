@@ -2,8 +2,16 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdlib>
+#include <cstring>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+#include <atomic>
+#include <span>
 #include "common/arch.h"
 #include "common/archives.h"
+#include "common/math_util.h"
 #include "common/microprofile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -16,6 +24,11 @@
 #include "video_core/shader/shader.h"
 
 namespace Pica {
+
+// The chain segment most recently entered by a command_buffer trigger, copied into the list
+// record at parse end. Emulation-thread only.
+static u32 g_last_chain_addr = 0;
+static u32 g_last_chain_size = 0;
 
 MICROPROFILE_DEFINE(GPU_Drawing, "GPU", "Drawing", MP_RGB(50, 50, 240));
 
@@ -79,7 +92,7 @@ PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> 
                                          const OutputVertex& v2) {
             rasterizer->AddTriangle(v0, v1, v2);
         };
-        const auto vertex = OutputVertex(regs.internal.rasterizer, buffer);
+        const auto vertex = OutputVertex(output_vertex_map, buffer);
         primitive_assembler.SubmitVertex(vertex, add_triangle);
     };
 
@@ -136,57 +149,402 @@ void PicaCore::SetInterruptHandler(Service::GSP::InterruptHandler& signal_interr
     this->signal_interrupt = signal_interrupt;
 }
 
+static bool any_byte_match(u32 a, u32 b) {
+    return ((a & 0xFF) == (b & 0xFF)) || (((a >> 8) & 0xFF) == ((b >> 8) & 0xFF)) ||
+           (((a >> 16) & 0xFF) == ((b >> 16) & 0xFF)) || (((a >> 24) & 0xFF) == ((b >> 24) & 0xFF));
+}
+
+// Special-register dispatch: one handler per register id, called through a table indexed by
+// the id. The switch this replaces spanned ids 0x010..0x2DD with about 80 cases, too sparse
+// for a jump table, so clang emitted a comparison tree that every special write walked
+// (several branches for a uniform upload, the commonest special write in a command list).
+// The table is one load and one indirect call; a null entry means the register is plain.
+struct PicaCore::Dispatch {
+    static void IrqRequest(PicaCore& p, u32 id, u32, bool& stop_requested) {
+        // TODO(PabloMK7): This logic is not fully accurate, but close enough:
+        // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
+        g_pica_probe[1].fetch_add(1, std::memory_order_relaxed);
+        if (any_byte_match(p.regs.internal.reg_array[id], p.regs.internal.irq_compare))
+            [[likely]] {
+            g_pica_probe[2].fetch_add(1, std::memory_order_relaxed);
+            // Under the software renderer the P3D must trail the shipped draws it acknowledges;
+            // see RasterizerInterface::DefersInterrupts.
+            if (p.rasterizer && p.rasterizer->DefersInterrupts()) [[unlikely]] {
+                p.rasterizer->PostInterruptAfterQueue(
+                    Service::GSP::InterruptId::P3D, p.delay_generator.CalculateAndResetDelay());
+            } else {
+                p.signal_interrupt(Service::GSP::InterruptId::P3D,
+                                   p.delay_generator.CalculateAndResetDelay());
+            }
+            if (p.regs.internal.irq_autostop) [[likely]] {
+                g_pica_probe[5].fetch_add(1, std::memory_order_relaxed);
+                stop_requested = true;
+            }
+        } else {
+            g_pica_probe[3].fetch_add(1, std::memory_order_relaxed);
+#ifdef CITRA_TRACE_PROBES
+            static const bool gx_trace = std::getenv("AZAHAR_GX_TRACE") != nullptr;
+            if (gx_trace) {
+                LOG_INFO(HW_GPU, "GXTRACE irq_nomatch req={:08x} cmp={:08x}",
+                         p.regs.internal.reg_array[id], p.regs.internal.irq_compare);
+            }
+#endif // CITRA_TRACE_PROBES
+        }
+    }
+
+    static void TriangleTopology(PicaCore& p, u32, u32, bool&) {
+        p.primitive_assembler.Reconfigure(p.regs.internal.pipeline.triangle_topology);
+        p.pa_reconfigure_events++;
+    }
+
+    static void RestartPrimitive(PicaCore& p, u32, u32, bool&) {
+        p.primitive_assembler.Reset();
+        p.pa_reset_events++;
+    }
+
+    static void DefaultAttributesIndex(PicaCore& p, u32, u32, bool&) {
+        p.immediate.Reset();
+    }
+
+    // Load default vertex input attributes
+    static void DefaultAttributesValue(PicaCore& p, u32, u32 value, bool&) {
+        p.SubmitImmediate(value);
+    }
+
+    static void DefaultAttributesValueBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        for (u32 i = 0; i < count; i++) {
+            p.SubmitImmediate(values[i]);
+        }
+    }
+
+    static void CommandBufferTrigger(PicaCore& p, u32 id, u32, bool&) {
+        g_pica_probe[4].fetch_add(1, std::memory_order_relaxed);
+        const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
+        const PAddr addr = p.regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
+        const u32 size = p.regs.internal.pipeline.command_buffer.GetSize(index);
+        g_last_chain_addr = addr;
+        g_last_chain_size = size;
+        const u8* head = p.memory.GetPhysicalPointer(addr);
+        p.cmd_list.Reset(addr, head, size);
+    }
+
+    // It seems like these trigger vertex rendering
+    static void TriggerDraw(PicaCore& p, u32 id, u32, bool&) {
+        const bool is_indexed = (id == PICA_REG_INDEX(pipeline.trigger_draw_indexed));
+        p.DrawArrays(is_indexed);
+    }
+
+    static bool GsMirrorsVs(const PicaCore& p) {
+        return !p.regs.internal.pipeline.gs_unit_exclusive_configuration &&
+               p.regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No;
+    }
+
+    static void GsBoolUniforms(PicaCore& p, u32, u32, bool&) {
+        p.gs_setup.WriteUniformBoolReg(p.regs.internal.gs.bool_uniforms.Value());
+    }
+
+    static void GsIntUniform(PicaCore& p, u32 id, u32, bool&) {
+        const u32 index = (id - PICA_REG_INDEX(gs.int_uniforms[0]));
+        p.gs_setup.WriteUniformIntReg(index, p.regs.internal.gs.GetIntUniform(index));
+    }
+
+    static void GsUniformValue(PicaCore& p, u32, u32 value, bool&) {
+        p.gs_setup.WriteUniformFloatReg(p.regs.internal.gs, value);
+    }
+
+    static void GsUniformValueBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        p.gs_setup.WriteUniformFloatRegRange(p.regs.internal.gs, values, count);
+    }
+
+    static void GsProgramWord(PicaCore& p, u32, u32 value, bool&) {
+        u32& offset = p.regs.internal.gs.program.offset;
+        if (offset >= 4096) {
+            LOG_ERROR(HW_GPU, "Invalid GS program offset {}", offset);
+        } else {
+            p.gs_setup.UpdateProgramCode(offset, value);
+            offset++;
+        }
+    }
+
+    static void GsProgramWordBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        u32& offset = p.regs.internal.gs.program.offset;
+        if (offset + count > 4096) {
+            LOG_ERROR(HW_GPU, "Invalid GS program offset {} count {}", offset, count);
+        } else {
+            p.gs_setup.UpdateProgramCodeRange(offset, values, count);
+            offset += count;
+        }
+    }
+
+    static void GsSwizzleWord(PicaCore& p, u32, u32 value, bool&) {
+        u32& offset = p.regs.internal.gs.swizzle_patterns.offset;
+        if (offset >= p.gs_setup.GetSwizzleData().size()) {
+            LOG_ERROR(HW_GPU, "Invalid GS swizzle pattern offset {}", offset);
+        } else {
+            p.gs_setup.UpdateSwizzleData(offset, value);
+            offset++;
+        }
+    }
+
+    static void GsSwizzleWordBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        u32& offset = p.regs.internal.gs.swizzle_patterns.offset;
+        if (offset + count > p.gs_setup.GetSwizzleData().size()) {
+            LOG_ERROR(HW_GPU, "Invalid GS swizzle pattern offset {} count {}", offset, count);
+        } else {
+            p.gs_setup.UpdateSwizzleDataRange(offset, values, count);
+            offset += count;
+        }
+    }
+
+    static void VsOutputMask(PicaCore& p, u32, u32 value, bool&) {
+        if (GsMirrorsVs(p)) {
+            p.regs.internal.gs.output_mask.Assign(value);
+        }
+    }
+
+    static void VsBoolUniforms(PicaCore& p, u32, u32, bool&) {
+        p.vs_setup.WriteUniformBoolReg(p.regs.internal.vs.bool_uniforms.Value());
+        if (GsMirrorsVs(p)) {
+            p.gs_setup.WriteUniformBoolReg(p.regs.internal.vs.bool_uniforms.Value());
+        }
+    }
+
+    static void VsIntUniform(PicaCore& p, u32 id, u32, bool&) {
+        const u32 index = (id - PICA_REG_INDEX(vs.int_uniforms[0]));
+        p.vs_setup.WriteUniformIntReg(index, p.regs.internal.vs.GetIntUniform(index));
+        if (GsMirrorsVs(p)) {
+            p.gs_setup.WriteUniformIntReg(index, p.regs.internal.vs.GetIntUniform(index));
+        }
+    }
+
+    static void VsUniformValue(PicaCore& p, u32, u32 value, bool&) {
+        const auto index = p.vs_setup.WriteUniformFloatReg(p.regs.internal.vs, value);
+        if (GsMirrorsVs(p) && index) {
+            p.gs_setup.uniforms_sync_dirty = true;
+            p.gs_setup.WidenFloatSyncWindow(index.value(), index.value() + 1);
+            p.gs_setup.uniforms.f[index.value()] = p.vs_setup.uniforms.f[index.value()];
+        }
+    }
+
+    static void VsUniformValueBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        const auto range = p.vs_setup.WriteUniformFloatRegRange(p.regs.internal.vs, values, count);
+        if (range && GsMirrorsVs(p)) {
+            p.gs_setup.uniforms_sync_dirty = true;
+            p.gs_setup.WidenFloatSyncWindow(range->first_index, range->first_index + range->count);
+            for (u32 i = 0; i < range->count; ++i) {
+                const u32 idx = range->first_index + i;
+                p.gs_setup.uniforms.f[idx] = p.vs_setup.uniforms.f[idx];
+            }
+        }
+    }
+
+    static void VsProgramWord(PicaCore& p, u32, u32 value, bool&) {
+        u32& offset = p.regs.internal.vs.program.offset;
+        if (offset >= 512) {
+            LOG_ERROR(HW_GPU, "Invalid VS program offset {}", offset);
+        } else {
+            p.vs_setup.UpdateProgramCode(offset, value);
+            if (GsMirrorsVs(p)) {
+                p.gs_setup.UpdateProgramCode(offset, value);
+            }
+            offset++;
+        }
+    }
+
+    static void VsProgramWordBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        u32& offset = p.regs.internal.vs.program.offset;
+        if (offset + count > 512) {
+            LOG_ERROR(HW_GPU, "Invalid VS program offset {} count {}", offset, count);
+        } else {
+            p.vs_setup.UpdateProgramCodeRange(offset, values, count);
+            if (GsMirrorsVs(p)) {
+                p.gs_setup.UpdateProgramCodeRange(offset, values, count);
+            }
+            offset += count;
+        }
+    }
+
+    static void VsSwizzleWord(PicaCore& p, u32, u32 value, bool&) {
+        u32& offset = p.regs.internal.vs.swizzle_patterns.offset;
+        if (offset >= p.vs_setup.GetSwizzleData().size()) {
+            LOG_ERROR(HW_GPU, "Invalid VS swizzle pattern offset {}", offset);
+        } else {
+            p.vs_setup.UpdateSwizzleData(offset, value);
+            if (GsMirrorsVs(p)) {
+                p.gs_setup.UpdateSwizzleData(offset, value);
+            }
+            offset++;
+        }
+    }
+
+    static void VsSwizzleWordBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        u32& offset = p.regs.internal.vs.swizzle_patterns.offset;
+        if (offset + count > p.vs_setup.GetSwizzleData().size()) {
+            LOG_ERROR(HW_GPU, "Invalid VS swizzle pattern offset {} count {}", offset, count);
+        } else {
+            p.vs_setup.UpdateSwizzleDataRange(offset, values, count);
+            if (GsMirrorsVs(p)) {
+                p.gs_setup.UpdateSwizzleDataRange(offset, values, count);
+            }
+            offset += count;
+        }
+    }
+
+    static void LightingLutData(PicaCore& p, u32, u32 value, bool&) {
+        auto& lut_config = p.regs.internal.lighting.lut_config;
+        const u32 prev =
+            std::exchange(p.lighting.luts[lut_config.type][lut_config.index].raw, value);
+        p.lighting.lut_dirty |= (prev != value) << lut_config.type;
+        lut_config.index.Assign(lut_config.index + 1);
+    }
+
+    static void LightingLutDataBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        // SM3DL rewrites its lighting LUTs every frame, 256 words at a time: compare and copy
+        // the runs up to the wrap with memcmp/memcpy instead of exchanging one word at a time
+        // (2.2% of the emulation thread on the pi5 as a scalar loop).
+        auto& lut_config = p.regs.internal.lighting.lut_config;
+        if (lut_config.type >= p.lighting.luts.size()) [[unlikely]] {
+            lut_config.index.Assign(lut_config.index + count);
+            return;
+        }
+        auto& lut = p.lighting.luts[lut_config.type];
+        static_assert(sizeof(lut[0]) == sizeof(u32));
+        u32 index = lut_config.index;
+        u32 done = 0;
+        while (done < count) {
+            const u32 run = std::min<u32>(count - done, static_cast<u32>(lut.size()) - index);
+            if (std::memcmp(&lut[index], values + done, run * sizeof(u32)) != 0) {
+                std::memcpy(&lut[index], values + done, run * sizeof(u32));
+                p.lighting.lut_dirty |= 1u << lut_config.type;
+            }
+            index = (index + run) % static_cast<u32>(lut.size());
+            done += run;
+        }
+        lut_config.index.Assign(lut_config.index + count);
+    }
+
+    static void FogLutData(PicaCore& p, u32, u32 value, bool&) {
+        auto& offset = p.regs.internal.texturing.fog_lut_offset;
+        const u32 prev = std::exchange(p.fog.lut[offset % 128].raw, value);
+        p.fog.lut_dirty |= prev != value;
+        offset.Assign(offset + 1);
+    }
+
+    static void FogLutDataBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        auto& offset = p.regs.internal.texturing.fog_lut_offset;
+        for (u32 i = 0; i < count; i++) {
+            const u32 prev = std::exchange(p.fog.lut[(offset + i) % 128].raw, values[i]);
+            p.fog.lut_dirty |= prev != values[i];
+        }
+        offset.Assign(offset + count);
+    }
+
+    static void ProcTexLutDataBatch(PicaCore& p, u32, const u32* values, u32 count) {
+        auto& index = p.regs.internal.texturing.proctex_lut_config.index;
+        const auto lut_table = p.regs.internal.texturing.proctex_lut_config.ref_table.Value();
+        const auto sync_lut = [&](auto& proctex_table) {
+            for (u32 i = 0; i < count; i++) {
+                const u32 prev =
+                    std::exchange(proctex_table[(index + i) % proctex_table.size()].raw, values[i]);
+                p.proctex.table_dirty |= (prev != values[i]) << u32(lut_table);
+            }
+        };
+        switch (lut_table) {
+        case TexturingRegs::ProcTexLutTable::Noise:
+            sync_lut(p.proctex.noise_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::ColorMap:
+            sync_lut(p.proctex.color_map_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::AlphaMap:
+            sync_lut(p.proctex.alpha_map_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::Color:
+            sync_lut(p.proctex.color_table);
+            break;
+        case TexturingRegs::ProcTexLutTable::ColorDiff:
+            sync_lut(p.proctex.color_diff_table);
+            break;
+        }
+        index.Assign(index + count);
+    }
+
+    static void ProcTexLutData(PicaCore& p, u32 id, u32 value, bool&) {
+        ProcTexLutDataBatch(p, id, &value, 1);
+    }
+
+    static consteval std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> BuildSpecialLUT() {
+        std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> table{};
+        const auto set = [&table](u32 base, u32 n, PicaCore::SpecialFn fn) {
+            for (u32 i = 0; i < n; ++i) {
+                table[base + i] = fn;
+            }
+        };
+        set(PICA_REG_INDEX(irq_request), 1, &IrqRequest);
+        set(PICA_REG_INDEX(pipeline.triangle_topology), 1, &TriangleTopology);
+        set(PICA_REG_INDEX(pipeline.restart_primitive), 1, &RestartPrimitive);
+        set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index), 1,
+            &DefaultAttributesIndex);
+        set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]), 3,
+            &DefaultAttributesValue);
+        set(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]), 2, &CommandBufferTrigger);
+        set(PICA_REG_INDEX(pipeline.trigger_draw), 1, &TriggerDraw);
+        set(PICA_REG_INDEX(pipeline.trigger_draw_indexed), 1, &TriggerDraw);
+        set(PICA_REG_INDEX(gs.bool_uniforms), 1, &GsBoolUniforms);
+        set(PICA_REG_INDEX(gs.int_uniforms[0]), 4, &GsIntUniform);
+        set(PICA_REG_INDEX(gs.uniform_setup.set_value[0]), 8, &GsUniformValue);
+        set(PICA_REG_INDEX(gs.program.set_word[0]), 8, &GsProgramWord);
+        set(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]), 8, &GsSwizzleWord);
+        set(PICA_REG_INDEX(vs.output_mask), 1, &VsOutputMask);
+        set(PICA_REG_INDEX(vs.bool_uniforms), 1, &VsBoolUniforms);
+        set(PICA_REG_INDEX(vs.int_uniforms[0]), 4, &VsIntUniform);
+        set(PICA_REG_INDEX(vs.uniform_setup.set_value[0]), 8, &VsUniformValue);
+        set(PICA_REG_INDEX(vs.program.set_word[0]), 8, &VsProgramWord);
+        set(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]), 8, &VsSwizzleWord);
+        set(PICA_REG_INDEX(lighting.lut_data[0]), 8, &LightingLutData);
+        set(PICA_REG_INDEX(texturing.fog_lut_data[0]), 8, &FogLutData);
+        set(PICA_REG_INDEX(texturing.proctex_lut_data[0]), 8, &ProcTexLutData);
+        return table;
+    }
+
+    static consteval std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> BuildBatchLUT() {
+        std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> table{};
+        const auto set = [&table](u32 base, u32 n, PicaCore::BatchFn fn) {
+            for (u32 i = 0; i < n; ++i) {
+                table[base + i] = fn;
+            }
+        };
+        set(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]), 3,
+            &DefaultAttributesValueBatch);
+        set(PICA_REG_INDEX(gs.uniform_setup.set_value[0]), 8, &GsUniformValueBatch);
+        set(PICA_REG_INDEX(gs.program.set_word[0]), 8, &GsProgramWordBatch);
+        set(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]), 8, &GsSwizzleWordBatch);
+        set(PICA_REG_INDEX(vs.uniform_setup.set_value[0]), 8, &VsUniformValueBatch);
+        set(PICA_REG_INDEX(vs.program.set_word[0]), 8, &VsProgramWordBatch);
+        set(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]), 8, &VsSwizzleWordBatch);
+        set(PICA_REG_INDEX(lighting.lut_data[0]), 8, &LightingLutDataBatch);
+        set(PICA_REG_INDEX(texturing.fog_lut_data[0]), 8, &FogLutDataBatch);
+        set(PICA_REG_INDEX(texturing.proctex_lut_data[0]), 8, &ProcTexLutDataBatch);
+        return table;
+    }
+};
+
+static constexpr std::array<PicaCore::SpecialFn, RegsInternal::NUM_REGS> special_lut =
+    PicaCore::Dispatch::BuildSpecialLUT();
+static constexpr std::array<PicaCore::BatchFn, RegsInternal::NUM_REGS> batch_lut =
+    PicaCore::Dispatch::BuildBatchLUT();
+
 static consteval std::array<RegImplInfo, RegsInternal::NUM_REGS> BuildRegImplFlagsLUT() {
     std::array<RegImplInfo, RegsInternal::NUM_REGS> table{};
 
-    // Marks the register as needing special handling.
-    const auto mark_special = [&table](u32 index) { table[index].SetNeedsSpecialHandling(); };
-
-    // Marks the register as supporting batch writes.
-    const auto mark_batch = [&table](u32 index) { table[index].SetSupportsBatch(); };
-
-    // Single registers
-    mark_special(PICA_REG_INDEX(irq_request));
-    mark_special(PICA_REG_INDEX(pipeline.triangle_topology));
-    mark_special(PICA_REG_INDEX(pipeline.restart_primitive));
-    mark_special(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index));
-    mark_special(PICA_REG_INDEX(pipeline.trigger_draw));
-    mark_special(PICA_REG_INDEX(pipeline.trigger_draw_indexed));
-    mark_special(PICA_REG_INDEX(gs.bool_uniforms));
-    mark_special(PICA_REG_INDEX(vs.output_mask));
-    mark_special(PICA_REG_INDEX(vs.bool_uniforms));
-
-    // Array based registers
-    for (u32 i = 0; i < 2; ++i) {
-        mark_special(PICA_REG_INDEX(pipeline.command_buffer.trigger[0]) + i);
-    }
-    for (u32 i = 0; i < 3; ++i) {
-        mark_special(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) + i);
-        mark_batch(PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]) + i);
-    }
-    for (u32 i = 0; i < 4; ++i) {
-        mark_special(PICA_REG_INDEX(vs.int_uniforms[0]) + i);
-        mark_special(PICA_REG_INDEX(gs.int_uniforms[0]) + i);
-    }
-    for (u32 i = 0; i < 8; ++i) {
-        mark_special(PICA_REG_INDEX(gs.uniform_setup.set_value[0]) + i);
-        mark_batch(PICA_REG_INDEX(gs.uniform_setup.set_value[0]) + i);
-        mark_special(PICA_REG_INDEX(vs.uniform_setup.set_value[0]) + i);
-        mark_batch(PICA_REG_INDEX(vs.uniform_setup.set_value[0]) + i);
-        mark_special(PICA_REG_INDEX(gs.program.set_word[0]) + i);
-        mark_batch(PICA_REG_INDEX(gs.program.set_word[0]) + i);
-        mark_special(PICA_REG_INDEX(vs.program.set_word[0]) + i);
-        mark_batch(PICA_REG_INDEX(vs.program.set_word[0]) + i);
-        mark_special(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]) + i);
-        mark_batch(PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]) + i);
-        mark_special(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]) + i);
-        mark_batch(PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]) + i);
-        mark_special(PICA_REG_INDEX(lighting.lut_data[0]) + i);
-        mark_batch(PICA_REG_INDEX(lighting.lut_data[0]) + i);
-        mark_special(PICA_REG_INDEX(texturing.fog_lut_data[0]) + i);
-        mark_batch(PICA_REG_INDEX(texturing.fog_lut_data[0]) + i);
-        mark_special(PICA_REG_INDEX(texturing.proctex_lut_data[0]) + i);
-        mark_batch(PICA_REG_INDEX(texturing.proctex_lut_data[0]) + i);
+    // Special and batch registers are the ones with a dispatch handler.
+    for (u32 i = 0; i < RegsInternal::NUM_REGS; ++i) {
+        if (special_lut[i] != nullptr) {
+            table[i].SetNeedsSpecialHandling();
+        }
+        if (batch_lut[i] != nullptr) {
+            table[i].SetSupportsBatch();
+        }
     }
 
     // Build distances to next special register.
@@ -212,6 +570,14 @@ static constexpr std::array<u32, 16> ExpandBitsToBytes = {
     0x00000000, 0x000000ff, 0x0000ff00, 0x0000ffff, 0x00ff0000, 0x00ff00ff, 0x00ffff00, 0x00ffffff,
     0xff000000, 0xff0000ff, 0xff00ff00, 0xff00ffff, 0xffff0000, 0xffff00ff, 0xffffff00, 0xffffffff,
 };
+
+#if CITRA_ARCH(arm32)
+// Thumb-2 command-list fast path, see pica_cmdlist_a32.S. Returns the new command index and
+// stores the number of applied commands in *out_count.
+extern "C" u32 PicaCmdListFastLoop(const u32* head, u32 index, u32 length, const u16* flags_lut,
+                                   const u32* expand_lut, u32* reg_array, u8* dirty_bytes,
+                                   u32* out_count);
+#endif
 
 /**
  * This is the main loop for processing GPU command lists. On Azahar, it's the most
@@ -255,15 +621,43 @@ static constexpr std::array<u32, 16> ExpandBitsToBytes = {
  * that would make debugging more complicated.
  */
 void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
+    g_pica_probe[0].fetch_add(1, std::memory_order_relaxed);
+    const u64 irqw_before = g_pica_probe[1].load(std::memory_order_relaxed);
+    const u64 p3d_before = g_pica_probe[2].load(std::memory_order_relaxed);
+    const u64 chain_before = g_pica_probe[4].load(std::memory_order_relaxed);
+    const auto record_list = [&](u32 end_index, u32 end_length, bool stopped) {
+        auto& rec =
+            g_list_ring[g_list_ring_head.fetch_add(1, std::memory_order_relaxed) % g_list_ring.size()];
+        rec.addr = list;
+        rec.size = size;
+        rec.end_index = end_index;
+        rec.end_length = end_length;
+        rec.irqw = static_cast<u32>(g_pica_probe[1].load(std::memory_order_relaxed) - irqw_before);
+        rec.p3d = static_cast<u32>(g_pica_probe[2].load(std::memory_order_relaxed) - p3d_before);
+        rec.chains =
+            static_cast<u32>(g_pica_probe[4].load(std::memory_order_relaxed) - chain_before);
+        rec.stopped = stopped ? 1 : 0;
+        rec.last_chain_addr = g_last_chain_addr;
+        rec.last_chain_size = g_last_chain_size;
+        g_last_chain_addr = 0;
+        g_last_chain_size = 0;
+    };
     if (ignore_list) {
-        signal_interrupt(Service::GSP::InterruptId::P3D, delay_generator.CalculateAndResetDelay());
+        if (rasterizer && rasterizer->DefersInterrupts()) {
+            rasterizer->PostInterruptAfterQueue(Service::GSP::InterruptId::P3D,
+                                                delay_generator.CalculateAndResetDelay());
+        } else {
+            signal_interrupt(Service::GSP::InterruptId::P3D,
+                             delay_generator.CalculateAndResetDelay());
+        }
+        record_list(0, 0, false);
         return;
     }
 
     const u8* head = memory.GetPhysicalPointer(list);
+    bool stop_requested = false;
     cmd_list.Reset(list, head, size);
 
-    bool stop_requested = false;
     bool skip_fast_path = false;
     while (cmd_list.current_index < cmd_list.length) {
         if (stop_requested) [[unlikely]] {
@@ -283,6 +677,24 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         // that's why it was decided to keep the structure like this.
         if (!debug_context) [[likely]] {
             if (!skip_fast_path) {
+#if CITRA_ARCH(arm32)
+                // Hand-written Thumb-2 loop (pica_cmdlist_a32.S): applies plain register
+                // writes until list end or a special command, which falls through to the
+                // slow path below with current_index already advanced past the batch.
+                u32 run = 0;
+                const u32 index = PicaCmdListFastLoop(
+                    cmd_list.head, cmd_list.current_index, cmd_list.length,
+                    reinterpret_cast<const u16*>(reg_impl_flags_lut.data()),
+                    ExpandBitsToBytes.data(), regs.internal.reg_array.data(),
+                    reinterpret_cast<u8*>(dirty_regs.qwords.data()), &run);
+                if (run > 0) {
+                    delay_generator.AddCommands(run);
+                    cmd_list.current_index = index;
+                    if (index + 1 >= cmd_list.length) {
+                        continue;
+                    }
+                }
+#else
                 constexpr u32 batch_size = 4;
                 u32 index = cmd_list.current_index;
                 u32 ids[batch_size], values[batch_size], masks[batch_size];
@@ -321,6 +733,7 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                     // Continue from the while loop in case we reached the end of the list.
                     continue;
                 }
+#endif
             }
         }
         // Slow path, command needs special handling.
@@ -334,8 +747,16 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         // Write to the requested PICA register.
         WriteInternalReg(header.cmd_id, value, header.parameter_mask, stop_requested);
 
-        // Write any extra paramters as well.
-        const u32 count = header.extra_data_length;
+        // Write any extra paramters as well. A header may declare more extra words than the list
+        // actually has left; taking it at its word walks the parser off the end of the buffer,
+        // past the `irq_request` that terminates the list, and on into whatever follows. The list
+        // then never raises its completion interrupt and never chains, and the guest waits for a
+        // frame that can no longer arrive.
+        const u32 remaining = cmd_list.length - cmd_list.current_index;
+        const u32 count = std::min(header.extra_data_length.Value(), remaining);
+        if (count != header.extra_data_length) {
+            g_cmdlist_overrun.fetch_add(1, std::memory_order_relaxed);
+        }
         if (count == 0)
             continue;
 
@@ -366,500 +787,24 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
             }
         }
     }
+    record_list(cmd_list.current_index, cmd_list.length, stop_requested);
 }
 
-static bool any_byte_match(u32 a, u32 b) {
-    return ((a & 0xFF) == (b & 0xFF)) || (((a >> 8) & 0xFF) == ((b >> 8) & 0xFF)) ||
-           (((a >> 16) & 0xFF) == ((b >> 16) & 0xFF)) || (((a >> 24) & 0xFF) == ((b >> 24) & 0xFF));
-}
 
-// Handle registers which our backend support batch writes.
-void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
-    switch (id) {
-    case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]):
-    case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[1]):
-    case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[2]): {
-        for (u32 i = 0; i < count; i++) {
-            SubmitImmediate(values[i]);
-        }
-        break;
-    }
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[0]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[1]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[2]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[3]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[4]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[5]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[6]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[7]): {
-        gs_setup.WriteUniformFloatRegRange(regs.internal.gs, values, count);
-        break;
-    }
-    case PICA_REG_INDEX(gs.program.set_word[0]):
-    case PICA_REG_INDEX(gs.program.set_word[1]):
-    case PICA_REG_INDEX(gs.program.set_word[2]):
-    case PICA_REG_INDEX(gs.program.set_word[3]):
-    case PICA_REG_INDEX(gs.program.set_word[4]):
-    case PICA_REG_INDEX(gs.program.set_word[5]):
-    case PICA_REG_INDEX(gs.program.set_word[6]):
-    case PICA_REG_INDEX(gs.program.set_word[7]): {
-        u32& offset = regs.internal.gs.program.offset;
-        if (offset + count > 4096) {
-            LOG_ERROR(HW_GPU, "Invalid GS program offset {} count {}", offset, count);
-        } else {
-            gs_setup.UpdateProgramCodeRange(offset, values, count);
-            offset += count;
-        }
-        break;
-    }
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[1]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[2]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[3]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[4]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[5]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[6]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[7]): {
-        u32& offset = regs.internal.gs.swizzle_patterns.offset;
-        if (offset + count > gs_setup.GetSwizzleData().size()) {
-            LOG_ERROR(HW_GPU, "Invalid GS swizzle pattern offset {} count {}", offset, count);
-        } else {
-            gs_setup.UpdateSwizzleDataRange(offset, values, count);
-            offset += count;
-        }
-        break;
-    }
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[0]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[1]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[2]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[3]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[4]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[5]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[6]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[7]): {
-        const auto range = vs_setup.WriteUniformFloatRegRange(regs.internal.vs, values, count);
-        if (range && !regs.internal.pipeline.gs_unit_exclusive_configuration &&
-            regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-            for (u32 i = 0; i < range->count; ++i) {
-                const u32 idx = range->first_index + i;
-                gs_setup.uniforms.f[idx] = vs_setup.uniforms.f[idx];
-            }
-        }
-        break;
-    }
-    case PICA_REG_INDEX(vs.program.set_word[0]):
-    case PICA_REG_INDEX(vs.program.set_word[1]):
-    case PICA_REG_INDEX(vs.program.set_word[2]):
-    case PICA_REG_INDEX(vs.program.set_word[3]):
-    case PICA_REG_INDEX(vs.program.set_word[4]):
-    case PICA_REG_INDEX(vs.program.set_word[5]):
-    case PICA_REG_INDEX(vs.program.set_word[6]):
-    case PICA_REG_INDEX(vs.program.set_word[7]): {
-        u32& offset = regs.internal.vs.program.offset;
-        if (offset + count > 512) {
-            LOG_ERROR(HW_GPU, "Invalid VS program offset {} count {}", offset, count);
-        } else {
-            vs_setup.UpdateProgramCodeRange(offset, values, count);
-            if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-                regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-                gs_setup.UpdateProgramCodeRange(offset, values, count);
-            }
-            offset += count;
-        }
-        break;
-    }
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[1]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[2]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[3]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[4]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[5]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]): {
-        u32& offset = regs.internal.vs.swizzle_patterns.offset;
-        if (offset + count > vs_setup.GetSwizzleData().size()) {
-            LOG_ERROR(HW_GPU, "Invalid VS swizzle pattern offset {} count {}", offset, count);
-        } else {
-            vs_setup.UpdateSwizzleDataRange(offset, values, count);
-            if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-                regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-                gs_setup.UpdateSwizzleDataRange(offset, values, count);
-            }
-            offset += count;
-        }
-        break;
-    }
-    case PICA_REG_INDEX(lighting.lut_data[0]):
-    case PICA_REG_INDEX(lighting.lut_data[1]):
-    case PICA_REG_INDEX(lighting.lut_data[2]):
-    case PICA_REG_INDEX(lighting.lut_data[3]):
-    case PICA_REG_INDEX(lighting.lut_data[4]):
-    case PICA_REG_INDEX(lighting.lut_data[5]):
-    case PICA_REG_INDEX(lighting.lut_data[6]):
-    case PICA_REG_INDEX(lighting.lut_data[7]): {
-        auto& lut_config = regs.internal.lighting.lut_config;
-
-        for (u32 i = 0; i < count; i++) {
-            const u32 prev =
-                std::exchange(lighting
-                                  .luts[lut_config.type][(lut_config.index + i) %
-                                                         lighting.luts[lut_config.type].size()]
-                                  .raw,
-                              values[i]);
-            lighting.lut_dirty |= (prev != values[i]) << lut_config.type;
-        }
-        lut_config.index.Assign(lut_config.index + count);
-        break;
-    }
-    case PICA_REG_INDEX(texturing.fog_lut_data[0]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[1]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[2]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[3]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[4]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[5]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[6]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[7]): {
-        for (u32 i = 0; i < count; i++) {
-            const u32 prev = std::exchange(
-                fog.lut[(regs.internal.texturing.fog_lut_offset + i) % 128].raw, values[i]);
-            fog.lut_dirty |= prev != values[i];
-        }
-        regs.internal.texturing.fog_lut_offset.Assign(regs.internal.texturing.fog_lut_offset +
-                                                      count);
-        break;
-    }
-    case PICA_REG_INDEX(texturing.proctex_lut_data[0]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[1]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[2]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[3]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[4]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[5]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[6]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[7]): {
-        auto& index = regs.internal.texturing.proctex_lut_config.index;
-        const auto lut_table = regs.internal.texturing.proctex_lut_config.ref_table.Value();
-
-        for (u32 i = 0; i < count; i++) {
-
-            const auto sync_lut = [&](auto& proctex_table) {
-                const u32 prev =
-                    std::exchange(proctex_table[(index + i) % proctex_table.size()].raw, values[i]);
-                proctex.table_dirty |= (prev != values[i]) << u32(lut_table);
-            };
-
-            switch (lut_table) {
-            case TexturingRegs::ProcTexLutTable::Noise:
-                sync_lut(proctex.noise_table);
-                break;
-            case TexturingRegs::ProcTexLutTable::ColorMap:
-                sync_lut(proctex.color_map_table);
-                break;
-            case TexturingRegs::ProcTexLutTable::AlphaMap:
-                sync_lut(proctex.alpha_map_table);
-                break;
-            case TexturingRegs::ProcTexLutTable::Color:
-                sync_lut(proctex.color_table);
-                break;
-            case TexturingRegs::ProcTexLutTable::ColorDiff:
-                sync_lut(proctex.color_diff_table);
-                break;
-            }
-        }
-        index.Assign(index + count);
-        break;
-    }
-    }
-}
-
-// Handle special registers. This function should also include the
-// registers that support batch processing can be submitted
-// individually.
-void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
-    switch (id) {
-    // Trigger IRQ
-    case PICA_REG_INDEX(irq_request):
-        // TODO(PabloMK7): This logic is not fully accurate, but close enough:
-        // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
-        if (any_byte_match(regs.internal.reg_array[id], regs.internal.irq_compare)) [[likely]] {
-            signal_interrupt(Service::GSP::InterruptId::P3D,
-                             delay_generator.CalculateAndResetDelay());
-            if (regs.internal.irq_autostop) [[likely]] {
-                stop_requested = true;
-            }
-        }
-        break;
-
-    case PICA_REG_INDEX(pipeline.triangle_topology):
-        primitive_assembler.Reconfigure(regs.internal.pipeline.triangle_topology);
-        break;
-
-    case PICA_REG_INDEX(pipeline.restart_primitive):
-        primitive_assembler.Reset();
-        break;
-
-    case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.index):
-        immediate.Reset();
-        break;
-
-    // Load default vertex input attributes
-    case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[0]):
-    case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[1]):
-    case PICA_REG_INDEX(pipeline.vs_default_attributes_setup.set_value[2]):
-        SubmitImmediate(value);
-        break;
-
-    case PICA_REG_INDEX(pipeline.gpu_mode):
-        // This register likely just enables vertex processing and doesn't need any special handling
-        break;
-
-    case PICA_REG_INDEX(pipeline.command_buffer.trigger[0]):
-    case PICA_REG_INDEX(pipeline.command_buffer.trigger[1]): {
-        const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
-        const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
-        const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
-        const u8* head = memory.GetPhysicalPointer(addr);
-        cmd_list.Reset(addr, head, size);
-        break;
-    }
-
-    // It seems like these trigger vertex rendering
-    case PICA_REG_INDEX(pipeline.trigger_draw):
-    case PICA_REG_INDEX(pipeline.trigger_draw_indexed): {
-        const bool is_indexed = (id == PICA_REG_INDEX(pipeline.trigger_draw_indexed));
-        DrawArrays(is_indexed);
-        break;
-    }
-
-    case PICA_REG_INDEX(gs.bool_uniforms):
-        gs_setup.WriteUniformBoolReg(regs.internal.gs.bool_uniforms.Value());
-        break;
-
-    case PICA_REG_INDEX(gs.int_uniforms[0]):
-    case PICA_REG_INDEX(gs.int_uniforms[1]):
-    case PICA_REG_INDEX(gs.int_uniforms[2]):
-    case PICA_REG_INDEX(gs.int_uniforms[3]): {
-        const u32 index = (id - PICA_REG_INDEX(gs.int_uniforms[0]));
-        gs_setup.WriteUniformIntReg(index, regs.internal.gs.GetIntUniform(index));
-        break;
-    }
-
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[0]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[1]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[2]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[3]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[4]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[5]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[6]):
-    case PICA_REG_INDEX(gs.uniform_setup.set_value[7]): {
-        gs_setup.WriteUniformFloatReg(regs.internal.gs, value);
-        break;
-    }
-
-    case PICA_REG_INDEX(gs.program.set_word[0]):
-    case PICA_REG_INDEX(gs.program.set_word[1]):
-    case PICA_REG_INDEX(gs.program.set_word[2]):
-    case PICA_REG_INDEX(gs.program.set_word[3]):
-    case PICA_REG_INDEX(gs.program.set_word[4]):
-    case PICA_REG_INDEX(gs.program.set_word[5]):
-    case PICA_REG_INDEX(gs.program.set_word[6]):
-    case PICA_REG_INDEX(gs.program.set_word[7]): {
-        u32& offset = regs.internal.gs.program.offset;
-        if (offset >= 4096) {
-            LOG_ERROR(HW_GPU, "Invalid GS program offset {}", offset);
-        } else {
-            gs_setup.UpdateProgramCode(offset, value);
-            offset++;
-        }
-        break;
-    }
-
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[0]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[1]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[2]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[3]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[4]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[5]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[6]):
-    case PICA_REG_INDEX(gs.swizzle_patterns.set_word[7]): {
-        u32& offset = regs.internal.gs.swizzle_patterns.offset;
-        if (offset >= gs_setup.GetSwizzleData().size()) {
-            LOG_ERROR(HW_GPU, "Invalid GS swizzle pattern offset {}", offset);
-        } else {
-            gs_setup.UpdateSwizzleData(offset, value);
-            offset++;
-        }
-        break;
-    }
-
-    case PICA_REG_INDEX(vs.output_mask):
-        if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-            regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-            regs.internal.gs.output_mask.Assign(value);
-        }
-        break;
-
-    case PICA_REG_INDEX(vs.bool_uniforms):
-        vs_setup.WriteUniformBoolReg(regs.internal.vs.bool_uniforms.Value());
-        if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-            regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-            gs_setup.WriteUniformBoolReg(regs.internal.vs.bool_uniforms.Value());
-        }
-        break;
-
-    case PICA_REG_INDEX(vs.int_uniforms[0]):
-    case PICA_REG_INDEX(vs.int_uniforms[1]):
-    case PICA_REG_INDEX(vs.int_uniforms[2]):
-    case PICA_REG_INDEX(vs.int_uniforms[3]): {
-        const u32 index = (id - PICA_REG_INDEX(vs.int_uniforms[0]));
-        vs_setup.WriteUniformIntReg(index, regs.internal.vs.GetIntUniform(index));
-        if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-            regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-            gs_setup.WriteUniformIntReg(index, regs.internal.vs.GetIntUniform(index));
-        }
-        break;
-    }
-
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[0]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[1]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[2]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[3]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[4]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[5]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[6]):
-    case PICA_REG_INDEX(vs.uniform_setup.set_value[7]): {
-        const auto index = vs_setup.WriteUniformFloatReg(regs.internal.vs, value);
-        if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-            regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No && index) {
-            gs_setup.uniforms.f[index.value()] = vs_setup.uniforms.f[index.value()];
-        }
-        break;
-    }
-
-    case PICA_REG_INDEX(vs.program.set_word[0]):
-    case PICA_REG_INDEX(vs.program.set_word[1]):
-    case PICA_REG_INDEX(vs.program.set_word[2]):
-    case PICA_REG_INDEX(vs.program.set_word[3]):
-    case PICA_REG_INDEX(vs.program.set_word[4]):
-    case PICA_REG_INDEX(vs.program.set_word[5]):
-    case PICA_REG_INDEX(vs.program.set_word[6]):
-    case PICA_REG_INDEX(vs.program.set_word[7]): {
-        u32& offset = regs.internal.vs.program.offset;
-        if (offset >= 512) {
-            LOG_ERROR(HW_GPU, "Invalid VS program offset {}", offset);
-        } else {
-            vs_setup.UpdateProgramCode(offset, value);
-            if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-                regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-                gs_setup.UpdateProgramCode(offset, value);
-            }
-            offset++;
-        }
-        break;
-    }
-
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[0]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[1]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[2]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[3]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[4]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[5]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]):
-    case PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]): {
-        u32& offset = regs.internal.vs.swizzle_patterns.offset;
-        if (offset >= vs_setup.GetSwizzleData().size()) {
-            LOG_ERROR(HW_GPU, "Invalid VS swizzle pattern offset {}", offset);
-        } else {
-            vs_setup.UpdateSwizzleData(offset, value);
-            if (!regs.internal.pipeline.gs_unit_exclusive_configuration &&
-                regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-                gs_setup.UpdateSwizzleData(offset, value);
-            }
-            offset++;
-        }
-        break;
-    }
-
-    case PICA_REG_INDEX(lighting.lut_data[0]):
-    case PICA_REG_INDEX(lighting.lut_data[1]):
-    case PICA_REG_INDEX(lighting.lut_data[2]):
-    case PICA_REG_INDEX(lighting.lut_data[3]):
-    case PICA_REG_INDEX(lighting.lut_data[4]):
-    case PICA_REG_INDEX(lighting.lut_data[5]):
-    case PICA_REG_INDEX(lighting.lut_data[6]):
-    case PICA_REG_INDEX(lighting.lut_data[7]): {
-        auto& lut_config = regs.internal.lighting.lut_config;
-
-        const u32 prev = std::exchange(lighting.luts[lut_config.type][lut_config.index].raw, value);
-        lighting.lut_dirty |= (prev != value) << lut_config.type;
-        lut_config.index.Assign(lut_config.index + 1);
-        break;
-    }
-
-    case PICA_REG_INDEX(texturing.fog_lut_data[0]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[1]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[2]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[3]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[4]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[5]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[6]):
-    case PICA_REG_INDEX(texturing.fog_lut_data[7]): {
-        const u32 prev =
-            std::exchange(fog.lut[regs.internal.texturing.fog_lut_offset % 128].raw, value);
-        fog.lut_dirty |= prev != value;
-        regs.internal.texturing.fog_lut_offset.Assign(regs.internal.texturing.fog_lut_offset + 1);
-        break;
-    }
-
-    case PICA_REG_INDEX(texturing.proctex_lut_data[0]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[1]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[2]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[3]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[4]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[5]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[6]):
-    case PICA_REG_INDEX(texturing.proctex_lut_data[7]): {
-        auto& index = regs.internal.texturing.proctex_lut_config.index;
-        const auto lut_table = regs.internal.texturing.proctex_lut_config.ref_table.Value();
-
-        const auto sync_lut = [&](auto& proctex_table) {
-            const u32 prev = std::exchange(proctex_table[index % proctex_table.size()].raw, value);
-            proctex.table_dirty |= (prev != value) << u32(lut_table);
-        };
-
-        switch (lut_table) {
-        case TexturingRegs::ProcTexLutTable::Noise:
-            sync_lut(proctex.noise_table);
-            break;
-        case TexturingRegs::ProcTexLutTable::ColorMap:
-            sync_lut(proctex.color_map_table);
-            break;
-        case TexturingRegs::ProcTexLutTable::AlphaMap:
-            sync_lut(proctex.alpha_map_table);
-            break;
-        case TexturingRegs::ProcTexLutTable::Color:
-            sync_lut(proctex.color_table);
-            break;
-        case TexturingRegs::ProcTexLutTable::ColorDiff:
-            sync_lut(proctex.color_diff_table);
-            break;
-        }
-        index.Assign(index + 1);
-        break;
-    }
-    default:
-        break;
-    }
+// Writes to OOB registers are no-ops. The log call carries a fmt frame; keeping it out of
+// line keeps the hot writers' prologues small.
+[[gnu::cold, gnu::noinline]] static void LogOutOfRangeWrite(u32 id, u32 count, u32 mask) {
+    LOG_DEBUG(HW_GPU,
+              "Commandlist tried to write to invalid register 0x{:03X} repeated 0x{:04X} times"
+              "(mask: {:X})",
+              id, count, mask);
 }
 
 // Handle batch register writes
 void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                      bool& stop_requested) {
     if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
-        // Writes to OOB registers are no-op.
-        LOG_DEBUG(HW_GPU,
-                  "Commandlist tried to write to invalid register 0x{:03X} repeated 0x{:04X} times"
-                  "(mask: {:X})",
-                  id, count, mask);
+        LogOutOfRangeWrite(id, count, mask);
         return;
     }
 
@@ -871,14 +816,14 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
         (regs.internal.reg_array[id] & ~write_mask) | (values[count - 1] & write_mask);
     dirty_regs.Set(id);
 
-    if (reg_impl_flags_lut[id].SupportsBatch()) {
+    if (const BatchFn batch = batch_lut[id]) {
         // If the register supports batch then call the handler.
-        HandleSpecialRegBatch(id, values, count);
-    } else if (reg_impl_flags_lut[id].NeedsSpecialHandling()) [[unlikely]] {
+        batch(*this, id, values, count);
+    } else if (const SpecialFn special = special_lut[id]) [[unlikely]] {
         // Unlikely as all special regs that make sense to use batch mode already
         // support batch handling.
         for (u32 i = 0; i < count && !stop_requested; ++i) {
-            HandleSpecialReg(id, values[i], stop_requested);
+            special(*this, id, values[i], stop_requested);
         }
     }
 }
@@ -887,11 +832,7 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
 void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, u32 count, u32 mask,
                                           bool& stop_requested) {
     if (id + count > RegsInternal::NUM_REGS) [[unlikely]] {
-        // Writes to OOB registers are no-op.
-        LOG_DEBUG(
-            HW_GPU,
-            "Commandlist tried to write to invalid register range 0x{:03X}-0x{:03X} (mask: {:X})",
-            id, id + count, mask);
+        LogOutOfRangeWrite(id, count, mask);
         if (id >= RegsInternal::NUM_REGS) {
             return;
         } else {
@@ -918,10 +859,22 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
             delay_generator.AddCommands(batch_count);
 
             // Allows the compiler to auto-vectorize thanks to the __restrict keywords.
-            // Verified in MSVC that vectorization is happening.
+            // Verified in MSVC that vectorization is happening; GCC for ARM32 did not
+            // (2026-09-08, not one vector instruction in the function), so the four-wide
+            // blend is written out for it. The register file is not 16-byte aligned:
+            // unaligned vector loads.
             u32* __restrict batch_dst = dst + offset;
             const u32* __restrict batch_src = values + offset;
-            for (u32 i = 0; i < batch_count; ++i) {
+            u32 i = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            const uint32x4_t mask_v = vdupq_n_u32(write_mask);
+            for (; i + 4 <= batch_count; i += 4) {
+                const uint32x4_t d = vld1q_u32(batch_dst + i);
+                const uint32x4_t v = vld1q_u32(batch_src + i);
+                vst1q_u32(batch_dst + i, vbslq_u32(mask_v, v, d));
+            }
+#endif
+            for (; i < batch_count; ++i) {
                 batch_dst[i] = (batch_dst[i] & ~write_mask) | (batch_src[i] & write_mask);
             }
 
@@ -940,11 +893,7 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
 // Handle individual command write.
 void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requested) {
     if (id >= RegsInternal::NUM_REGS) [[unlikely]] {
-        // Writes to OOB registers are no-op.
-        LOG_DEBUG(
-            HW_GPU,
-            "Commandlist tried to write to invalid register 0x{:03X} (value: {:08X}, mask: {:X})",
-            id, value, mask);
+        LogOutOfRangeWrite(id, 1, mask);
         return;
     }
 
@@ -962,8 +911,8 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
         debug_context->OnEvent(DebugContext::Event::PicaCommandLoaded, &id);
     }
 
-    if (reg_impl_flags_lut[id].NeedsSpecialHandling()) {
-        HandleSpecialReg(id, value, stop_requested);
+    if (const SpecialFn special = special_lut[id]) {
+        special(*this, id, value, stop_requested);
     }
 
     dirty_regs.Set(id);
@@ -991,6 +940,7 @@ void PicaCore::SubmitImmediate(u32 value) {
     const auto attribute = immediate.queue.Get();
     if (setup.index < IMMEDIATE_MODE_INDEX) {
         input_default_attributes[setup.index] = attribute;
+        default_attributes_sync_dirty = true;
         setup.index++;
         return;
     }
@@ -1007,8 +957,21 @@ void PicaCore::SubmitImmediate(u32 value) {
 }
 
 void PicaCore::DrawImmediate() {
+    if (rasterizer->ConsumesShippedDraws()) {
+        // Immediate-mode input is already assembled in emulator memory; ship it by value.
+        DrawPayload payload;
+        payload.immediate = true;
+        payload.immediate_input = immediate.input_vertex;
+        payload.immediate_reset_geometry = immediate.reset_geometry_pipeline;
+        immediate.reset_geometry_pipeline = false;
+        rasterizer->ShipDraw(std::move(payload), nullptr);
+        immediate.current_attribute = 0;
+        return;
+    }
+
     // Compile the vertex shader.
     shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+    output_vertex_map.Build(regs.internal.rasterizer);
 
     // Track vertex in the debug recorder.
     if (debug_context) {
@@ -1078,8 +1041,17 @@ void PicaCore::DrawArrays(bool is_indexed) {
     delay_generator.AddVertices(regs.internal.pipeline.num_vertices,
                                 regs.internal.pipeline.triangle_topology);
 
-    // Attempt to use hardware vertex shaders if possible.
-    if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
+    // Attempt to use hardware vertex shaders if possible. Under the offload the draw ships with
+    // its arena and the GLSL path runs against the mirror; the software (NEON) pipeline stays as
+    // the automatic fallback for anything the hardware path declines.
+    if (accelerate_draw && rasterizer->ConsumesShippedDraws()) {
+        if (TryShipDraw(is_indexed, true)) {
+            if (debug_context) {
+                debug_context->OnEvent(DebugContext::Event::FinishedPrimitiveBatch, nullptr);
+            }
+            return;
+        }
+    } else if (accelerate_draw && rasterizer->AccelerateDrawBatch(is_indexed)) {
         return;
     }
 
@@ -1094,12 +1066,109 @@ void PicaCore::DrawArrays(bool is_indexed) {
     }
 }
 
+bool PicaCore::TryShipDraw(bool is_indexed, bool hw) {
+    const auto& pipeline = regs.internal.pipeline;
+    const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
+    const auto& index_info = pipeline.index_array;
+    const u8* const index_address_8 = memory.GetPhysicalPointer(base_address + index_info.offset);
+    if (index_address_8 == nullptr || pipeline.num_vertices == 0) {
+        return false;
+    }
+    const u16* const index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+    const bool index_u16 = index_info.format != 0;
+
+    auto& loader = GetVertexLoader();
+    u32 vertex_min = pipeline.vertex_offset;
+    u32 vertex_max = pipeline.vertex_offset + pipeline.num_vertices - 1;
+    const u32 index_bytes = is_indexed ? pipeline.num_vertices * (index_u16 ? 2 : 1) : 0;
+    if (is_indexed) {
+        if (index_u16) {
+            const auto [min, max] = Common::FindMinMax(
+                std::span<const u16>{index_address_16, pipeline.num_vertices});
+            vertex_min = min;
+            vertex_max = max;
+        } else {
+            const auto [min, max] =
+                Common::FindMinMax(std::span<const u8>{index_address_8, pipeline.num_vertices});
+            vertex_min = min;
+            vertex_max = max;
+        }
+    }
+    DrawArenaLayout layout = loader.ComputeArenaLayout(vertex_min, vertex_max, index_bytes);
+    // The GL vertex-array path cannot express a zero-stride loader; those draws shade in
+    // software.
+    if (hw && layout.zero_stride) {
+        return false;
+    }
+    // Garbage configs (boot-time junk draws) can make range x stride explode — one boot draw
+    // asked for 631 MB. Real draws stay in the low megabytes; anything bigger shades locally
+    // where cost scales with the vertex count instead of the index range.
+    constexpr u32 MAX_ARENA_BYTES = 16 * 1024 * 1024;
+    if (layout.total > MAX_ARENA_BYTES) {
+        return false;
+    }
+    // A hardware draw would rather be written once, straight into the renderer's GPU-visible
+    // ring in the layout its vertex streams read, than into an arena the render thread copies
+    // into that ring; the facade grants it when the ring has room.
+    const DrawArenaLayout ring_layout =
+        hw ? loader.ComputeArenaLayout(vertex_min, vertex_max,
+                                       is_indexed ? pipeline.num_vertices * 2 : 0, true)
+           : layout;
+    auto ticket = rasterizer->BeginShippedDraw(
+        layout.total, regs.internal.framebuffer.framebuffer.height + 1 > 350,
+        hw ? ring_layout.total : 0);
+    if (!ticket) {
+        return false;
+    }
+    if (ticket->data == nullptr) {
+        return true; // Skipped before any snapshot cost.
+    }
+    if (ticket->in_ring) {
+        layout = ring_layout;
+    }
+    loader.CopyIntoArena(base_address, vertex_min, vertex_max, layout, ticket->data);
+    if (index_bytes != 0) {
+        if (layout.ring) {
+            VertexLoader::WriteRingIndices(ticket->data + layout.index_offset, index_address_8,
+                                           index_u16, pipeline.num_vertices, vertex_min);
+        } else {
+            std::memcpy(ticket->data + layout.index_offset, index_address_8, index_bytes);
+        }
+    }
+    DrawPayload payload;
+    payload.arena = ticket->data;
+    payload.layout = layout;
+    payload.in_ring = ticket->in_ring;
+    payload.ring_offset = ticket->ring_offset;
+    payload.ring_end = ticket->ring_end;
+    payload.vertex_min = vertex_min;
+    payload.vertex_max = vertex_max;
+    payload.num_vertices = pipeline.num_vertices;
+    payload.vertex_offset = pipeline.vertex_offset;
+    payload.is_indexed = is_indexed;
+    payload.index_u16 = index_u16;
+    payload.hw = hw;
+    rasterizer->ShipDraw(std::move(payload), ticket->slot);
+    return true;
+}
+
+VertexLoader& PicaCore::GetVertexLoader() {
+    const auto* key = reinterpret_cast<const u8*>(&regs.internal.pipeline.vertex_attributes);
+    if (!cached_vertex_loader ||
+        std::memcmp(cached_loader_key.data(), key, cached_loader_key.size()) != 0) {
+        std::memcpy(cached_loader_key.data(), key, cached_loader_key.size());
+        cached_vertex_loader.emplace(memory, regs.internal.pipeline);
+    }
+    return *cached_vertex_loader;
+}
+
 void PicaCore::LoadVertices(bool is_indexed) {
     // Read and validate vertex information from the loaders
     const auto& pipeline = regs.internal.pipeline;
     const PAddr base_address = pipeline.vertex_attributes.GetPhysicalBaseAddress();
-    const auto loader = VertexLoader(memory, pipeline);
+    auto& loader = GetVertexLoader();
     regs.internal.rasterizer.ValidateSemantics();
+    output_vertex_map.Build(regs.internal.rasterizer);
 
     // Locate index buffer.
     const auto& index_info = pipeline.index_array;
@@ -1112,12 +1181,31 @@ void PicaCore::LoadVertices(bool is_indexed) {
     const u16* index_address_16 = reinterpret_cast<const u16*>(index_address_8);
     const bool index_u16 = index_info.format != 0;
 
-    // Simple circular-replacement vertex cache
-    const std::size_t VERTEX_CACHE_SIZE = 64;
-    std::array<bool, VERTEX_CACHE_SIZE> vertex_cache_valid{};
-    std::array<u16, VERTEX_CACHE_SIZE> vertex_cache_ids;
+    if (pipeline.num_vertices == 0) {
+        return;
+    }
+
+    // Offload path: freeze this draw — index extremes, then exactly the attribute and index
+    // bytes it can reference — into a render-thread arena and ship it. Shading, primitive
+    // assembly and the rasterizer then all run against the mirror, and this thread is done with
+    // the draw the moment the copy finishes. BeginShippedDraw is also the frameskip gate: a
+    // skipped draw returns a null ticket before any copy is paid.
+    if (TryShipDraw(is_indexed, false)) {
+        return;
+    }
+
+    // Local path: resolve the attribute arrays to host pointers once for the whole draw;
+    // fetches below are then a pointer add each.
+    loader.Rebase(base_address);
+
+    // Direct-mapped vertex cache, slot = index & 63: one probe instead of the 64-entry linear
+    // scan, which alone measured 28% of the emulation thread in-match. A collision just evicts;
+    // mesh indices are near-sequential, so slots rarely collide inside the reuse window anyway.
+    // The sentinel doubles as the invalid flag — no index is 0xFFFFFFFF.
+    constexpr std::size_t VERTEX_CACHE_SIZE = 64;
+    std::array<u32, VERTEX_CACHE_SIZE> vertex_cache_ids;
+    vertex_cache_ids.fill(0xFFFFFFFF);
     std::array<AttributeBuffer, VERTEX_CACHE_SIZE> vertex_cache;
-    u32 vertex_cache_pos = 0;
 
     // Compile the vertex shader for this batch.
     ShaderUnit shader_unit;
@@ -1142,19 +1230,17 @@ void PicaCore::LoadVertices(bool is_indexed) {
                 continue;
             }
 
-            for (u32 i = 0; i < VERTEX_CACHE_SIZE; ++i) {
-                if (vertex_cache_valid[i] && vertex == vertex_cache_ids[i]) {
-                    vs_output = vertex_cache[i];
-                    vertex_cache_hit = true;
-                    break;
-                }
+            const u32 slot = vertex & (VERTEX_CACHE_SIZE - 1);
+            if (vertex_cache_ids[slot] == vertex) {
+                vs_output = vertex_cache[slot];
+                vertex_cache_hit = true;
             }
         }
 
         if (!vertex_cache_hit) {
             // Initialize data for the current vertex
             AttributeBuffer input;
-            loader.LoadVertex(base_address, index, vertex, input, input_default_attributes);
+            loader.LoadVertex(vertex, input, input_default_attributes);
 
             // Record vertex processing to the debugger.
             if (debug_context) {
@@ -1169,16 +1255,138 @@ void PicaCore::LoadVertices(bool is_indexed) {
 
             // Cache the vertex when doing indexed rendering.
             if (is_indexed) {
-                vertex_cache[vertex_cache_pos] = vs_output;
-                vertex_cache_valid[vertex_cache_pos] = true;
-                vertex_cache_ids[vertex_cache_pos] = vertex;
-                vertex_cache_pos = (vertex_cache_pos + 1) % VERTEX_CACHE_SIZE;
+                const u32 slot = vertex & (VERTEX_CACHE_SIZE - 1);
+                vertex_cache[slot] = vs_output;
+                vertex_cache_ids[slot] = vertex;
             }
         }
 
         // Send to geometry pipeline
         geometry_pipeline.SubmitVertex(vs_output);
     }
+}
+
+#ifdef CITRA_TRACE_PROBES
+static void DrawTraceRunProbe() {
+    static const bool trace = std::getenv("AZAHAR_DRAW_TRACE") != nullptr;
+    static std::atomic<u32> n{0};
+    if (trace && n.fetch_add(1) < 3000) {
+        LOG_INFO(HW_GPU, "DRAWTRACE run");
+    }
+}
+#endif // CITRA_TRACE_PROBES
+
+// Command headers that declared more extra words than the list had left; the clamp in
+// ProcessCmdList keeps the parse inside the buffer, this makes the (rare) occurrences visible.
+std::atomic<u64> g_cmdlist_overrun{};
+
+// Parse-side tallies, surfaced by the debug port's `gsp` dump:
+// [0] ProcessCmdList calls  [1] irq_request writes  [2] P3D raised  [3] irq compare mismatches
+// [4] chain trigger writes  [5] autostop stops
+// A healthy title keeps [0] and [1] in step; a list that parses without raising its interrupt is
+// the fingerprint of the class of bug behind the 2026-08 software-renderer freeze.
+std::array<std::atomic<u64>, 6> g_pica_probe{};
+
+// Per-list parse summaries, newest last, read through the debug port's `lists` command. Each
+// ProcessCmdList call appends one record when it finishes; the deltas of g_pica_probe across the
+// call fill the flags. Writes happen only on the emulation thread; the debug port reads on the
+// same thread.
+std::array<ListRec, 1024> g_list_ring{};
+std::atomic<u32> g_list_ring_head{};
+
+
+void PicaCore::RunShippedDraw(const DrawPayload& p) {
+#ifdef CITRA_TRACE_PROBES
+    DrawTraceRunProbe();
+#endif // CITRA_TRACE_PROBES
+    if (p.immediate) {
+        shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+        output_vertex_map.Build(regs.internal.rasterizer);
+
+        ShaderUnit shader_unit;
+        AttributeBuffer output{};
+        shader_unit.LoadInput(regs.internal.vs, p.immediate_input);
+        shader_engine->Run(vs_setup, shader_unit);
+        shader_unit.WriteOutput(regs.internal.vs, output);
+
+        if (p.immediate_reset_geometry) {
+            geometry_pipeline.Reconfigure();
+        }
+        ASSERT(!geometry_pipeline.NeedIndexInput());
+        geometry_pipeline.Setup(shader_engine.get());
+        geometry_pipeline.SubmitVertex(output);
+
+        rasterizer->DrawTriangles();
+        return;
+    }
+
+    // The mirror's registers, shader setup and LUTs were applied by the shipment this payload
+    // rode in on; the loader reconstructs the identical fetch configuration from them and reads
+    // only the arena.
+    const auto& pipeline = regs.internal.pipeline;
+    auto& loader = GetVertexLoader();
+    regs.internal.rasterizer.ValidateSemantics();
+    output_vertex_map.Build(regs.internal.rasterizer);
+    loader.AttachArena(p.arena, p.layout, p.vertex_min);
+
+    const u8* const index_address_8 = p.arena + p.layout.index_offset;
+    const u16* const index_address_16 = reinterpret_cast<const u16*>(index_address_8);
+
+    constexpr std::size_t VERTEX_CACHE_SIZE = 64;
+    std::array<u32, VERTEX_CACHE_SIZE> vertex_cache_ids;
+    vertex_cache_ids.fill(0xFFFFFFFF);
+    std::array<AttributeBuffer, VERTEX_CACHE_SIZE> vertex_cache;
+
+    ShaderUnit shader_unit;
+    AttributeBuffer vs_output;
+    shader_engine->SetupBatch(vs_setup, regs.internal.vs.main_offset);
+
+    geometry_pipeline.Reconfigure();
+    geometry_pipeline.Setup(shader_engine.get());
+    ASSERT(!geometry_pipeline.NeedIndexInput() || p.is_indexed);
+
+    for (u32 index = 0; index < p.num_vertices; ++index) {
+        // A ring-layout arena holds 16-bit indices rebased to the draw's first vertex.
+        const u32 vertex =
+            p.is_indexed ? (p.layout.ring ? index_address_16[index] + p.vertex_min
+                            : p.index_u16 ? index_address_16[index]
+                                          : index_address_8[index])
+                         : (index + p.vertex_offset);
+
+        bool vertex_cache_hit = false;
+        if (p.is_indexed) {
+            if (geometry_pipeline.NeedIndexInput()) {
+                geometry_pipeline.SubmitIndex(vertex);
+                continue;
+            }
+
+            const u32 slot = vertex & (VERTEX_CACHE_SIZE - 1);
+            if (vertex_cache_ids[slot] == vertex) {
+                vs_output = vertex_cache[slot];
+                vertex_cache_hit = true;
+            }
+        }
+
+        if (!vertex_cache_hit) {
+            AttributeBuffer input;
+            loader.LoadVertex(vertex, input, input_default_attributes);
+
+            shader_unit.LoadInput(regs.internal.vs, input);
+            shader_engine->Run(vs_setup, shader_unit);
+            shader_unit.WriteOutput(regs.internal.vs, vs_output);
+
+
+            if (p.is_indexed) {
+                const u32 slot = vertex & (VERTEX_CACHE_SIZE - 1);
+                vertex_cache[slot] = vs_output;
+                vertex_cache_ids[slot] = vertex;
+            }
+        }
+
+        geometry_pipeline.SubmitVertex(vs_output);
+    }
+
+    rasterizer->DrawTriangles();
 }
 
 PicaCore::RenderPropertiesGuess PicaCore::GuessCmdRenderProperties(PAddr list, u32 size) {

@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <optional>
 #include "common/common_types.h"
 #include "core/hle/service/gsp/gsp_interrupt.h"
 #include "video_core/pica/dirty_regs.h"
@@ -12,6 +15,7 @@
 #include "video_core/pica/primitive_assembly.h"
 #include "video_core/pica/regs_external.h"
 #include "video_core/pica/regs_internal.h"
+#include "video_core/pica/vertex_loader.h"
 #include "video_core/pica/regs_lcd.h"
 #include "video_core/pica/shader_setup.h"
 #include "video_core/pica/shader_unit.h"
@@ -25,6 +29,20 @@ class RasterizerInterface;
 }
 
 namespace Pica {
+
+/// Command headers that declared more extra words than the list had left.
+extern std::atomic<u64> g_cmdlist_overrun;
+
+/// Command-list parse tallies, see ProcessCmdList.
+extern std::array<std::atomic<u64>, 6> g_pica_probe;
+
+/// One finished ProcessCmdList call: where the parse ended and what it raised along the way.
+struct ListRec {
+    u32 addr, size, end_index, end_length, irqw, p3d, chains, stopped;
+    u32 last_chain_addr, last_chain_size;
+};
+extern std::array<ListRec, 1024> g_list_ring;
+extern std::atomic<u32> g_list_ring_head;
 
 class DebugContext;
 class ShaderEngine;
@@ -120,12 +138,14 @@ public:
 
     void ProcessCmdList(PAddr list, u32 size, bool ignore_list);
 
+    // Special-register handlers, one per register id (null for plain registers), called
+    // through a table indexed by the id; see PicaCore::Dispatch in pica_core.cpp.
+    using SpecialFn = void (*)(PicaCore&, u32 id, u32 value, bool& stop_requested);
+    using BatchFn = void (*)(PicaCore&, u32 id, const u32* values, u32 count);
+    struct Dispatch;
+
 private:
     void InitializeRegs();
-
-    void HandleSpecialRegBatch(u32 id, const u32* values, u32 count);
-
-    void HandleSpecialReg(u32 id, u32 value, bool& stop_requested);
 
     void WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 mask,
                                bool& stop_requested);
@@ -365,6 +385,14 @@ public:
     Lighting lighting{};
     Fog fog{};
     AttributeBuffer input_default_attributes{};
+    /// Mirror-sync flag, same contract as ShaderSetup's: set on write, cleared on ship.
+    bool default_attributes_sync_dirty = true;
+
+    /// Primitive-assembler events since the last shipment. Reconfigure/Reset are side effects of
+    /// special register writes on the emulation side; the mirror must replay them or its
+    /// assembler stays on the constructed topology and strips shear into triangle soup.
+    u32 pa_reconfigure_events = 0;
+    u32 pa_reset_events = 0;
     ImmediateModeState immediate{};
 
     DelayGenerator delay_generator{};
@@ -402,15 +430,37 @@ public:
 
     RenderPropertiesGuess GuessCmdRenderProperties(PAddr list, u32 size);
 
+    /// Executes a shipped draw against this core's registers, shader setup and rasterizer.
+    /// Runs on the render thread against the mirror; everything it reads was shipped.
+    void RunShippedDraw(const DrawPayload& payload);
+
+    /// Freezes the current draw into an arena and ships it (hw = GLSL path with software
+    /// fallback). Returns false when the draw must be handled locally instead.
+    bool TryShipDraw(bool is_indexed, bool hw);
+
+    PrimitiveAssembler& GetPrimitiveAssembler() {
+        return primitive_assembler;
+    }
+
 private:
+    /// Returns a VertexLoader for the current vertex_attributes block, rebuilding only when
+    /// those registers changed since the last draw. The constructor decodes the full loader
+    /// layout and ran on every draw; the register block rarely changes between draws.
+    VertexLoader& GetVertexLoader();
+
     Memory::MemorySystem& memory;
     VideoCore::RasterizerInterface* rasterizer;
     std::shared_ptr<DebugContext> debug_context;
     Service::GSP::InterruptHandler signal_interrupt;
     GeometryPipeline geometry_pipeline;
     PrimitiveAssembler primitive_assembler;
+    /// Semantic map for OutputVertex construction, rebuilt at each batch start.
+    OutputVertexMap output_vertex_map;
     CommandList cmd_list;
     std::unique_ptr<ShaderEngine> shader_engine;
+    /// Cache for GetVertexLoader, keyed on the raw vertex_attributes register block.
+    std::optional<VertexLoader> cached_vertex_loader;
+    std::array<u8, sizeof(PipelineRegs::vertex_attributes)> cached_loader_key{};
 };
 
 #define GPU_REG_INDEX(field_name) (offsetof(Pica::PicaCore::Regs, field_name) / sizeof(u32))
