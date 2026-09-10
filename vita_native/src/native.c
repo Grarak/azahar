@@ -1,16 +1,18 @@
-// azaharnative — native.c: the emulator half. Takes one PS Vita core away from Sony's scheduler and runs
-// guest code on it natively, at the guest's own addresses, under translation tables and
-// exception vectors of ours.
+// azahar-native — native.c: the emulator half. Takes one PS Vita core away from Sony's
+// scheduler and runs guest code on it natively, at the guest's own addresses, under
+// translation tables and exception vectors of ours.
 //
 // The PS Vita is Sony's handheld games console (2011–2019); "Vita" is product branding. This is
 // a hobby emulator project (Nintendo 3DS games on Vita hardware) on a console the author owns.
 // The plugin loads through taiHEN, the public plugin framework every Vita homebrew uses. It has
 // no networking and touches no system but the one it runs on.
 //
-// Included from main.c, after the stages, whose helpers it reuses (emit, translate, the cp15
-// accessors, resolve_export, the mask getter and setter, gic_locate). Exported as four syscalls
-// alongside azaharnativeRun. What it implements is ~/3ds-vita/PLAN.md §8.11 steps 3–9 and 12, the
-// pieces the stages measured one at a time and never joined:
+// Included from main.c, whose helpers it uses (emit, translate, the cp15 accessors,
+// resolve_export, the mask getter and setter, gic_locate). Every exported call is here.
+//
+// The STAGE_* names in the comments below are vaprobe's, the diagnostic plugin this code grew
+// out of. Each one was a measurement that established a fact this file depends on, and the
+// dates say when. The stages themselves are not part of this module:
 //
 //   azaharTakeCore   occupy core 2 with a resident kernel thread, then clear core 2 from the
 //                 scheduler's mask (STAGE_OWN / STAGE_HOLD, 2026-08-26 / 08-29)
@@ -96,8 +98,8 @@
 
 // ---------------------------------------------------------------------------- log
 //
-// azaharnative's emit() writes to out_fd, which run_probe opens for a report and closes after. The
-// native calls keep a file of their own open from the first call to the release — the emulator
+// emit() writes to out_fd. The calls here keep a file of their own open from the first call
+// to the release — the emulator
 // makes thousands of these calls a second, and an open per call would cost more than the
 // guest work between them — and point out_fd at it for the duration of each call. Lines are
 // still synced as written; azaharRun writes none on the success path for the same reason.
@@ -175,7 +177,7 @@ static inline uint32_t rd_cpsr(void) {
 //
 // Short-descriptor format with SCTLR.AFE = 1 (sctlr 20c5587d on this console): AP[0] is the
 // Access Flag and must be set, the permission is AP[2:1]. Measured to behave exactly so by
-// azaharnative's STAGE_L2 on 2026-08-29. Memory attributes: TEX=001 C=1 B=1 (write-back,
+// vaprobe's STAGE_L2 on 2026-08-29. Memory attributes: TEX=001 C=1 B=1 (write-back,
 // write-allocate), S=1 so the other cores see what the guest writes. Domain 8 throughout — D0 is
 // No-access under this console's DACR and hung the console on 2026-08-26.
 
@@ -253,7 +255,7 @@ enum { CMD_NONE, CMD_INSTALL, CMD_RUN, CMD_UNINSTALL };
 static volatile uint32_t azahar_cmd, azahar_cmd_done, azahar_cmd_status;
 static volatile uint32_t azahar_heartbeat, azahar_on_core, azahar_stop, azahar_park, azahar_park_cycles;
 
-// PMU totals over guest slices; see AzaharPmuStats in vanative.h. Written by core 2 between
+// PMU totals over guest slices; see AzaharPmuStats in azahar_native.h. Written by core 2 between
 // slices, read and zeroed by azaharPmuRead on the syscall core. The emulator calls azaharRun and
 // azaharPmuRead from one thread, so the two never overlap and the 64-bit sums need no lock.
 static volatile uint64_t azahar_pmu_cycles;
@@ -462,7 +464,7 @@ static volatile uint32_t sv_sp_svc, sv_pmr;
 
 // The table switch, both directions. ARM ARM B3.10.4 example B3-3 with erratum 754322's dsb on
 // each side; TTBCR and TTBR0 change inside one break-before-make block because between them the
-// CPU would read a 1024-entry table as though it had 4096 (azaharnative STAGE_OWN, 2026-08-26).
+// CPU would read a 1024-entry table as though it had 4096 (vaprobe's STAGE_OWN, 2026-08-26).
 static void core2_switch(uint32_t ttbcr, uint32_t ttbr0, uint32_t ctxid, int icache) {
     asm volatile("dsb                             \n"
                  "mcr p15, 0, %[zero], c13, c0, 1 \n"
@@ -737,7 +739,7 @@ static void core2_run(void) {
     }
 
     // entry.S left the raw exception LR in ctx.r[15] and the SPSR in ctx.cpsr. Turn the LR into
-    // the address the reason means (vanative.h), and pull the svc immediate out of the
+    // the address the reason means (azahar_native.h), and pull the svc immediate out of the
     // instruction — readable here because our table is still installed and the code window is
     // readable at PL1.
     const uint32_t thumb = azahar_ctx.cpsr & (1u << 5);
@@ -1163,7 +1165,7 @@ int azaharTakeCore(void) {
         azahar_installed = 0;
         azahar_client_pid = ksceKernelGetProcessId();
         if (azahar_proc_handler < 0) {
-            azahar_proc_handler = ksceKernelRegisterProcEventHandler("vanative", &azahar_proc_events, 0);
+            azahar_proc_handler = ksceKernelRegisterProcEventHandler("azaharnative", &azahar_proc_events, 0);
             emit("  process-event handler: 0x%08x\n", (uint32_t)azahar_proc_handler);
         }
         emit("  folded: no resident thread, the caller's core runs the guest\n");
@@ -1213,7 +1215,7 @@ int azaharTakeCore(void) {
 
     // Occupy first, detach second: a thread pinned to an already-detached core never runs.
     azahar_heartbeat = azahar_stop = azahar_park = azahar_cmd = azahar_cmd_done = 0;
-    azahar_thread = ksceKernelCreateThread("vanative_core2", core2_entry, 0x10000100, 0x4000, 0,
+    azahar_thread = ksceKernelCreateThread("azaharnative_core2", core2_entry, 0x10000100, 0x4000, 0,
                                         CPU_AFFINITY(AZAHAR_TARGET_CORE), NULL);
     if (azahar_thread < 0 || ksceKernelStartThread(azahar_thread, 0, NULL) < 0) {
         emit("  core-2 thread create/start failed 0x%08x\n", (uint32_t)azahar_thread);
@@ -1272,7 +1274,7 @@ int azaharTakeCore(void) {
     if (azahar_proc_handler < 0) {
         // So the core comes back when the app dies, however it dies. Registered here rather
         // than at module_start: a fault here costs one launch, a fault there bootloops.
-        azahar_proc_handler = ksceKernelRegisterProcEventHandler("vanative", &azahar_proc_events, 0);
+        azahar_proc_handler = ksceKernelRegisterProcEventHandler("azaharnative", &azahar_proc_events, 0);
         emit("  process-event handler: 0x%08x\n", (uint32_t)azahar_proc_handler);
     }
     azahar_state = ST_TAKEN;

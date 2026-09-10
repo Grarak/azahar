@@ -1,4 +1,4 @@
-// vanative — the ABI between the kernel plugin and the user app. Included by both.
+// azahar-native — the ABI between the kernel plugin and the emulator. Included by both.
 //
 // The PS Vita is Sony's handheld games console; this is a hobby emulator project running on a
 // console the author owns. The plugin takes one CPU core away from the Vita's scheduler and

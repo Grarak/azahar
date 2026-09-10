@@ -1,0 +1,21 @@
+azaharnative:
+  attributes: 0
+  version:
+    major: 1
+    minor: 0
+  main:
+    start: module_start
+    stop: module_stop
+  libraries:
+    azaharnative:
+      syscall: true
+      functions:
+        - azaharTakeCore: 0x3C1A7E01
+        - azaharMap: 0x3C1A7E02
+        - azaharRun: 0x3C1A7E03
+        - azaharRelease: 0x3C1A7E04
+        - azaharEdit: 0x3C1A7E05
+        - azaharPmuRead: 0x3C1A7E06
+        - azaharPmuReadAll: 0x3C1A7E07
+        - azaharSgiStats: 0x3C1A7E08
+        - azaharThreadDump: 0x3C1A7E09
