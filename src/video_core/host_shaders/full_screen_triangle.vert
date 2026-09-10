@@ -3,11 +3,8 @@
 
 //? #version 450
 
-out gl_PerVertex {
-    vec4 gl_Position;
-};
 
-layout(location = 0) out vec2 texcoord;
+VARYING_LOCATION(0) out vec2 texcoord;
 
 #ifdef VULKAN
 #define gl_VertexID gl_VertexIndex
@@ -17,7 +14,7 @@ layout(location = 0) out vec2 texcoord;
 #else // if OpenGL
 #define BEGIN_PUSH_CONSTANTS
 #define END_PUSH_CONSTANTS
-#define UNIFORM(n) layout (location = n) uniform
+#define UNIFORM(n) EXPLICIT_UNIFORM_LOCATION(n) uniform
 #endif
 
 BEGIN_PUSH_CONSTANTS

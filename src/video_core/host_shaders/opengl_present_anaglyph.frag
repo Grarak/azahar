@@ -16,11 +16,11 @@ const mat3 r = mat3(-0.011,-0.032,-0.007,
                0.377, 0.761, 0.009,
               -0.026,-0.093, 1.234);
 
-layout(location = 0) in vec2 frag_tex_coord;
-layout(location = 0) out vec4 color;
+VARYING_LOCATION(0) in vec2 frag_tex_coord;
+VARYING_LOCATION(0) out vec4 color;
 
-layout(binding = 0) uniform sampler2D color_texture;
-layout(binding = 1) uniform sampler2D color_texture_r;
+SAMPLER_BINDING(0) uniform sampler2D color_texture;
+SAMPLER_BINDING(1) uniform sampler2D color_texture_r;
 
 uniform vec4 resolution;
 uniform int layer;

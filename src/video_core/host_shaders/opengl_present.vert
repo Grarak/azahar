@@ -5,7 +5,7 @@
 //? #version 430 core
 layout(location = 0) in vec2 vert_position;
 layout(location = 1) in vec2 vert_tex_coord;
-layout(location = 0) out vec2 frag_tex_coord;
+VARYING_LOCATION(0) out vec2 frag_tex_coord;
 
 // This is a truncated 3x3 matrix for 2D transformations:
 // The upper-left 2x2 submatrix performs scaling/rotation/mirroring.

@@ -4,9 +4,9 @@
 
 //? #version 430 core
 
-layout(location = 0) out vec2 dst_coord;
+VARYING_LOCATION(0) out vec2 dst_coord;
 
-layout(location = 0) uniform mediump ivec2 dst_size;
+EXPLICIT_UNIFORM_LOCATION(0) uniform mediump ivec2 dst_size;
 
 #ifdef VULKAN
 #define gl_VertexID gl_VertexIndex

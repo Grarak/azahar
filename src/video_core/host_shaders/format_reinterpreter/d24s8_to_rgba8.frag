@@ -7,11 +7,11 @@
 precision highp int;
 precision highp float;
 
-layout(location = 0) in mediump vec2 tex_coord;
-layout(location = 0) out lowp vec4 frag_color;
+VARYING_LOCATION(0) in mediump vec2 tex_coord;
+VARYING_LOCATION(0) out lowp vec4 frag_color;
 
-layout(binding = 0) uniform highp sampler2D depth;
-layout(binding = 1) uniform lowp usampler2D stencil;
+SAMPLER_BINDING(0) uniform highp sampler2D depth;
+SAMPLER_BINDING(1) uniform lowp usampler2D stencil;
 
 void main() {
     mediump vec2 coord = tex_coord * vec2(textureSize(depth, 0));

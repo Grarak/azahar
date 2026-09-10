@@ -4,11 +4,11 @@
 
 //? #version 430 core
 
-layout(location = 0) in vec2 frag_tex_coord;
-layout(location = 0) out vec4 color;
+VARYING_LOCATION(0) in vec2 frag_tex_coord;
+VARYING_LOCATION(0) out vec4 color;
 
-layout(binding = 0) uniform sampler2D color_texture;
-layout(binding = 1) uniform sampler2D color_texture_r;
+SAMPLER_BINDING(0) uniform sampler2D color_texture;
+SAMPLER_BINDING(1) uniform sampler2D color_texture_r;
 
 uniform vec4 o_resolution;
 uniform int reverse_interlaced;
