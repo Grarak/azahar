@@ -181,6 +181,11 @@ public:
         return current_pipeline;
     }
 
+    struct MemoryUsage {
+        std::size_t retired_shaders, pipelines, program_bytes;
+    };
+    [[nodiscard]] MemoryUsage MemoryStats() const;
+
     [[nodiscard]] std::size_t ShaderCount() const {
         return shaders.size();
     }

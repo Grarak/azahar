@@ -5,6 +5,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <deque>
 #include <initializer_list>
 #include <memory>
@@ -228,6 +229,11 @@ private:
     /// Writes the vertex and fragment default uniform buffers for the draw (only what
     /// changed since the buffers on the context were written).
     void UploadUniforms(Shader* fs, Shader* vs, u64 fs_hash);
+    // Texture bindings persist across scenes; blits use the same cache, and EndFrame
+    // invalidates it before the frontend uses the shared context.
+    void BindFragmentTexture(u32 unit, const SceGxmTexture& texture);
+    std::array<SceGxmTexture, 8> texture_bindings{};
+    std::bitset<8> texture_binding_valid{};
     void SyncTextureUnits(const Framebuffer* framebuffer);
     /// P5a: the lighting, fog and proctex LUTs into the three 2D LUT textures the fragment
     /// programs sample on units 3-5, one row per LUT, rows handed out round-robin. Called

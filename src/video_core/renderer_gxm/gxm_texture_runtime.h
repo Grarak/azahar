@@ -176,6 +176,9 @@ public:
     /// be in flight. ReapFreed returns what is done (all of it, after waiting, when `wait`).
     void DeferFree(void* data, bool cdram, u64 serial);
     void ReapFreed(bool wait);
+    [[nodiscard]] std::size_t PendingFreeCount() const {
+        return pending_frees.size();
+    }
     /// Whether a scene the GPU has not passed may still read or write the surface.
     [[nodiscard]] bool InFlight(const Surface& surface) const {
         return NeedsWait(&surface);

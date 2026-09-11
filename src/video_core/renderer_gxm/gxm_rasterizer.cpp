@@ -11,6 +11,7 @@
 #include <vector>
 #include <fmt/format.h>
 #ifdef __vita__
+#include <malloc.h>
 #include <psp2/io/stat.h>
 #else
 // The stub libgxm build: the dump directories are the console's, and a dump off the console
@@ -565,7 +566,7 @@ bool RasterizerGxm::GpuBlit(Surface& source, Surface& dest, const VideoCore::Tex
     sceGxmTextureSetMipFilter(&bound, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
     sceGxmTextureSetUAddrMode(&bound, SCE_GXM_TEXTURE_ADDR_CLAMP);
     sceGxmTextureSetVAddrMode(&bound, SCE_GXM_TEXTURE_ADDR_CLAMP);
-    sceGxmSetFragmentTexture(context, 0, &bound);
+    BindFragmentTexture(0, bound);
 
     sceGxmSetVertexStream(context, 0, quad);
     const int draw_err = sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES,
@@ -806,11 +807,11 @@ void RasterizerGxm::BeginScene(Framebuffer* fb) {
     state_cache = CachedState{};
     // The LUT units, and the framebuffer-fetch unit (white until P5c); a texture binding
     // persists indefinitely, so this belongs once a scene rather than once a draw.
-    sceGxmSetFragmentTexture(context, 3, &lut_lf.texture);
-    sceGxmSetFragmentTexture(context, 4, &lut_rg.texture);
-    sceGxmSetFragmentTexture(context, 5, &lut_rgba.texture);
+    BindFragmentTexture(3, lut_lf.texture);
+    BindFragmentTexture(4, lut_rg.texture);
+    BindFragmentTexture(5, lut_rgba.texture);
     for (u32 unit = 6; unit < 8; unit++) {
-        sceGxmSetFragmentTexture(context, unit, &white_texture);
+        BindFragmentTexture(unit, white_texture);
     }
     if (fb->color_id && !res_cache.GetSurface(fb->color_id).pending_colour.empty()) {
         DrawPendingColourClears();
@@ -1044,8 +1045,8 @@ void RasterizerGxm::SyncAndUploadLUTs() {
  * could not be satisfied then parked the render thread.
  *
  * A surface's gpu_serial is the scene that last used it, so it is already the least-recently-
- * used key. Render targets are left alone: a title reuses them every frame, so dropping one
- * only means building it again immediately. Anything the GPU may still be holding, or that
+ * used key. Dirty-region owners and surfaces used this tick are protected by the shared
+ * cache. Anything the GPU may still be holding, or that
  * the presentation layer is sampling, is skipped. This runs at the end of a frame, with no
  * scene open and nothing bound.
  */
@@ -1082,11 +1083,11 @@ void RasterizerGxm::TrimSurfaceCache() {
     stat_trimmed += res_cache.TrimSurfaces(
         TrimUntil - headroom, [](const Surface& surface) { return surface.AllocSize(); },
         [&](const Surface& surface) {
-            // Targets keep their render-target objects, presented surfaces are what the
-            // frontend's scene samples, and anything a scene the GPU has not finished still
-            // reads must stay allocated.
-            return surface.IsColorTarget() || surface.IsDepthTarget() || surface.presented ||
-                   !surface.HasMemory() || surface.gpu_serial > completed;
+            // IsColorTarget describes format capability, not usage: ordinary RGB/RGBA
+            // textures have color-surface descriptors too. Exempting them makes them
+            // immortal. TrimSurfaces already protects dirty owners and current-tick uses;
+            // clean old targets can be recreated from guest memory like other textures.
+            return surface.presented || !surface.HasMemory() || surface.gpu_serial > completed;
         });
 }
 
@@ -1760,24 +1761,29 @@ void RasterizerGxm::UploadUniforms(Shader* fs, Shader* vs,
     fs_data_dirty = false;
 }
 
+void RasterizerGxm::BindFragmentTexture(u32 unit, const SceGxmTexture& texture) {
+    if (texture_binding_valid[unit] &&
+        std::memcmp(&texture_bindings[unit], &texture, sizeof(texture)) == 0) {
+        return;
+    }
+    // Remember only successful binds; a refused descriptor must be retried next draw.
+    texture_binding_valid[unit] =
+        sceGxmSetFragmentTexture(Device().context, unit, &texture) >= 0;
+    if (texture_binding_valid[unit]) {
+        texture_bindings[unit] = texture;
+    }
+}
+
 void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
-    SceGxmContext* context = Device().context;
+    std::array<SceGxmTexture, 3> textures{white_texture, white_texture, white_texture};
+    std::array<float, 6> dimensions{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     user_config = {};
     bound_surfaces = {};
     const auto pica_textures = regs.texturing.GetTextures();
     for (u32 unit = 0; unit < pica_textures.size(); unit++) {
         const auto& texture = pica_textures[unit];
-        const auto note_dims = [&](float w, float h) {
-            if (tex_dims[unit * 2] != w || tex_dims[unit * 2 + 1] != h) {
-                tex_dims[unit * 2] = w;
-                tex_dims[unit * 2 + 1] = h;
-                tex_dims_dirty = true;
-            }
-        };
-        note_dims(1.0f, 1.0f);
         if (!texture.enabled) {
-            sceGxmSetFragmentTexture(context, unit, &white_texture);
             continue;
         }
         if (unit == 0) {
@@ -1786,7 +1792,6 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
             case TextureType::ShadowCube:
             case TextureType::TextureCube:
                 // P5: cube maps and shadow textures.
-                sceGxmSetFragmentTexture(context, unit, &white_texture);
                 continue;
             default:
                 break;
@@ -1801,13 +1806,11 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         const VideoCore::SurfaceId surface_id = res_cache.GetTextureSurface(info, max_level);
         if (!surface_id) {
             stat_white_nosurface++;
-            sceGxmSetFragmentTexture(context, unit, &white_texture);
             continue;
         }
         Surface& surface = res_cache.GetSurface(surface_id);
         if (!surface.HasMemory()) {
             stat_white_nomem++;
-            sceGxmSetFragmentTexture(context, unit, &white_texture);
             continue;
         }
         // Sampling the target being drawn is a feedback loop GXM cannot express on a
@@ -1819,12 +1822,22 @@ void RasterizerGxm::SyncTextureUnits(const Framebuffer* framebuffer) {
         }
         SceGxmTexture bound = *surface.Texture();
         res_cache.GetSampler(texture.config).Apply(bound);
-        sceGxmSetFragmentTexture(context, unit, &bound);
+        textures[unit] = bound;
         // The scene that will sample this has not begun yet (a cache miss here uploads, and
         // an upload may end the open scene), so the surface is noted and given the serial in
         // DrawTriangles once BeginScene has claimed one.
         bound_surfaces[unit] = surface_id;
-        note_dims(static_cast<float>(surface.width), static_cast<float>(surface.height));
+        dimensions[unit * 2] = static_cast<float>(surface.width);
+        dimensions[unit * 2 + 1] = static_cast<float>(surface.height);
+    }
+    // A cache lookup or pending clear can blit through unit 0. Bind only after all
+    // lookups have finished so a later unit's upload cannot overwrite an earlier one.
+    for (u32 unit = 0; unit < textures.size(); unit++) {
+        BindFragmentTexture(unit, textures[unit]);
+    }
+    if (tex_dims != dimensions) {
+        tex_dims = dimensions;
+        tex_dims_dirty = true;
     }
     // Units 3 to 7 (the LUTs and the framebuffer-fetch unit) are bound once a scene, in
     // BeginScene: they are white until P5 and a texture binding persists indefinitely.
@@ -2740,6 +2753,7 @@ void RasterizerGxm::EndFrame() {
     // The frontend presents through this same context and sets its own cull mode, depth
     // state, viewport and region clip while doing it.
     state_cache = CachedState{};
+    texture_binding_valid.reset();
     runtime.Finish();
     TrimSurfaceCache();
     // dumpsurfaces: what the pause menu's button does, once, 300 frames in, for a headless
@@ -2789,8 +2803,8 @@ void RasterizerGxm::EndFrame() {
                  runtime.CdramPool().Used() / 1024, runtime.CdramPool().Reserved() / 1024);
         {
             // What the surface cache is holding: the pools say how much memory is out, this
-            // says how many surfaces it is spread over and how much of it is render targets,
-            // which is the part a title cannot be talked out of.
+            // says how many surfaces it is spread over. Target capability is a format
+            // property and includes ordinary sampled RGB/RGBA textures.
             u32 surfaces = 0, targets = 0;
             u64 surface_bytes = 0, target_bytes = 0;
             res_cache.ForEachSurface([&](VideoCore::SurfaceId, Surface& surface) {
@@ -2801,13 +2815,31 @@ void RasterizerGxm::EndFrame() {
                     target_bytes += surface.AllocSize();
                 }
             });
-            LOG_INFO(Render, "gxm surfaces: {} holding {} KiB, of which {} render targets "
+            LOG_INFO(Render, "gxm surfaces: {} holding {} KiB, of which {} target-capable surfaces "
                              "holding {} KiB, {} sentenced, {} given up, white binds {} "
                              "(no surface) {} (no memory), {} guest flushes needed no upload",
                      surfaces, surface_bytes / 1024, targets, target_bytes / 1024,
                      res_cache.SentencedCount(), stat_trimmed, stat_white_nosurface,
                      stat_white_nomem, res_cache.guest_flush_hash_skips);
             res_cache.guest_flush_hash_skips = 0;
+        }
+        {
+            const auto memory = pipeline_cache->MemoryStats();
+            LOG_INFO(Render, "gxm shader cache: {} shaders + {} retired, {} pipelines, "
+                             "{} KiB GXP storage, {} pending surface frees",
+                     pipeline_cache->ShaderCount(), memory.retired_shaders, memory.pipelines,
+                     memory.program_bytes / 1024, runtime.PendingFreeCount());
+#ifdef __vita__
+            const auto* patcher = Device().patcher;
+            const auto heap = mallinfo();
+            LOG_INFO(Render, "gxm memory: heap {}/{} KiB, patcher host {} KiB, buffer {} KiB, "
+                             "vertex USSE {} KiB, fragment USSE {} KiB",
+                     heap.uordblks / 1024, heap.arena / 1024,
+                     sceGxmShaderPatcherGetHostMemAllocated(patcher) / 1024,
+                     sceGxmShaderPatcherGetBufferMemAllocated(patcher) / 1024,
+                     sceGxmShaderPatcherGetVertexUsseMemAllocated(patcher) / 1024,
+                     sceGxmShaderPatcherGetFragmentUsseMemAllocated(patcher) / 1024);
+#endif
         }
         {
             // Which target each scene of a frame drew into, in the order Razor GPU Live

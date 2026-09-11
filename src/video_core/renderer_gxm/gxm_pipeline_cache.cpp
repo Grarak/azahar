@@ -233,6 +233,17 @@ Shader* PipelineCache::Replace(u64 key, std::string name, std::span<const u8> pr
     return shader;
 }
 
+PipelineCache::MemoryUsage PipelineCache::MemoryStats() const {
+    MemoryUsage usage{retired.size(), pipelines.size(), 0};
+    for (const auto& [key, shader] : shaders) {
+        usage.program_bytes += shader->program.capacity();
+    }
+    for (const auto& shader : retired) {
+        usage.program_bytes += shader->program.capacity();
+    }
+    return usage;
+}
+
 bool PipelineCache::BindPipeline(const PipelineInfo& info) {
     const u64 hash = info.Hash();
     const auto [it, is_new] = pipelines.try_emplace(hash);
