@@ -1849,6 +1849,16 @@ bool RasterizerGxm::BeginDraw(DrawSetup& setup, const VertexLayout& layout,
 
     const auto& fb_regs = regs.framebuffer;
     const auto& om = fb_regs.output_merger;
+    // Alpha rejection precedes depth/stencil updates. Leave the framebuffer helper
+    // uncreated so a fully rejected draw neither uploads textures nor invalidates surfaces.
+    using CompareFunc = Pica::FramebufferRegs::CompareFunc;
+    const auto& alpha = om.alpha_test;
+    if (alpha.enable &&
+        (alpha.func == CompareFunc::Never ||
+         (alpha.func == CompareFunc::LessThan && alpha.ref == 0) ||
+         (alpha.func == CompareFunc::GreaterThan && alpha.ref == 255))) {
+        return false;
+    }
     if (fb_regs.IsShadowRendering()) {
         // No image load/store on this backend: shadow maps are dropped (P5).
         return false;
