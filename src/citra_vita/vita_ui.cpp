@@ -448,10 +448,6 @@ void Ui::DrawGpuHud() {
 }
 
 void Ui::DrawStatsHud() {
-#ifndef VITA_DIAGNOSTICS
-    // A measurement overlay, so the release build does not draw one.
-    return;
-#else
     // Top right, every frame while a title runs: what the console line prints once a second.
     // A dozen text lines of ImGui, so a few hundred vertices; `nostats` hides it.
     static const bool off = GxmRenderer::GxmFlag("nostats");
@@ -472,7 +468,6 @@ void Ui::DrawStatsHud() {
     ImGui::Text("%u%%/%u", speed_percent.load(std::memory_order_relaxed), (fps10 + 5) / 10);
     ImGui::Text("%.1fms/%ufps", shown != 0 ? 1000.0f / static_cast<float>(shown) : 0.0f, shown);
     ImGui::End();
-#endif // VITA_DIAGNOSTICS
 }
 
 Ui::Action Ui::Update() {

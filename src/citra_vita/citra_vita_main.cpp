@@ -453,7 +453,6 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
 
         // Once a second: the speed line to the console, the full record - GPU health, the
         // emulation thread's time split, all four cores' PMU counters - to the perf blob.
-#ifdef VITA_DIAGNOSTICS
         // Everything measured once a second, and where it is printed. Compiled in only
         // for the diagnostic build: the release build takes no clock readings, drains no
         // counters, and prints nothing.
@@ -461,12 +460,23 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             static SceUInt64 last_perf_us = 0;
             const SceUInt64 now_us = sceKernelGetProcessTimeWide();
             if (now_us - last_perf_us >= 1000000ull) {
-                static u64 hud_last_us = now_us;
                 last_perf_us = now_us;
-                static FILE* const perf_file = OpenPerfFile();
                 const auto perf = system.GetAndResetPerfStats();
                 const int speed = static_cast<int>(perf.emulation_speed * 100.0 + 0.5);
                 const int fps10 = static_cast<int>(perf.game_fps * 10.0 + 0.5);
+
+                const unsigned presented =
+                                    Common::PipelineStats::presents.exchange(0, std::memory_order_relaxed);
+
+#ifdef VITA_DIAGNOSTICS
+                // Frames the guest ran whose draws were dropped: the difference between
+                // this and the game's frame rate is what the renderer actually drew, which
+                // is the number to read against the presented rate.
+                static u64 skipped_total = 0;
+                const u64 skipped_now = system.GPU().SkippedFrames();
+                const unsigned skipped = static_cast<unsigned>(skipped_now - skipped_total);
+                skipped_total = skipped_now;
+                static FILE* const perf_file = OpenPerfFile();
 
                 PerfRecord rec{};
                 rec.time_us = now_us;
@@ -501,20 +511,11 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 }
 #endif
                 // sceClibPrintf has no reliable float formatting, so fixed-point by hand.
-                const unsigned presented =
-                    Common::PipelineStats::presents.exchange(0, std::memory_order_relaxed);
                 // Live heap, because a run that lasts long enough dies in std::bad_alloc and
                 // the rate of climb here is the only thing that says what is leaking. uordblks
                 // is what newlib has handed out and not got back; arena is what it took from
                 // the kernel, which only grows.
                 const struct mallinfo heap = mallinfo();
-                // Frames the guest ran whose draws were dropped: the difference between
-                // this and the game's frame rate is what the renderer actually drew, which
-                // is the number to read against the presented rate.
-                static u64 skipped_total = 0;
-                const u64 skipped_now = system.GPU().SkippedFrames();
-                const unsigned skipped = static_cast<unsigned>(skipped_now - skipped_total);
-                skipped_total = skipped_now;
                 // Both empty unless the Vita tracing is built in.
                 char sema[64] = {};
                 char phase[128] = {};
@@ -573,30 +574,17 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     std::fwrite(&rec, sizeof(rec), 1, perf_file);
                     std::fflush(perf_file);
                 }
+#endif // VITA_DIAGNOSTICS
                 // The stats window reads these on the render thread.
                 {
                     using namespace VitaFrontend::HudStats;
-                    const u64 window_us = std::max<u64>(now_us - hud_last_us, 1);
-                    hud_last_us = now_us;
                     speed_percent.store(static_cast<u32>(std::max(speed, 0)), std::memory_order_relaxed);
                     game_fps10.store(static_cast<u32>(std::max(fps10, 0)), std::memory_order_relaxed);
                     shown_fps.store(presented, std::memory_order_relaxed);
-                    skipped_frames.store(skipped, std::memory_order_relaxed);
-                    guest_percent.store(static_cast<u32>(std::min<u64>(
-                                            rec.guest_ns / 10 / window_us, 100)),
-                                        std::memory_order_relaxed);
-                    emu_percent.store(static_cast<u32>(std::min<u64>(
-                                          rec.runloop_us * 100 / window_us, 100)),
-                                      std::memory_order_relaxed);
-                    render_percent.store(static_cast<u32>(std::min<u64>(
-                                             rec.gpu_busy_ns / 10 / window_us, 100)),
-                                         std::memory_order_relaxed);
-                    queue_depth.store(system.GPU().RenderQueueDepth(), std::memory_order_relaxed);
                     valid.store(true, std::memory_order_release);
                 }
             }
         }
-#endif // VITA_DIAGNOSTICS
         // Nothing to present from here: a finished frame is presented by the render thread
         // where it arrives (EmuWindowVita::SwapBuffers), so this thread never waits on one.
     }
