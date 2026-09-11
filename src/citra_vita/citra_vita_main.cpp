@@ -297,6 +297,9 @@ void ShutdownSystem(Core::System& system) {
 bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFrontend::Ui& ui,
               const std::string& path) {
     VTRACE("RunTitle: %s", path.c_str());
+
+    window.UpdateCurrentFramebufferLayout();
+
     ui.SetStatusMessage("Loading...");
     ui.Update();
     window.Present(&ui);
@@ -329,6 +332,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
     // yet. A picture that comes right this way was being raced.
     system.GPU().SetRenderThreadLockstep(GxmRenderer::GxmFlag("lockstep"));
 
+#ifdef VITA_DIAGNOSTICS
     // ux0:data/azahar/autoload.txt names a savestate slot to restore before the render thread
     // starts, the one moment a load is accepted (saves and loads are refused once the thread
     // runs). The signal executes at a quiescent point inside RunLoop, so it gets a few slices.
@@ -372,6 +376,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
             LOG_WARNING(Frontend, "autoload.txt: could not queue a load of slot {}", slot);
         }
     }
+#endif
 
     VTRACE("RunTitle: StartRenderThread");
     system.GPU().StartRenderThread();
@@ -700,9 +705,10 @@ int EmulatorMain() {
         window.Present(&ui);
 
         switch (action) {
-        case VitaFrontend::Ui::Action::LaunchGame:
+        case VitaFrontend::Ui::Action::LaunchGame: {
             running = RunTitle(system, window, ui, ui.SelectedGamePath());
             break;
+        }
         case VitaFrontend::Ui::Action::ExitApplication:
             running = false;
             break;
@@ -727,6 +733,7 @@ int main(int argc, char* argv[]) {
 #ifdef CITRA_VITA_PMU
     Common::PipelineStats::stuck_report.store(&StuckReport, std::memory_order_relaxed);
 #endif
+#ifdef VITA_DIAGNOSTICS
     // What the partition has left after newlib took the heap. The extended-memory mode
     // (ATTRIBUTE2=12, ~365 MB) is only granted with every system app closed; without it the
     // 240 MB heap overruns the plain partition and newlib silently has no heap at all.
@@ -755,6 +762,7 @@ int main(int argc, char* argv[]) {
         }
     }
     SetupTerminateHandler();
+#endif
     Common::SetCurrentThreadRole(Common::ThreadRole::Other);
     // The process's own thread gets a stack sized for a homebrew launcher, and the global that
     // is supposed to change that does not work. Everything therefore runs on a thread created
@@ -767,11 +775,9 @@ int main(int argc, char* argv[]) {
     constexpr std::size_t EmulationStackSize = 4 * 1024 * 1024;
 
     {
-        Common::NamedThread emu_thread{Common::ThreadCfg{"emulation", EmulationStackSize},
-                                       []() { EmulatorMain(); }};
+        Common::NamedThread emu_thread{Common::ThreadCfg{"emulation", EmulationStackSize}, EmulatorMain};
         emu_thread.join();
     }
 
-    sceKernelExitProcess(0);
     return 0;
 }

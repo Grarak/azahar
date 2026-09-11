@@ -86,6 +86,8 @@ public:
         input_to_guest.store(enabled, std::memory_order_relaxed);
     }
 
+    void UpdateCurrentFramebufferLayout();
+
 private:
     void DrawScreens();
     void UpdateTouch();

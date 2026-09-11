@@ -40,11 +40,15 @@ EmuWindowVita::EmuWindowVita(Core::System& system_) : system{system_} {
 
     // The display never resizes and never rotates, so the layout is computed once. Touch input is
     // resolved against it, so it has to exist before the first frame.
-    UpdateCurrentFramebufferLayout(DisplayWidth, DisplayHeight, false);
+    UpdateCurrentFramebufferLayout();
 }
 
 EmuWindowVita::~EmuWindowVita() {
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_STOP);
+}
+
+void EmuWindowVita::UpdateCurrentFramebufferLayout() {
+    EmuWindow::UpdateCurrentFramebufferLayout(DisplayWidth, DisplayHeight, false);
 }
 
 std::pair<float, float> EmuWindowVita::LeftStick() const {
@@ -88,6 +92,7 @@ struct ScriptedPress {
 class InputScript {
 public:
     void Load() {
+#ifdef VITA_DIAGNOSTICS
         loaded = true;
         FILE* f = std::fopen("ux0:data/azahar/autoinput.txt", "rb");
         if (f == nullptr) {
@@ -133,6 +138,7 @@ public:
         }
         std::fclose(f);
         LOG_INFO(Frontend, "autoinput.txt: {} presses", presses.size());
+#endif
     }
 
     /// Applies the presses due now. `elapsed` is seconds since the title started.
@@ -160,8 +166,19 @@ public:
     }
 
     bool loaded = false;
+    bool Loaded() const {
+#ifdef VITA_DIAGNOSTICS
+        return loaded;
+#else
+        return false;
+#endif
+    }
     bool Empty() const {
+#ifdef VITA_DIAGNOSTICS
         return presses.empty();
+#else
+        return true;
+#endif
     }
 
 private:
@@ -198,7 +215,7 @@ double ScriptElapsed() {
 void EmuWindowVita::PollEvents() {
     SceCtrlData pad{};
     if (sceCtrlPeekBufferPositive(0, &pad, 1) > 0) {
-        if (!input_script.loaded) {
+        if (!input_script.Loaded()) {
             input_script.Load();
         }
         if (!input_script.Empty() && system.IsPoweredOn()) {

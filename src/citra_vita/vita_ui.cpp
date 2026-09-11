@@ -336,6 +336,7 @@ Ui::Action Ui::DrawPauseMenu() {
     const ImVec2 button_size{320.0f, 48.0f};
     if (ImGui::Button("Resume", button_size)) {
         action = Action::ResumeGame;
+        window.UpdateCurrentFramebufferLayout();
     }
     if (ImGui::Button("Settings", button_size)) {
         state = State::PauseSettings;
