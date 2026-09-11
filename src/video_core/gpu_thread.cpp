@@ -6,7 +6,6 @@
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "common/thread.h"
-#include <chrono>
 #include <cstdlib>
 #include "video_core/gpu_thread.h"
 #include "video_core/guest_watch.h"
@@ -43,7 +42,7 @@ void GpuThread::Stop(std::function<void()> on_thread_exit) {
         std::scoped_lock lock{mutex};
         stop_requested = true;
     }
-    enqueue_cv.notify_all();
+    enqueue_wake.RaiseAll();
     thread.join();
 }
 
@@ -62,40 +61,15 @@ void GpuThread::Enqueue(Op op) {
             // once a second while it lasts: a render thread that never drains is what the
             // log then has to explain (the phase breadcrumb, VITA_RENDER_TRACE builds).
             Common::PipelineStats::gpu_brakes.fetch_add(1, std::memory_order_relaxed);
-            const auto brake_start = std::chrono::steady_clock::now();
-            while (!retire_cv.wait_for(lock, std::chrono::seconds(1), [this] {
-                return depth.load(std::memory_order_relaxed) < MaxDepth / 2;
-            })) {
-                // The breadcrumb: the phase the render thread last entered, how long ago, and
-                // the three numbers it carries (for a wait: what it waits for, what was
-                // submitted, what the GPU finished). A phase that stops advancing while its
-                // age climbs names the call that never returned.
-                const u64 since =
-                    Common::PipelineStats::render_phase_us.load(std::memory_order_relaxed);
-                const u64 now = Common::PipelineStats::NowUs();
-                LOG_CRITICAL(HW_GPU,
-                             "render queue stuck at {} ops for a second: the render thread is "
-                             "not retiring work; it entered {} {} us ago [{} {} {}]",
-                             depth.load(std::memory_order_relaxed),
-                             Common::PipelineStats::render_phase.load(std::memory_order_relaxed),
-                             since != 0 && now > since ? now - since : 0,
-                             Common::PipelineStats::render_phase_a.load(std::memory_order_relaxed),
-                             Common::PipelineStats::render_phase_b.load(std::memory_order_relaxed),
-                             Common::PipelineStats::render_phase_c.load(std::memory_order_relaxed));
-                if (const auto report =
-                        Common::PipelineStats::stuck_report.load(std::memory_order_relaxed)) {
-                    report();
+            while (depth.load(std::memory_order_relaxed) >= MaxDepth / 2) {
+                retire_wake.Lower();
+                if (depth.load(std::memory_order_relaxed) < MaxDepth / 2) {
+                    break;
                 }
-                if (const auto scenes =
-                        Common::PipelineStats::scene_report.load(std::memory_order_relaxed)) {
-                    scenes();
-                }
+                lock.unlock();
+                retire_wake.Wait();
+                lock.lock();
             }
-            Common::PipelineStats::gpu_brake_us.fetch_add(
-                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                     std::chrono::steady_clock::now() - brake_start)
-                                     .count()),
-                std::memory_order_relaxed);
         }
         idle = false;
         if (op.swap_marker) {
@@ -104,7 +78,7 @@ void GpuThread::Enqueue(Op op) {
         depth.fetch_add(1, std::memory_order_relaxed);
         queue.push_back(std::move(op));
     }
-    enqueue_cv.notify_one();
+    enqueue_wake.Raise();
 
     if (lockstep.load(std::memory_order_relaxed)) {
         Drain();
@@ -130,7 +104,10 @@ void GpuThread::WaitForRetire() {
         return;
     }
     retire_waiters.fetch_add(1, std::memory_order_relaxed);
-    retire_cv.wait(lock);
+    retire_wake.Lower();
+    lock.unlock();
+    retire_wake.Wait();
+    lock.lock();
     retire_waiters.fetch_sub(1, std::memory_order_relaxed);
 }
 
@@ -140,7 +117,15 @@ void GpuThread::Drain() {
     }
     const u64 drain_start = Common::PipelineStats::NowUs();
     std::unique_lock lock{mutex};
-    retire_cv.wait(lock, [this] { return idle; });
+    while (!idle) {
+        retire_wake.Lower();
+        if (idle) {
+            break;
+        }
+        lock.unlock();
+        retire_wake.Wait();
+        lock.lock();
+    }
     Common::PipelineStats::drain_us.fetch_add(Common::PipelineStats::NowUs() - drain_start,
                                               std::memory_order_relaxed);
     Common::PipelineStats::drain_count.fetch_add(1, std::memory_order_relaxed);
@@ -157,9 +142,14 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
     while (true) {
         if (queue.empty()) {
             idle = true;
-            retire_cv.notify_all();
+            retire_wake.RaiseAll();
             GXM_PHASE("queue:idle");
-            enqueue_cv.wait(lock, [this] { return stop_requested || !queue.empty(); });
+            enqueue_wake.Lower();
+            if (!stop_requested && queue.empty()) {
+                lock.unlock();
+                enqueue_wake.Wait();
+                lock.lock();
+            }
             if (stop_requested && queue.empty()) {
                 break;
             }
@@ -170,7 +160,7 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
         queue.pop_front();
         const u32 new_depth = depth.fetch_sub(1, std::memory_order_relaxed) - 1;
         if (new_depth == MaxDepth / 2) {
-            retire_cv.notify_all();
+            retire_wake.RaiseAll();
         }
         // Coalesce presents, which this loop has always documented and never done. A present
         // captures the framebuffer registers when it is queued but reads the pixels when it
@@ -240,7 +230,7 @@ void GpuThread::ThreadLoop(std::function<void()> on_thread_start) {
 
         lock.lock();
         if (retire_waiters.load(std::memory_order_relaxed) > 0) {
-            retire_cv.notify_all();
+            retire_wake.RaiseAll();
         }
     }
 }

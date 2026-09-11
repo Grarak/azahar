@@ -75,7 +75,6 @@ inline std::atomic<u32> fb_switches{0};
 /// thread's rate: while it is braking the guest does not run, so the core looks idle and the
 /// speed falls by exactly this much.
 inline std::atomic<u32> gpu_brakes{0};
-inline std::atomic<u64> gpu_brake_us{0};
 
 /**
  * Where the render thread is right now, for the case where it stops being anywhere.

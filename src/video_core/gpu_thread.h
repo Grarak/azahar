@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "common/named_thread.h"
+#include "common/wake_flag.h"
 #include "common/common_types.h"
 
 namespace VideoCore {
@@ -127,8 +128,14 @@ private:
 
     Common::NamedThread thread;
     std::mutex mutex;
-    std::condition_variable enqueue_cv; ///< Signalled when work arrives or stop is requested
-    std::condition_variable retire_cv;  ///< Signalled when the queues become empty
+    /// Raised when work arrives or a stop is requested, and when an op retires. Not condition
+    /// variables: newlib's are built on kernel semaphores whose count climbs by one on every
+    /// wait and is never drained, so after 32766 waits - nine minutes of a thread that sleeps
+    /// whenever its queue empties - the post fails with SCE_KERNEL_ERROR_SEMA_OVF, the
+    /// pthreads layer discards the error, and the wakeup is lost for good. A kernel event flag
+    /// keeps no such count. See Common::WakeFlag.
+    Common::WakeFlag enqueue_wake;
+    Common::WakeFlag retire_wake;
     /// Arrival order. Presents coalesce at pop time: with more than one pending, older ones are
     /// dropped as skipped frames, so the thread never renders a frame nobody will see. Nothing
     /// guest-visible waits on this queue — every completion the guest can observe is raised on

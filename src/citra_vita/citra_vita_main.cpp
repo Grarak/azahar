@@ -73,14 +73,11 @@ struct PerfRecord {
     std::uint64_t irq_lag_us;
     std::uint32_t irq_count;
     std::uint32_t pad4;
-    // Version 5: what the queue's depth ceiling cost the emulation thread. The guest does not
-    // run while it brakes, so this is the speed the render thread took away.
-    std::uint64_t gpu_brake_us;
 };
 #pragma pack(pop)
 // The reader (tools/read_perf.py) parses this layout by hand; keep the two in lockstep.
 static_assert(sizeof(PerfFileHeader) == 12);
-static_assert(sizeof(PerfRecord) == 392);
+static_assert(sizeof(PerfRecord) == 384);
 
 FILE* OpenPerfFile() {
     sceIoMkdir("ux0:data/azahar", 0777);
@@ -487,7 +484,6 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 rec.guest_ns = Core::NativeStats::credited_ns.exchange(0);
                 rec.gpu_ops = Common::PipelineStats::gpu_ops.exchange(0);
                 rec.gpu_brakes = Common::PipelineStats::gpu_brakes.exchange(0);
-                rec.gpu_brake_us = Common::PipelineStats::gpu_brake_us.exchange(0);
                 rec.gpu_busy_ns = Common::PipelineStats::gpu_busy_us.exchange(0) * 1000ull;
                 rec.runloop_us = Core::NativeStats::runloop_us.exchange(0);
                 rec.vanrun_us = Core::NativeStats::vanrun_us.exchange(0);
