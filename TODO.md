@@ -24,7 +24,7 @@ would give us one.
 
 ### The GPU is at the frame budget on composite-heavy screens
 
-Measured on the victory screen: 16.7 ms of GPU per guest frame against a 16.6 ms
+Measured on smash's victory screen: 16.7 ms of GPU per guest frame against a 16.6 ms
 budget at 60 fps, GPU 100% busy. That is not a comfortable margin, and the same
 screen runs at a full 60 fps on the OpenGL tier with a quarter of its render
 thread spare — so the work itself is not inherently expensive, the mapping onto
@@ -73,9 +73,6 @@ from the host emulator is the next step.
 
 - Savestate autoload. It works on the Linux tier; it has never been run on the
   console.
-- Mirrored repeat on a linear texture, written by setting the control word
-  directly past the library's refusal.
-- The Vita audio sink has never actually been listened to.
 
 ### Titles that need hardware to progress
 

@@ -1,16 +1,10 @@
 # Running azahar on the PlayStation Vita
 
-This branch ports azahar to the PS Vita, and to 32-bit ARM Linux along the way.
-The Vita is a 2011 handheld: four Cortex-A9 cores at 500 MHz (444 in most
-titles), 512 MB of system RAM with rather less available to an application, 128
-MB of video memory, and a PowerVR SGX543MP4+ GPU. A 3DS is slower than that on
-paper, but an emulator does not get to spend the difference on itself.
-
 Three problems, and this document is about how each is answered.
 
 ## 1. The CPU: don't emulate it
 
-The 3DS's ARM11 and the Vita's Cortex-A9 are both ARMv7-A. A 3DS game's
+3DS' ARMv6 ISA is backwards compatible with the Vita's ARMv7 ISA. A 3DS game's
 user-mode code is, instruction for instruction, code the Vita can already
 execute. What stops it running is not the instruction set but the *address
 space*: a 3DS binary expects its `.text` at `0x00100000`, its heap and stack
@@ -29,13 +23,10 @@ interpreter, and asks for the next slice.
 There is no recompiler and no interpreter on this path. The guest's instructions
 are the host's instructions.
 
-Two designs exist for how the core is obtained. The original one takes a core
-out of Sony's scheduler and keeps a resident kernel thread on it. The current
-one — *folded* — takes no core at all: each `azaharRun` installs the guest's
+Two designs exist for how the core is obtained. Each `azaharRun` installs the guest's
 world on whichever core called it, runs one slice, and puts Sony's world back
 before returning. That costs a world switch per slice, measured at 12.9 µs and
-about 3.5% of a core at three thousand slices a second, and it buys back an
-entire core for the renderer. `vita_native/DEVELOPMENT.md` has the detail.
+about 3.5% of a core at three thousand slices a second. `vita_native/DEVELOPMENT.md` has the detail.
 
 ## 2. Memory: one allocation, two addresses
 
@@ -92,9 +83,7 @@ directly**, in microseconds, in `renderer_gxm/usse/`.
 
 It works in two tiers: the first places registers and produces a correct program
 immediately; the second runs the optimising passes on a worker thread once a
-program has survived a hundred draws, and swaps it in at a frame boundary. Every
-pass is checked against a simulator on the host, over every program captured
-from a real title, so a pass that changes what a program computes cannot ship.
+program has survived a hundred draws, and swaps it in at a frame boundary.
 
 ### The freeze
 
@@ -107,15 +96,6 @@ cycle as the only way out. There is one word per in-flight scene now, a ring of
 32 chosen by serial.
 
 ## Threads and cores
-
-Four cores, and each has a job:
-
-| Core | What runs there |
-|---|---|
-| 0 | left to `libgxm`'s display queue thread, which Sony pins there |
-| 1 | the render thread |
-| 2 | the emulation thread, and the guest with it |
-| 3 | workers: audio, the shader optimiser, the surface trim |
 
 The emulation thread never waits for the renderer. It enqueues ops and carries
 on, which is what lets the guest hold full speed while the renderer is behind.
@@ -175,7 +155,7 @@ because the release build cannot tell you anything about itself.
 -DENABLE_LTO=OFF   # diagnostic
 ```
 
-`VITA_DIAGNOSTICS` is the underlying switch and can be set on its own if you
+`ENABLE_VITA_DIAGNOSTICS` is the underlying switch and can be set on its own if you
 want the diagnostics with LTO, or a small binary without them.
 
 ### Bring-up switches
