@@ -48,15 +48,15 @@ target_link_libraries(citra_vita PRIVATE citra_common citra_core input_common vi
 # calls into the import table, so the vpk then only loads against a kernel module new enough to
 # export them; OFF builds a vpk that runs against any module. It is a measurement, so it
 # follows the diagnostic build.
-option(VITA_PMU "Per-second per-core PMU counter line" ${VITA_DIAGNOSTICS})
-if (VITA_PMU)
+option(ENABLE_VITA_PMU "Per-second per-core PMU counter line" ${ENABLE_VITA_DIAGNOSTICS})
+if (ENABLE_VITA_PMU)
     target_compile_definitions(citra_vita PRIVATE CITRA_VITA_PMU)
 endif()
 
 # Render-thread phase breadcrumb: -DVITA_RENDER_TRACE=ON makes the per-second line carry the
 # phase the render thread is in and how long it has been there, so a hang that prints nothing
 # from the thread that hung can still be located. See common/pipeline_stats.h.
-if (VITA_RENDER_TRACE)
+if (ENABLE_VITA_RENDER_TRACE)
     target_compile_definitions(citra_vita PRIVATE VITA_RENDER_TRACE)
 endif()
 

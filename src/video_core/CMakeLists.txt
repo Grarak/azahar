@@ -114,7 +114,7 @@ add_library(video_core STATIC EXCLUDE_FROM_ALL
 )
 
 if (ENABLE_GXM)
-    if (VITA_RENDER_TRACE)
+    if (ENABLE_VITA_RENDER_TRACE)
         # GXM_PHASE: the render thread's breadcrumb, see common/pipeline_stats.h.
         target_compile_definitions(video_core PRIVATE VITA_RENDER_TRACE)
     endif()

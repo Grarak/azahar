@@ -213,41 +213,6 @@ option(ENABLE_SSE42 "Enable SSE4.2 optimizations on x86_64" ON)
 
 option(ENABLE_DEVELOPER_OPTIONS "Enable functionality targeted at emulator developers" OFF)
 
-# The render thread's phase breadcrumb (common/pipeline_stats.h, GXM_PHASE): where the thread
-# is, so a hang that prints nothing can still be located. Declared here rather than beside the
-# frontend because video_core has to honour it too - the render thread spends most of its life
-# inside the GXM renderer, which is compiled there.
-# On by default since 2026-09-08: two console freezes in a row came from a plain build, whose
-# log could not say where the render thread was. The cost is a few relaxed stores per queued
-# op, scene and present, and none per draw.
-# Two flavours of the Vita build, and the difference is what is compiled in rather than what
-# is switched off at runtime.
-#
-# The release build is -O3 with LTO and carries no diagnostics at all: no logging, no
-# per-second measurements, no bring-up switches. Nothing reads a file or an environment
-# variable to decide how to behave, and nothing spends a clock read or a printf on saying what
-# it is doing. That is the build a user runs.
-#
-# The diagnostic build is -O3 without LTO and has all of it. Every measurement quoted in
-# DEVELOPMENT.md and TODO.md was taken with it, and it is what a bug report should be
-# reproduced on, because the release build cannot tell you anything about itself.
-#
-# LTO is what separates them by default - the diagnostic build wants readable profiles and
-# fast relinks, the release build wants the inlining - but the two are independent options, so
-# either can be had on its own.
-if (ENABLE_LTO)
-    set(DEFAULT_VITA_DIAGNOSTICS OFF)
-else()
-    set(DEFAULT_VITA_DIAGNOSTICS ON)
-endif()
-option(VITA_DIAGNOSTICS "Compile in the Vita's logging, measurements and bring-up switches"
-       ${DEFAULT_VITA_DIAGNOSTICS})
-if (VITA_DIAGNOSTICS)
-    add_compile_definitions(VITA_DIAGNOSTICS)
-endif()
-
-option(VITA_RENDER_TRACE "Record where the Vita render thread is, for locating a hang" ${DEFAULT_VITA_DIAGNOSTICS})
-
 option(ENABLE_BUILTIN_KEYBLOB "Enable the inclusion of the default crypto keys blob" ON)
 
 # Compile options
@@ -261,6 +226,18 @@ option(CITRA_TRACE_PROBES "Compile in env-gated diagnostic trace probes (see TRA
 if (CITRA_TRACE_PROBES)
     add_compile_definitions(CITRA_TRACE_PROBES)
 endif()
+
+if (ENABLE_LTO)
+    set(DEFAULT_VITA_DIAGNOSTICS OFF)
+else()
+    set(DEFAULT_VITA_DIAGNOSTICS ON)
+endif()
+option(ENABLE_VITA_DIAGNOSTICS "Compile in the Vita's logging, measurements and bring-up switches" ${DEFAULT_VITA_DIAGNOSTICS})
+if (ENABLE_VITA_DIAGNOSTICS)
+    add_compile_definitions(VITA_DIAGNOSTICS)
+endif()
+
+option(ENABLE_VITA_RENDER_TRACE "Record where the Vita render thread is, for locating a hang" ${DEFAULT_VITA_DIAGNOSTICS})
 
 # Handle incompatible options for libretro builds
 if(ENABLE_LIBRETRO)
