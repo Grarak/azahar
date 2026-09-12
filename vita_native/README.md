@@ -4,7 +4,7 @@ A PS Vita kernel plugin that lets [azahar](https://github.com/azahar-emu/azahar)
 emulator, run the guest's ARM11 code on the Vita's own Cortex-A9 rather than interpreting or
 recompiling it.
 
-Both machines are ARMv7-A, so most 3DS user-mode code is already valid Vita instructions. What
+3DS' ARMv6 ISA is backwards compatible with the Vita's ARMv7 ISA, so most 3DS user-mode code is already valid Vita instructions. What
 stops it running directly is that a 3DS binary expects its own virtual addresses — `.text` at
 `0x00100000`, its heap and stack where the 3DS kernel put them — and those addresses belong to
 the Vita kernel in any ordinary process. This plugin takes one CPU core away from Sony's

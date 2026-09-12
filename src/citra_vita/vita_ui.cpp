@@ -346,12 +346,14 @@ Ui::Action Ui::DrawPauseMenu() {
         state = State::Savestates;
         overlay_focused = false;
     }
+#ifdef VITA_DIAGNOSTICS
     if (ImGui::Button("Dump frame", button_size)) {
         // The next presented frame, screens only, to ux0:data/azahar/frame_NN.ppm, and every
         // surface the cache holds at that frame's end to ux0:data/azahar/dump/.
         GxmPresent::DumpNextFrame();
         GxmRenderer::RequestSurfaceDump();
     }
+#endif
     if (ImGui::Button("Quit game", button_size)) {
         action = Action::QuitGame;
     }

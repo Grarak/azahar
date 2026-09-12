@@ -2775,6 +2775,7 @@ void RasterizerGxm::EndFrame() {
     res_cache.TickFrame();
     // Report on wall time, not on a frame count: at the frame rates this phase produces, a
     // 120-frame report can be two minutes apart, which is no use while finding out why.
+#ifdef VITA_DIAGNOSTICS
     const u64 now = static_cast<u64>(Common::Timer::GetTimeMs().count());
     if (report_at_ms == 0) {
         report_at_ms = now + ReportIntervalMs;
@@ -2913,6 +2914,7 @@ void RasterizerGxm::EndFrame() {
                     runtime.stat_syncs_avoided =
                     runtime.stat_gpu_blits = runtime.stat_gpu_blit_merges = 0;
     }
+#endif
 }
 
 void RasterizerGxm::DumpSurfaces() {

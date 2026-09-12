@@ -1,6 +1,6 @@
 # How azahar-native works
 
-Both the 3DS and the Vita are ARMv7-A. A 3DS game's user-mode code is already valid Vita
+3DS' ARMv6 ISA is backwards compatible with the Vita's ARMv7 ISA. A 3DS game's user-mode code is already valid Vita
 instructions, so the interesting problem is not translation but *address space*: the binary
 wants `.text` at `0x00100000`, and in any ordinary Vita process that megabyte belongs to the
 kernel, inside a single global TTBR0 table the kernel rewrites at runtime. Identity mapping

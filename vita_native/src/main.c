@@ -257,28 +257,6 @@ extern int module_get_export_func(SceUID pid, const char *modname, uint32_t libn
 #define AZAHAR_KERNEL_PID 0x10005
 
 
-
-// Tries the 3.60 pair then the 3.63+ pair. Reports which one answered, because knowing the
-// firmware generation from the probe's own output is worth having on every report.
-static int resolve_export(const char *label, const char *mod, uint32_t lib60, uint32_t fn60,
-                          uint32_t lib63, uint32_t fn63, uintptr_t *out) {
-    if (module_get_export_func(AZAHAR_KERNEL_PID, mod, lib60, fn60, out) >= 0 && *out) {
-        emit("    %-26s resolved, 3.60 NIDs (lib %08x fn %08x)\n", label, lib60, fn60);
-        return 1;
-    }
-    if (module_get_export_func(AZAHAR_KERNEL_PID, mod, lib63, fn63, out) >= 0 && *out) {
-        emit("    %-26s resolved, 3.63+ NIDs (lib %08x fn %08x)\n", label, lib63, fn63);
-        return 1;
-    }
-    emit("    %-26s NOT RESOLVED on this firmware (tried %08x/%08x and %08x/%08x)\n", label,
-         lib60, fn60, lib63, fn63);
-    *out = 0;
-    return 0;
-}
-
-
-
-
 // SceKernelSystemInfo lives in the user headers (psp2/kernel/threadmgr/thread.h) and a kernel
 // plugin only has psp2kern, so the layout is restated here. It is asserted at 0x48 bytes
 // upstream: 4 + 4 + 4 * (8 + 4 + 4) = 72.
@@ -296,7 +274,6 @@ typedef int (*fn_get_system_info)(AzaharSystemInfo *info);
 typedef int (*fn_change_active_cpu_mask)(int mask);
 
 static fn_get_system_info p_GetSystemInfo;
-static fn_change_active_cpu_mask p_ChangeActiveCpuMask;
 
 
 // Resolving GetSystemInfo, and the NID that finally made it work from kernel context.
