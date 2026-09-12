@@ -124,9 +124,9 @@ set_target_properties(citra_vita PROPERTIES
 # and one large FS read's std::bad_alloc froze the guest (see hle_ipc.h's async sections).
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
-set(VITA_TITLEID "AZAH00001")
+set(VITA_TITLEID "AZAHARPSV")
 set(VITA_APP_NAME "Azahar")
-set(VITA_VERSION "01.00")
+set(VITA_VERSION "00.10")
 
 # The SceShell authid grants the extra permissions the native backend needs (taking a core, the
 # kernel-module bridge), and -na disables ASLR so the guest range lands where the module expects.
@@ -155,4 +155,8 @@ vita_create_vpk(citra_vita.vpk ${VITA_TITLEID} citra_vita.self
     NAME ${VITA_APP_NAME}
     # Razor HUD reads its settings from app0:; LIVE=1 is what lets GPU Live Metrics start.
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/hud_settings.ini hud_settings.ini
+        ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
+        ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+        ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+        ${CMAKE_CURRENT_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
 )
