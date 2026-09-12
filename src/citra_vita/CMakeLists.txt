@@ -105,6 +105,7 @@ target_link_libraries(citra_vita PRIVATE
     SceRazorCapture_stub_weak
     SceRazorHud_stub_weak
     SceKernelModulemgr_stub
+    SceVshBridge_stub
     m
 )
 

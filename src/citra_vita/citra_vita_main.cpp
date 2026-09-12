@@ -5,9 +5,9 @@
 #include <cstddef>
 #include <exception>
 #include <memory>
-#include <pthread.h>
 #include <string>
 #include <vector>
+#include <pthread.h>
 
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
@@ -15,17 +15,19 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/message_dialog.h>
 #include <psp2/power.h>
 #include <psp2/shellutil.h>
+#include <psp2/vshbridge.h>
 #include "citra_vita/gxm_present.h"
 
 #include "citra_vita/emu_window_vita.h"
 #include "citra_vita/input_factory_vita.h"
 
+#include "azahar_native.h"
 #include "common/named_thread.h"
 #include "common/pipeline_stats.h"
 #include "core/arm/vita/native_stats.h"
-#include "azahar_native.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -33,7 +35,6 @@
 #include <psp2/io/stat.h>
 
 namespace {
-
 // One record per second, appended to ux0:data/azahar/perf.bin; read the file back with
 // src/citra_vita/tools/read_perf.py. The console keeps only the speed line - everything
 // else lives here, where a run's whole history survives instead of scrolling away.
@@ -43,6 +44,7 @@ struct PerfFileHeader {
     std::uint32_t version;
     std::uint32_t record_size;
 };
+
 struct PerfRecord {
     std::uint64_t time_us;
     float speed;
@@ -89,7 +91,6 @@ FILE* OpenPerfFile() {
     }
     return f;
 }
-
 } // namespace
 #include "citra_vita/hud_stats.h"
 #include "citra_vita/vita_ui.h"
@@ -102,11 +103,11 @@ FILE* OpenPerfFile() {
 #include "core/core.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/image_interface.h"
-#include "video_core/gpu.h"
-#include "video_core/renderer_gxm/gxm_flags.h"
-#include "pte_sema.h"
 #include "core/hle/service/service.h"
 #include "core/movie.h"
+#include "pte_sema.h"
+#include "video_core/gpu.h"
+#include "video_core/renderer_gxm/gxm_flags.h"
 
 // The default heap is nowhere near enough for a 3DS: FCRAM alone is 128 MB, and the caches and
 // the surface storage sit on top of it. Newlib reads this at startup.
@@ -137,14 +138,19 @@ unsigned int _pthread_stack_default_user = 1024 * 1024;
 int _vita_net_init(void);
 }
 
-namespace {
+constexpr int MinAzaharNativeVersion = 1;
 
+namespace {
 /// The process's own arguments, kept for LaunchParameter.
 std::vector<std::string> g_arguments;
 
 // Startup trace, to the kernel's printf channel (visible over the module logger / a PC). The
 // app was failing to launch with no on-screen detail; this says how far it got.
-#define VTRACE(...) do { sceClibPrintf("[azahar] " __VA_ARGS__); sceClibPrintf("\n"); } while (0)
+#define VTRACE(...)                                                                                \
+    do {                                                                                           \
+        sceClibPrintf("[azahar] " __VA_ARGS__);                                                    \
+        sceClibPrintf("\n");                                                                       \
+    } while (0)
 
 #ifdef CITRA_VITA_PMU
 /// The kernel module's counters as one string: SGI service windows, the last pending mask,
@@ -172,7 +178,8 @@ void StuckReport() {
     static int dumps = 0;
     if (dumps < 3) {
         dumps++;
-        sceClibPrintf("[azahar] stuck: azaharThreadDump wrote %d threads to native.txt\n", azaharThreadDump());
+        sceClibPrintf("[azahar] stuck: azaharThreadDump wrote %d threads to native.txt\n",
+                      azaharThreadDump());
     }
 }
 #endif
@@ -183,15 +190,11 @@ extern "C" void VitaAllocTraceWatchThread(void);
 #else
 // So the call sites do not each need a guard: with the tracer off this folds away to nothing.
 inline void VitaAllocTraceDump() {}
+
 inline void VitaAllocTraceWatchThread() {}
 #endif
 
 constexpr char UserDirectory[] = "ux0:/data/azahar/";
-
-/// Opens the pause menu alongside the PS button: a fallback for the case where the shell
-/// refuses the lock and the PS button therefore never reaches the pad data. Select plus start
-/// costs the guest nothing because no title needs both at once.
-constexpr u32 MenuCombo = SCE_CTRL_SELECT | SCE_CTRL_START;
 
 void SetupPaths() {
     // Must happen before anything asks for a path: the first request bootstraps the whole table
@@ -396,8 +399,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
         // away from the shell below, arrives as an ordinary pad bit that nothing binds for
         // the guest; it is the same button DSVita pauses on.
         const u32 buttons = window.ButtonsHeld();
-        const bool combo_now =
-            (buttons & SCE_CTRL_PSBUTTON) != 0 || (buttons & MenuCombo) == MenuCombo;
+        const bool combo_now = (buttons & SCE_CTRL_PSBUTTON) != 0;
         if (combo_now && !combo_held && !ui.MenuOpen()) {
             ui.OpenPauseMenu();
         }
@@ -468,7 +470,7 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                 const int fps10 = static_cast<int>(perf.game_fps * 10.0 + 0.5);
 
                 const unsigned presented =
-                                    Common::PipelineStats::presents.exchange(0, std::memory_order_relaxed);
+                    Common::PipelineStats::presents.exchange(0, std::memory_order_relaxed);
 
 #ifdef VITA_DIAGNOSTICS
                 // Frames the guest ran whose draws were dropped: the difference between
@@ -547,39 +549,39 @@ bool RunTitle(Core::System& system, VitaFrontend::EmuWindowVita& window, VitaFro
                     const u64 since =
                         Common::PipelineStats::render_phase_us.load(std::memory_order_relaxed);
                     const u64 now = Common::PipelineStats::NowUs();
-                    sceClibSnprintf(phase, sizeof(phase), "  render %s %llu us [%llu %llu %llu]",
-                                    where, since != 0 && now > since ? now - since : 0,
-                                    Common::PipelineStats::render_phase_a.load(
-                                        std::memory_order_relaxed),
-                                    Common::PipelineStats::render_phase_b.load(
-                                        std::memory_order_relaxed),
-                                    Common::PipelineStats::render_phase_c.load(
-                                        std::memory_order_relaxed));
+                    sceClibSnprintf(
+                        phase, sizeof(phase), "  render %s %llu us [%llu %llu %llu]", where,
+                        since != 0 && now > since ? now - since : 0,
+                        Common::PipelineStats::render_phase_a.load(std::memory_order_relaxed),
+                        Common::PipelineStats::render_phase_b.load(std::memory_order_relaxed),
+                        Common::PipelineStats::render_phase_c.load(std::memory_order_relaxed));
                 }
 #endif
                 const auto wt_stats = system.Memory().WriteTracker().TakeStats();
-                sceClibPrintf("[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  "
-                              "slices %u (svc %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
-                              "queue %u brake %u us  heap %u/%u KiB%s%s%s\n",
-                              speed, fps10 / 10, fps10 % 10, presented, skipped, rec.slices,
-                              rec.svcs, static_cast<unsigned>(rec.guest_ns / 1000),
-                              static_cast<unsigned>(rec.vanrun_us),
-                              Core::NativeStats::write_faults.exchange(0, std::memory_order_relaxed),
-                              static_cast<unsigned>(wt_stats.arms),
-                              static_cast<unsigned>(wt_stats.hot_skips),
-                              system.GPU().RenderQueueDepth(), rec.gpu_brakes,
-                              static_cast<unsigned>(heap.uordblks / 1024),
-                              static_cast<unsigned>(heap.arena / 1024), sema, phase, sgi);
+                sceClibPrintf(
+                    "[azahar] speed %d%%  game %d.%d fps  shown %u fps  skipped %u  "
+                    "slices %u (svc %u)  guest %u us  in %u us  wf %u wa %u wh %u  "
+                    "queue %u brake %u us  heap %u/%u KiB%s%s%s\n",
+                    speed, fps10 / 10, fps10 % 10, presented, skipped, rec.slices, rec.svcs,
+                    static_cast<unsigned>(rec.guest_ns / 1000),
+                    static_cast<unsigned>(rec.vanrun_us),
+                    Core::NativeStats::write_faults.exchange(0, std::memory_order_relaxed),
+                    static_cast<unsigned>(wt_stats.arms), static_cast<unsigned>(wt_stats.hot_skips),
+                    system.GPU().RenderQueueDepth(), rec.gpu_brakes,
+                    static_cast<unsigned>(heap.uordblks / 1024),
+                    static_cast<unsigned>(heap.arena / 1024), sema, phase, sgi);
                 if (perf_file != nullptr) {
                     std::fwrite(&rec, sizeof(rec), 1, perf_file);
                     std::fflush(perf_file);
                 }
 #endif // VITA_DIAGNOSTICS
-                // The stats window reads these on the render thread.
+       // The stats window reads these on the render thread.
                 {
                     using namespace VitaFrontend::HudStats;
-                    speed_percent.store(static_cast<u32>(std::max(speed, 0)), std::memory_order_relaxed);
-                    game_fps10.store(static_cast<u32>(std::max(fps10, 0)), std::memory_order_relaxed);
+                    speed_percent.store(static_cast<u32>(std::max(speed, 0)),
+                                        std::memory_order_relaxed);
+                    game_fps10.store(static_cast<u32>(std::max(fps10, 0)),
+                                     std::memory_order_relaxed);
                     shown_fps.store(presented, std::memory_order_relaxed);
                     valid.store(true, std::memory_order_release);
                 }
@@ -622,6 +624,29 @@ std::string LaunchParameter() {
     return std::string{text.substr(at + 7)};
 }
 
+bool module_installed(const std::string& name) {
+    SceUID search_unk[2] = {0};
+    return _vshKernelSearchModuleByName(name.c_str(), search_unk) >= 0;
+}
+
+void show_error_dialog(const std::string& message) {
+    SceMsgDialogUserMessageParam msg_param{};
+    msg_param.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_OK;
+    msg_param.msg = reinterpret_cast<const SceChar8*>(message.c_str());
+
+    SceMsgDialogParam param{};
+    sceMsgDialogParamInit(&param);
+    param.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
+    param.userMsgParam = &msg_param;
+
+    sceMsgDialogInit(&param);
+
+    while (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) {
+        VitaFrontend::GxmPresent::SwapCommonDialog();
+    }
+    sceMsgDialogTerm();
+}
+
 /// The emulator proper. Runs on a thread of its own; see main.
 int EmulatorMain() {
     // Register this stack with the allocation tracer's overflow watch; see alloc_trace.c.
@@ -646,6 +671,29 @@ int EmulatorMain() {
         LOG_CRITICAL(Frontend, "Could not bring up GXM");
         return -1;
     }
+
+    {
+        SceCommonDialogConfigParam dialog_config_param{};
+        sceCommonDialogSetConfigParam(&dialog_config_param);
+
+        if (!module_installed("azaharnative")) {
+            show_error_dialog("azaharnative.skprx not installed. Check the release page.");
+            return -1;
+        }
+
+        if (!module_installed("CapUnlocker")) {
+            show_error_dialog("CapUnlocker.skprx not installed. Install it from "
+                              "https://github.com/GrapheneCt/CapUnlocker");
+            return -1;
+        }
+
+        if (azaharVersion() < MinAzaharNativeVersion) {
+            show_error_dialog(
+                "The installed azaharnative.skprx module is not compatible. Please update it.");
+            return -1;
+        }
+    }
+
     // Presents never block this thread in a vblank wait: the display queue's own thread
     // does the flip and the wait, and submission only blocks past two pending flips - which
     // the run loop's own pacing keeps from happening.
@@ -725,7 +773,6 @@ int EmulatorMain() {
     VitaFrontend::GxmPresent::Shutdown();
     return 0;
 }
-
 } // Anonymous namespace
 
 int main(int argc, char* argv[]) {
@@ -740,10 +787,11 @@ int main(int argc, char* argv[]) {
         SceKernelFreeMemorySizeInfo info{};
         info.size = sizeof(info);
         sceKernelGetFreeMemorySize(&info);
-        sceClibPrintf("[azahar] free memory after the heap: user %u KiB, cdram %u KiB, phycont %u KiB\n",
-                      static_cast<unsigned>(info.size_user / 1024),
-                      static_cast<unsigned>(info.size_cdram / 1024),
-                      static_cast<unsigned>(info.size_phycont / 1024));
+        sceClibPrintf(
+            "[azahar] free memory after the heap: user %u KiB, cdram %u KiB, phycont %u KiB\n",
+            static_cast<unsigned>(info.size_user / 1024),
+            static_cast<unsigned>(info.size_cdram / 1024),
+            static_cast<unsigned>(info.size_phycont / 1024));
         void* probe = std::malloc(64);
         if (probe == nullptr) {
             sceClibPrintf("[azahar] the %u MB heap could not be allocated. The extended memory "
@@ -774,7 +822,8 @@ int main(int argc, char* argv[]) {
     constexpr std::size_t EmulationStackSize = 4 * 1024 * 1024;
 
     {
-        Common::NamedThread emu_thread{Common::ThreadCfg{"emulation", EmulationStackSize}, EmulatorMain};
+        Common::NamedThread emu_thread{Common::ThreadCfg{"emulation", EmulationStackSize},
+                                       EmulatorMain};
         emu_thread.join();
     }
 

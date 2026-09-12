@@ -357,6 +357,10 @@ static uint32_t active_cpu_mask(void) {
     return p_GetActiveCpuMask ? (uint32_t)p_GetActiveCpuMask() : 0u;
 }
 
+int azaharVersion() {
+    return 1;
+}
+
 // One read into `out`. Returns the call's own status; the caller decides what a failure means.
 
 // ---------------------------------------------------------------------------- the emulator

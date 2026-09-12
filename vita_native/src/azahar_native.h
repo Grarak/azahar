@@ -142,6 +142,7 @@ int azaharRelease(void);
 int azaharEdit(const AzaharEditRequest *req);
 int azaharPmuRead(AzaharPmuStats *out);
 int azaharPmuReadAll(AzaharPmuAll *out);
+int azaharVersion();
 
 /// The SGI service-window counters and the resident loop's heartbeat (resident mode; the
 /// folded mode reports zeros except installed). pending_now is the banked GICD_ISPENDR0.

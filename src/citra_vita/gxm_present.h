@@ -48,6 +48,7 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b);
 void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float h);
 void DrawSolidRect(float x, float y, float w, float h, u8 r, u8 g, u8 b, u8 a);
 void EndFrame();
+void SwapCommonDialog();
 
 // --- for the imgui backend, which speaks GXM itself ---
 

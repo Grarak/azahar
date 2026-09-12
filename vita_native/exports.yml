@@ -19,3 +19,4 @@ azaharnative:
         - azaharPmuReadAll: 0x3C1A7E07
         - azaharSgiStats: 0x3C1A7E08
         - azaharThreadDump: 0x3C1A7E09
+        - azaharVersion: 0x3C1A7E0A

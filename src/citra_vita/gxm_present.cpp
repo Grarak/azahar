@@ -9,10 +9,11 @@
 #include <map>
 #include <vector>
 
+#include <psp2/common_dialog.h>
 #include <psp2/display.h>
 #include <psp2/gxm.h>
-#include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/razor_capture.h>
@@ -60,7 +61,6 @@ struct MappedBlock {
     MapKind kind;
 };
 
-
 /// One memblock taken at init and mapped once, handed out first-fit: what vitaGL does with
 /// the whole of free CDRAM and RAM at vglInit, so the budget is claimed up front and a
 /// boot that does not fit fails at boot, not on the first level that needs a texture.
@@ -77,8 +77,8 @@ public:
         void* addr = nullptr;
         sceKernelGetMemBlockBase(uid, &addr);
         if (sceGxmMapMemory(addr, size,
-                            static_cast<SceGxmMemoryAttribFlags>(SCE_GXM_MEMORY_ATTRIB_READ |
-                                                                 SCE_GXM_MEMORY_ATTRIB_WRITE)) < 0) {
+                            static_cast<SceGxmMemoryAttribFlags>(
+                                SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE)) < 0) {
             sceKernelFreeMemBlock(uid);
             uid = -1;
             return false;
@@ -231,12 +231,25 @@ void LogMemBlock(const char* name, SceKernelMemBlockType type, SceSize size, Sce
     const char* kind = "other";
     int slot = 4;
     switch (type) {
-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW: kind = "USER_RW"; slot = 0; break;
-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE: kind = "USER_RW_UNCACHE"; slot = 1; break;
-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW: kind = "CDRAM_RW"; slot = 2; break;
+    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW:
+        kind = "USER_RW";
+        slot = 0;
+        break;
+    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE:
+        kind = "USER_RW_UNCACHE";
+        slot = 1;
+        break;
+    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW:
+        kind = "CDRAM_RW";
+        slot = 2;
+        break;
     case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW:
-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW: kind = "PHYCONT"; slot = 3; break;
-    default: break;
+    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW:
+        kind = "PHYCONT";
+        slot = 3;
+        break;
+    default:
+        break;
     }
     if (uid >= 0) {
         totals[slot] += size;
@@ -458,11 +471,12 @@ void GpuLiveFrame() {
                   "pbuf peak %u KiB, partial renders %u (%u jobs), vertex jobs paused %u\n",
                   live.frames, frame_us, busy_us, live.vertex_us / n, live.vertex_jobs,
                   live.fragment_us / n, live.fragment_jobs, live.firmware_us / n,
-                  static_cast<u32>(live.usse_vertex / vj), static_cast<u32>(live.usse_fragment / fj),
-                  static_cast<u32>(live.dep_tex / fj), static_cast<u32>(live.nondep_tex / fj),
-                  live.px_before_hsr / n, live.px_out / n, live.vdm_verts / n, live.mte_prims / n,
-                  live.tiling_writes / n / 1024, live.isp_reads / n / 1024, live.pbuf_peak / 1024,
-                  live.partial, live.partial_jobs, live.vertex_paused);
+                  static_cast<u32>(live.usse_vertex / vj),
+                  static_cast<u32>(live.usse_fragment / fj), static_cast<u32>(live.dep_tex / fj),
+                  static_cast<u32>(live.nondep_tex / fj), live.px_before_hsr / n, live.px_out / n,
+                  live.vdm_verts / n, live.mte_prims / n, live.tiling_writes / n / 1024,
+                  live.isp_reads / n / 1024, live.pbuf_peak / 1024, live.partial, live.partial_jobs,
+                  live.vertex_paused);
     // Where the fragment time goes, by the scene's place in its frame, in the order the
     // renderer opened them: a scene that costs most of the frame can be found this way.
     char scenes[256];
@@ -490,19 +504,18 @@ void GpuLiveFrame() {
         "pixels {} before hsr, {} out  vertices {}  prims {}\n"
         "tiling {} KiB  isp {} KiB  pbuf peak {} KiB\n"
         "partial renders {} ({} jobs)  vertex jobs paused {}",
-        live.frames, frame_us, busy_us, frame_us ? busy_us * 100 / frame_us : 0,
-        live.vertex_us / n, live.vertex_jobs, live.fragment_us / n, live.fragment_jobs,
-        live.firmware_us / n, static_cast<u32>(live.usse_vertex / vj),
-        static_cast<u32>(live.usse_fragment / fj), static_cast<u32>(live.dep_tex / fj),
-        static_cast<u32>(live.nondep_tex / fj), live.px_before_hsr / n, live.px_out / n,
-        live.vdm_verts / n, live.mte_prims / n, live.tiling_writes / n / 1024,
-        live.isp_reads / n / 1024, live.pbuf_peak / 1024, live.partial, live.partial_jobs,
-        live.vertex_paused);
+        live.frames, frame_us, busy_us, frame_us ? busy_us * 100 / frame_us : 0, live.vertex_us / n,
+        live.vertex_jobs, live.fragment_us / n, live.fragment_jobs, live.firmware_us / n,
+        static_cast<u32>(live.usse_vertex / vj), static_cast<u32>(live.usse_fragment / fj),
+        static_cast<u32>(live.dep_tex / fj), static_cast<u32>(live.nondep_tex / fj),
+        live.px_before_hsr / n, live.px_out / n, live.vdm_verts / n, live.mte_prims / n,
+        live.tiling_writes / n / 1024, live.isp_reads / n / 1024, live.pbuf_peak / 1024,
+        live.partial, live.partial_jobs, live.vertex_paused);
     if (live.frames == 0) {
-        live_text = fmt::format("GPU live: no frame entries ({} entries, set buffer failed {} "
-                                "times, last {:#x})",
-                                live.entries, live.set_failures,
-                                static_cast<u32>(live.last_set_error));
+        live_text =
+            fmt::format("GPU live: no frame entries ({} entries, set buffer failed {} "
+                        "times, last {:#x})",
+                        live.entries, live.set_failures, static_cast<u32>(live.last_set_error));
     }
     const bool on = live.on;
     void* buffers[MaxDisplayBuffers];
@@ -556,8 +569,8 @@ void StartGpuLive() {
     }
     const int hud = hud_module;
     for (u32 i = 0; i < MaxDisplayBuffers; i++) {
-        const SceUID uid = sceKernelAllocMemBlock("azahar-gpulive", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
-                                                  GpuLive::BufferSize, nullptr);
+        const SceUID uid = sceKernelAllocMemBlock(
+            "azahar-gpulive", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, GpuLive::BufferSize, nullptr);
         LogMemBlock("azahar-gpulive", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, GpuLive::BufferSize, uid);
         if (uid < 0 || sceKernelGetMemBlockBase(uid, &live.buffer[i]) < 0) {
             LOG_WARNING(Frontend, "GPU Live: no result buffer ({:#x})", static_cast<u32>(uid));
@@ -575,10 +588,14 @@ void StartGpuLive() {
         // app0:hud_settings.ini is not where this firmware's module looks. Probe: the same
         // file at each candidate, a reload after each, the first that is found is logged.
         static const char* const candidates[] = {
-            "ux0:data/hud_settings.ini",  "ux0:hud_settings.ini",
-            "ux0:data/azahar/hud_settings.ini", "ur0:data/hud_settings.ini",
-            "ux0:temp/hud_settings.ini",  "host0:hud_settings.ini",
-            "ur0:hud_settings.ini",       "ux0:app/hud_settings.ini",
+            "ux0:data/hud_settings.ini",
+            "ux0:hud_settings.ini",
+            "ux0:data/azahar/hud_settings.ini",
+            "ur0:data/hud_settings.ini",
+            "ux0:temp/hud_settings.ini",
+            "host0:hud_settings.ini",
+            "ur0:hud_settings.ini",
+            "ux0:app/hud_settings.ini",
         };
         // The module's own on-screen HUD (GPU_HUD = 1) never drew anything on this
         // firmware; the gpuhud flag draws the live counters with imgui instead (vita_ui).
@@ -665,18 +682,17 @@ void LoadRazor() {
     const int cap = sceSysmoduleLoadModule(SCE_SYSMODULE_RAZOR_CAPTURE);
     SceUID mod = -1;
     if (cap < 0) {
-        mod = sceKernelLoadStartModule("ur0:data/librazorcapture_es4.suprx", 0, nullptr, 0,
-                                       nullptr, nullptr);
+        mod = sceKernelLoadStartModule("ur0:data/librazorcapture_es4.suprx", 0, nullptr, 0, nullptr,
+                                       nullptr);
     }
     razor_loaded = cap >= 0 || mod >= 0;
-    LOG_WARNING(Frontend, "Razor: hud {:#x} capture {:#x} suprx {:#x} -> {}",
-                static_cast<u32>(hud), static_cast<u32>(cap), static_cast<u32>(mod),
+    LOG_WARNING(Frontend, "Razor: hud {:#x} capture {:#x} suprx {:#x} -> {}", static_cast<u32>(hud),
+                static_cast<u32>(cap), static_cast<u32>(mod),
                 razor_loaded ? "loaded" : "unavailable");
     if (razor_loaded) {
         sceRazorGpuCaptureEnableSalvage("ux0:data/azahar/gpucrash.sgx");
     }
 }
-
 
 struct DisplayData {
     void* addr;
@@ -708,9 +724,9 @@ u32 LargestFree(bool cdram) {
 void* GpuAlloc(SceKernelMemBlockType type, u32 size, SceGxmMemoryAttribFlags attribs,
                SceUID* out_uid) {
     // The pools first; a memblock of its own only when the pool is out (or was never made).
-    MemPool* pool = type == SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW        ? &g.pool_cdram
+    MemPool* pool = type == SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW     ? &g.pool_cdram
                     : type == SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE ? &g.pool_lpddr
-                                                                        : nullptr;
+                                                                       : nullptr;
     if (pool != nullptr && pool->Ready()) {
         if (void* addr = pool->Alloc(size)) {
             *out_uid = pool->uid;
@@ -727,9 +743,9 @@ void* GpuAlloc(SceKernelMemBlockType type, u32 size, SceGxmMemoryAttribFlags att
                         pool_out_reports);
         }
     }
-    const u32 align = type == SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW ? 256 * 1024
+    const u32 align = type == SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW             ? 256 * 1024
                       : type == SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW ? 1024 * 1024
-                                                                                : 4 * 1024;
+                                                                                 : 4 * 1024;
     size = (size + align - 1) & ~(align - 1);
     SceUID uid = sceKernelAllocMemBlock("azahar-gxm", type, size, nullptr);
     LogMemBlock("azahar-gxm", type, size, uid);
@@ -984,8 +1000,8 @@ private:
         // Growing the vector moves the chunks; the live map holds indices, not pointers, so
         // only the Chunk& taken during Alloc matters and that call is already finished.
         chunks.push_back(std::move(chunk));
-        LOG_INFO(Frontend, "GXM patcher {} heap grew to {} KiB in {} chunks ({} KiB live)",
-                 Name(), Reserved() / 1024, chunks.size(), used / 1024);
+        LOG_INFO(Frontend, "GXM patcher {} heap grew to {} KiB in {} chunks ({} KiB live)", Name(),
+                 Reserved() / 1024, chunks.size(), used / 1024);
         return true;
     }
 
@@ -1096,8 +1112,8 @@ bool BuildFixedPipelines() {
         SceGxmVertexStream stream{};
         stream.stride = sizeof(float) * 2;
         stream.indexSource = SCE_GXM_INDEX_SOURCE_INDEX_16BIT;
-        if (sceGxmShaderPatcherCreateVertexProgram(g.patcher, g.color_v_id, &attr, 1, &stream,
-                                                   1, &g.color_vp) < 0) {
+        if (sceGxmShaderPatcherCreateVertexProgram(g.patcher, g.color_v_id, &attr, 1, &stream, 1,
+                                                   &g.color_vp) < 0) {
             return false;
         }
         if (sceGxmShaderPatcherCreateFragmentProgram(
@@ -1150,8 +1166,7 @@ void DrawQuad(const QuadVertex corners[4]) {
     }
     std::memcpy(verts, corners, 4 * sizeof(QuadVertex));
     sceGxmSetVertexStream(g.context, 0, verts);
-    sceGxmDraw(g.context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
-               g.quad_indices, 6);
+    sceGxmDraw(g.context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, g.quad_indices, 6);
 }
 
 } // Anonymous namespace
@@ -1195,9 +1210,9 @@ bool Initialize() {
     void* fragment_usse_ring = nullptr;
     {
         const u32 size = SCE_GXM_DEFAULT_FRAGMENT_USSE_RING_BUFFER_SIZE;
-        SceUID uid = sceKernelAllocMemBlock("azahar-gxm-fusse",
-                                            SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
-                                            (size + 0xFFFu) & ~0xFFFu, nullptr);
+        SceUID uid =
+            sceKernelAllocMemBlock("azahar-gxm-fusse", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
+                                   (size + 0xFFFu) & ~0xFFFu, nullptr);
         LogMemBlock("azahar-gxm-fusse", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE,
                     (size + 0xFFFu) & ~0xFFFu, uid);
         if (uid >= 0) {
@@ -1263,8 +1278,8 @@ bool Initialize() {
         if (g.display_mem[i] == nullptr ||
             sceGxmColorSurfaceInit(&g.display_surface[i], SCE_GXM_COLOR_FORMAT_A8B8G8R8,
                                    SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE,
-                                   SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, DisplayWidth,
-                                   DisplayHeight, DisplayWidth, g.display_mem[i]) < 0 ||
+                                   SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT, DisplayWidth, DisplayHeight,
+                                   DisplayWidth, g.display_mem[i]) < 0 ||
             sceGxmSyncObjectCreate(&g.sync[i]) < 0) {
             LOG_CRITICAL(Frontend, "GXM display surface {} failed", i);
             Shutdown();
@@ -1485,7 +1500,8 @@ bool HasRazor() {
 
 void CaptureNextFrame() {
     if (!razor_loaded) {
-        LOG_WARNING(Frontend, "GPU capture asked for, but Razor is not loaded (gxm_flags.txt: razor)");
+        LOG_WARNING(Frontend,
+                    "GPU capture asked for, but Razor is not loaded (gxm_flags.txt: razor)");
         return;
     }
     static char path[64];
@@ -1554,11 +1570,10 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
     {
         const PresentTimer timer{ptimes.begin_scene_us};
         GXM_PHASE("present:begin-scene");
-        sceGxmBeginScene(g.context,
-                         SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY |
-                             SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY,
-                         g.render_target, nullptr, nullptr, g.sync[g.back],
-                         &g.display_surface[g.back], nullptr);
+        sceGxmBeginScene(
+            g.context,
+            SCE_GXM_SCENE_FRAGMENT_SET_DEPENDENCY | SCE_GXM_SCENE_VERTEX_WAIT_FOR_DEPENDENCY,
+            g.render_target, nullptr, nullptr, g.sync[g.back], &g.display_surface[g.back], nullptr);
     }
     g.in_scene = true;
 
@@ -1567,8 +1582,8 @@ void BeginFrame(u8 clear_r, u8 clear_g, u8 clear_b) {
     sceGxmSetFrontDepthFunc(g.context, SCE_GXM_DEPTH_FUNC_ALWAYS);
     sceGxmSetFrontDepthWriteEnable(g.context, SCE_GXM_DEPTH_WRITE_DISABLED);
 
-    DrawSolidRect(0.0f, 0.0f, static_cast<float>(DisplayWidth),
-                  static_cast<float>(DisplayHeight), clear_r, clear_g, clear_b, 255);
+    DrawSolidRect(0.0f, 0.0f, static_cast<float>(DisplayWidth), static_cast<float>(DisplayHeight),
+                  clear_r, clear_g, clear_b, 255);
 }
 
 void DrawSolidRect(float x, float y, float w, float h, u8 r, u8 gc, u8 b, u8 a) {
@@ -1591,8 +1606,7 @@ void DrawSolidRect(float x, float y, float w, float h, u8 r, u8 gc, u8 b, u8 a) 
     const float quad[8] = {x0, y0, x1, y0, x0, y1, x1, y1};
     std::memcpy(verts, quad, sizeof(quad));
     sceGxmSetVertexStream(g.context, 0, verts);
-    sceGxmDraw(g.context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, g.quad_indices,
-               6);
+    sceGxmDraw(g.context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16, g.quad_indices, 6);
 }
 
 void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float h) {
@@ -1621,14 +1635,14 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
     if (screen.texture != nullptr) {
         texture = *screen.texture;
     } else if (screen.stride_bytes == 240 * bpp) {
-        if (sceGxmTextureInitLinear(&texture, screen.pixels, tex_format, 240, screen.height,
-                                    1) < 0) {
+        if (sceGxmTextureInitLinear(&texture, screen.pixels, tex_format, 240, screen.height, 1) <
+            0) {
             return;
         }
     } else {
         if (format == Pica::PixelFormat::RGB8 ||
-            sceGxmTextureInitLinearStrided(&texture, screen.pixels, tex_format, 240,
-                                           screen.height, screen.stride_bytes) < 0) {
+            sceGxmTextureInitLinearStrided(&texture, screen.pixels, tex_format, 240, screen.height,
+                                           screen.stride_bytes) < 0) {
             return;
         }
     }
@@ -1649,9 +1663,8 @@ void DrawGuestScreen(const GuestScreen& screen, float x, float y, float w, float
             const void* pixels = sceGxmTextureGetData(&texture);
             const u32 tex_width = sceGxmTextureGetWidth(&texture);
             const u32 tex_height = sceGxmTextureGetHeight(&texture);
-            const u32 tex_stride = screen.texture != nullptr
-                                       ? ((tex_width + 7u) & ~7u) * bpp
-                                       : screen.stride_bytes;
+            const u32 tex_stride =
+                screen.texture != nullptr ? ((tex_width + 7u) & ~7u) * bpp : screen.stride_bytes;
             char path[64];
             std::snprintf(path, sizeof(path), "ux0:data/azahar/fb_%s.raw", top ? "top" : "bot");
             if (FILE* f = std::fopen(path, "wb")) {
@@ -1805,6 +1818,26 @@ void EndFrame() {
     }
     Common::PipelineStats::presents.fetch_add(1, std::memory_order_relaxed);
     GXM_PHASE("present:done");
+}
+
+void SwapCommonDialog() {
+    g.back = g.frame_index % display_buffers;
+
+    SceCommonDialogUpdateParam updateParam{};
+    updateParam.renderTarget.colorFormat = SCE_GXM_COLOR_FORMAT_A8B8G8R8;
+    updateParam.renderTarget.surfaceType = SCE_GXM_COLOR_SURFACE_LINEAR;
+    updateParam.renderTarget.width = DisplayWidth;
+    updateParam.renderTarget.height = DisplayHeight;
+    updateParam.renderTarget.strideInPixels = DisplayWidth;
+    updateParam.renderTarget.colorSurfaceData = g.display_mem[g.back];
+    updateParam.displaySyncObject = g.sync[g.back];
+    sceCommonDialogUpdate(&updateParam);
+
+    const u32 front = (g.frame_index + display_buffers - 1) % display_buffers;
+    DisplayData data{g.display_mem[g.back]};
+    sceGxmDisplayQueueAddEntry(g.sync[front], g.sync[g.back], &data);
+
+    g.frame_index++;
 }
 
 } // namespace VitaFrontend::GxmPresent
